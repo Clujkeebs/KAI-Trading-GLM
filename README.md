@@ -30,11 +30,27 @@ All settings live in `.env` (see `.env.example`):
 - `PORTFOLIO_VALUE` — fallback portfolio size in USD when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle
 - `SCAN_INTERVAL_MINUTES` — scan cadence in loop mode
 - `LOOP_MODE` — continuous operation by default; set `false` for one cycle
-- `MAX_PORTFOLIO_RISK_PCT` — risk ceiling for minimum-sized trades (default `0.05`)
+- `AI_DECISIONS_PER_CYCLE` — maximum new-buy decisions per cycle (default `3`)
+- `MAX_EXPOSURE_PCT` — optional exposure cap as a portfolio fraction; disabled by default
+- `MAX_RISK_PER_TRADE_PCT` — optional per-trade risk cap as a portfolio fraction; disabled by default
+- `MAX_PORTFOLIO_RISK_PCT` — optional portfolio-risk cap as a portfolio fraction; disabled by default
+- `MIN_TRADE_USD` — optional bot-level minimum order value; disabled by default
+- `MIN_RR_RATIO` — optional minimum risk/reward filter; disabled by default
+- `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor from 1–10; disabled by default
+
+The AI owns position sizing and requests a portfolio percentage. By default, the bot's
+self-imposed risk, exposure, R/R, confidence, and minimum-size guardrails are **off**.
+The only entry constraints then are available free cash and Kraken's market amount,
+cost, and precision rules. Set the optional variables above to re-enable a cap.
+Stop-loss and take-profit remain active exit logic. This permissive configuration can
+spend most or all of a tiny account if the AI requests it; use `PAPER_MODE=true` first.
 
 ## Deployment
 
 `Procfile` defines a continuous `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. Live mode reconciles and manages every held asset with an active Kraken `BASE/USD` spot market, while Phase 2 new-buy scanning remains limited to the watchlist. State and trade history are persisted as JSON under `data/`; Railway-style ephemeral filesystems can wipe that state, so live mode reconciles positions from the Kraken balance each cycle.
+
+Exchange and AI calls use bounded retries with backoff. The worker handles SIGINT/SIGTERM,
+finishes the current operation, atomically flushes state, and stops between cycles.
 
 ## Disclaimer
 

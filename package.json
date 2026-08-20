@@ -11,7 +11,7 @@
     "test": "tsx src/index.ts --once"
   },
   "dependencies": {
-    "ccxt": "^4.5.0",
+    "ccxt": "4.5.0",
     "openai": "^4.73.0",
     "dotenv": "^16.4.0"
   },
