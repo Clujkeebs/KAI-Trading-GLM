@@ -30,7 +30,7 @@ All settings live in `.env` (see `.env.example`):
 
 ## Deployment
 
-`Procfile` defines a `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. State and trade history are persisted as JSON under `data/`.
+`Procfile` defines a `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. State and trade history are persisted as JSON under `data/`; Railway-style ephemeral filesystems can wipe that state, so live mode reconciles positions from the Kraken balance each cycle.
 
 ## Disclaimer
 

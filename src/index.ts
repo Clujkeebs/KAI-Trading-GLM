@@ -43,6 +43,7 @@ interface TradeRecord {
   pnlUsd: number; pnlPct: number; status: string;
   sector: string; reason: string; aiVerdict: string; aiConfidence: number;
 }
+interface OrderFill { qty: number; price: number }
 interface BotState {
   startedAt: string; totalTrades: number; wins: number; losses: number;
   totalPnl: number; bestTrade: string; worstTrade: string;
@@ -59,6 +60,9 @@ const MAX_EXPOSURE_PCT = 0.85;
 const MAX_RISK_PER_TRADE = 0.02;
 const MIN_RR_RATIO = 2.0;
 const MIN_TRADE_USD = 5;
+const BALANCE_DUST_USD = 1;
+const IMPORTED_POSITION_STOP_PCT = 0.05;
+const IMPORTED_POSITION_TARGET_PCT = 0.10;
 const AI_CONFIDENCE_THRESHOLD = 6;
 
 const WATCHLIST: Record<string, string[]> = {
@@ -86,6 +90,19 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const fmt = (n: number) => n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
+const ASSET_ALIASES: Record<string, string> = {
+  XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD',
+};
+
+function normalizeAsset(asset: string): string {
+  const base = asset.toUpperCase().split('.')[0];
+  return ASSET_ALIASES[base] || base;
+}
+
+function pairForAsset(asset: string): string | null {
+  const normalized = normalizeAsset(asset);
+  return ALL_PAIRS.find(pair => normalizeAsset(pair.split('/')[0]) === normalized) || null;
+}
 
 function getSector(pair: string): string {
   for (const [sector, pairs] of Object.entries(WATCHLIST)) {
@@ -212,6 +229,9 @@ const TA = {
 class Exchange {
   private ex: any;
   readonly paper: boolean;
+  private cycleBalance: any = null;
+  private balanceLoaded = false;
+  private cyclePrices: Record<string, number> = {};
 
   constructor(apiKey?: string, apiSecret?: string, paperMode = true) {
     this.paper = paperMode;
@@ -252,33 +272,237 @@ class Exchange {
     return out;
   }
 
-  async buy(pair: string, usd: number): Promise<boolean> {
+  private async getCyclePrice(pair: string): Promise<number | null> {
+    if (this.cyclePrices[pair] !== undefined) return this.cyclePrices[pair];
+    const price = await this.getPrice(pair);
+    if (price !== null) this.cyclePrices[pair] = price;
+    return price;
+  }
+
+  private getBalanceEntries(balance: any): Array<{ asset: string; qty: number }> {
+    const source = balance?.total && typeof balance.total === 'object' ? balance.total : balance;
+    return Object.entries(source || {}).flatMap(([asset, value]: [string, any]) => {
+      if (['free', 'used', 'total', 'info'].includes(asset)) return [];
+      const qty = typeof value === 'object' ? Number(value?.total ?? value?.free ?? 0) : Number(value);
+      return Number.isFinite(qty) && qty > 0 ? [{ asset, qty }] : [];
+    });
+  }
+
+  private getBalanceField(balance: any, canonical: string, field: string): number {
+    let found = false;
+    let total = 0;
+    for (const [asset, value] of Object.entries(balance || {})) {
+      if (normalizeAsset(asset) !== canonical || !value || typeof value !== 'object') continue;
+      const amount = Number((value as any)[field]);
+      if (Number.isFinite(amount)) { total += amount; found = true; }
+    }
+    if (found) return total;
+    const bucket = balance?.[field];
+    if (!bucket || typeof bucket !== 'object') return 0;
+    for (const [asset, value] of Object.entries(bucket)) {
+      if (normalizeAsset(asset) !== canonical) continue;
+      const amount = Number(value);
+      if (Number.isFinite(amount)) total += amount;
+    }
+    return total;
+  }
+
+  private mapHoldings(balance: any, logUnknown: boolean): Record<string, { asset: string; qty: number }> {
+    const mapped: Record<string, { asset: string; qty: number }> = {};
+    for (const { asset, qty } of this.getBalanceEntries(balance)) {
+      if (normalizeAsset(asset) === 'USD') continue;
+      const pair = pairForAsset(asset);
+      if (!pair) {
+        if (logUnknown) console.warn(`  [RECONCILE] Unmapped Kraken holding: ${asset} (${qty})`);
+        continue;
+      }
+      if (mapped[pair]) mapped[pair].qty += qty;
+      else mapped[pair] = { asset, qty };
+    }
+    return mapped;
+  }
+
+  private async getEntryPrice(pair: string, holdingQty: number, fallback: number): Promise<{ price: number; source: string }> {
+    try {
+      let records: any[] = [];
+      if (typeof this.ex.fetchMyTrades === 'function') records = await this.ex.fetchMyTrades(pair);
+      if (!records.length && typeof this.ex.fetchClosedOrders === 'function') {
+        const orders = await this.ex.fetchClosedOrders(pair);
+        records = orders.map((o: any) => ({
+          timestamp: o.timestamp, side: o.side, amount: o.filled ?? o.amount,
+          price: o.average ?? o.price, cost: o.cost,
+        }));
+      }
+      const lots: Array<{ qty: number; cost: number }> = [];
+      for (const record of records.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))) {
+        const qty = Number(record.amount ?? record.filled ?? 0);
+        const price = Number(record.price ?? record.average ?? (record.cost && qty ? record.cost / qty : 0));
+        if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(price) || price <= 0) continue;
+        if (String(record.side).toLowerCase() === 'buy') {
+          lots.push({ qty, cost: qty * price });
+        } else if (String(record.side).toLowerCase() === 'sell') {
+          let remaining = qty;
+          while (remaining > 0 && lots.length > 0) {
+            const lot = lots[0];
+            const used = Math.min(remaining, lot.qty);
+            lot.qty -= used;
+            lot.cost -= used * (lot.cost / (lot.qty + used));
+            remaining -= used;
+            if (lot.qty <= 1e-12) lots.shift();
+          }
+        }
+      }
+      const availableQty = lots.reduce((sum, lot) => sum + lot.qty, 0);
+      if (availableQty < holdingQty * 0.99) throw new Error('trade history does not cover current holding');
+      let remaining = holdingQty;
+      let matchedQty = 0;
+      let matchedCost = 0;
+      for (const lot of lots) {
+        if (remaining <= 0) break;
+        const used = Math.min(remaining, lot.qty);
+        matchedQty += used;
+        matchedCost += used * (lot.cost / lot.qty);
+        remaining -= used;
+      }
+      if (matchedQty < holdingQty * 0.99 || matchedCost <= 0) throw new Error('no usable buy history');
+      return { price: matchedCost / matchedQty, source: 'Kraken trade history' };
+    } catch {
+      console.warn(`  [RECONCILE] ${pair} entry history unavailable; using current price`);
+      return { price: fallback, source: 'current price fallback' };
+    }
+  }
+
+  private orderFill(order: any, fallbackQty: number, fallbackPrice: number): OrderFill {
+    const filledQty = Number(order?.filled);
+    const orderQty = Number(order?.amount);
+    const cost = Number(order?.cost);
+    const average = Number(order?.average);
+    const orderPrice = Number(order?.price);
+    const qty = Number.isFinite(filledQty) && filledQty > 0
+      ? filledQty : Number.isFinite(orderQty) && orderQty > 0 ? orderQty : fallbackQty;
+    const price = Number.isFinite(average) && average > 0
+      ? average : Number.isFinite(orderPrice) && orderPrice > 0
+        ? orderPrice : Number.isFinite(cost) && cost > 0 && qty > 0 ? cost / qty : fallbackPrice;
+    return { qty, price };
+  }
+
+  private async normalizeOrderAmount(pair: string, qty: number, price: number): Promise<number | null> {
+    try {
+      await this.ex.loadMarkets();
+      const market = this.ex.market(pair);
+      const amount = Number(this.ex.amountToPrecision(pair, qty));
+      const minAmount = Number(market?.limits?.amount?.min || 0);
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        console.warn(`  [ORDER SKIP] ${pair}: invalid amount after exchange precision`);
+        return null;
+      }
+      if (minAmount > 0 && amount < minAmount) {
+        console.warn(`  [ORDER SKIP] ${pair}: amount ${amount} below exchange minimum ${minAmount}`);
+        return null;
+      }
+      if (minCost > 0 && amount * price < minCost) {
+        console.warn(`  [ORDER SKIP] ${pair}: cost ${fmt(amount * price)} below exchange minimum ${fmt(minCost)}`);
+        return null;
+      }
+      return amount;
+    } catch (e: any) {
+      console.error(`  [ORDER SKIP] ${pair}: market metadata unavailable (${e.message})`);
+      return null;
+    }
+  }
+
+  async buy(pair: string, usd: number): Promise<OrderFill | null> {
     try {
       const price = await this.getPrice(pair);
-      if (!price) return false;
+      if (!price) return null;
       const qty = usd / price;
       if (this.paper) {
         console.log(`  [PAPER BUY] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(usd)}`);
-        return true;
+        return { qty, price };
       }
-      await this.ex.createMarketBuyOrder(pair, qty);
-      console.log(`  [LIVE BUY] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(usd)}`);
-      return true;
-    } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return false; }
+      const orderQty = await this.normalizeOrderAmount(pair, qty, price);
+      if (orderQty === null) return null;
+      const order = await this.ex.createMarketBuyOrder(pair, orderQty);
+      const fill = this.orderFill(order, orderQty, price);
+      console.log(`  [LIVE BUY] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
+      return fill;
+    } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return null; }
   }
 
-  async sell(pair: string, qty: number): Promise<boolean> {
+  async sell(pair: string, qty: number): Promise<OrderFill | null> {
     try {
       const price = await this.getPrice(pair);
-      if (!price) return false;
+      if (!price) return null;
       if (this.paper) {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
-        return true;
+        return { qty, price };
       }
-      await this.ex.createMarketSellOrder(pair, qty);
-      console.log(`  [LIVE SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
-      return true;
-    } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return false; }
+      const orderQty = await this.normalizeOrderAmount(pair, qty, price);
+      if (orderQty === null) return null;
+      const order = await this.ex.createMarketSellOrder(pair, orderQty);
+      const fill = this.orderFill(order, orderQty, price);
+      console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
+      return fill;
+    } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
+  }
+
+  async reconcilePositions(mem: Memory): Promise<void> {
+    if (this.paper) return;
+    this.balanceLoaded = false;
+    this.cyclePrices = {};
+    try {
+      this.cycleBalance = await this.ex.fetchBalance();
+      this.balanceLoaded = true;
+      const holdings = this.mapHoldings(this.cycleBalance, true);
+      const priced: Record<string, { qty: number; price: number; value: number }> = {};
+      for (const [pair, holding] of Object.entries(holdings)) {
+        const price = await this.getCyclePrice(pair);
+        if (price === null) {
+          console.warn(`  [RECONCILE] ${pair} price unavailable; preserving memory state`);
+          continue;
+        }
+        priced[pair] = { qty: holding.qty, price, value: holding.qty * price };
+        if (priced[pair].value < MIN_TRADE_USD && mem.positions[pair]?.status !== 'open')
+          console.log(`  [RECONCILE] ${pair} balance ${fmt(priced[pair].value)} below minimum; not importing`);
+      }
+
+      for (const [pair, holding] of Object.entries(priced)) {
+        if (holding.value < MIN_TRADE_USD || mem.positions[pair]?.status === 'open') continue;
+        const entry = await this.getEntryPrice(pair, holding.qty, holding.price);
+        const reason = `Imported from Kraken balance (${entry.source})`;
+        mem.openPosition(pair, holding.qty, entry.price,
+          entry.price * (1 - IMPORTED_POSITION_STOP_PCT),
+          entry.price * (1 + IMPORTED_POSITION_TARGET_PCT),
+          getSector(pair), reason, 'Imported from Kraken balance; not opened by the bot.');
+        console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source})`);
+      }
+
+      for (const pos of mem.getOpenPositions()) {
+        const holding = holdings[pos.pair];
+        const price = priced[pos.pair]?.price ?? await this.getCyclePrice(pos.pair);
+        if (price === null) {
+          console.warn(`  [RECONCILE] ${pos.pair} balance could not be priced; preserving position`);
+          continue;
+        }
+        if (!holding || holding.qty * price < BALANCE_DUST_USD) {
+          const reason = `Closed by reconciliation: Kraken balance gone or below dust (${fmt(price)})`;
+          const closed = mem.closePosition(pos.pair, price, reason);
+          if (closed) mem.logTrade({
+            timestamp: new Date().toISOString(), pair: pos.pair, side: 'SELL',
+            price, qty: pos.qty, costBasisUsd: pos.costBasisUsd,
+            stopLoss: pos.stopLoss, takeProfit: pos.takeProfit,
+            pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
+            sector: pos.sector, reason, aiVerdict: 'RECONCILE', aiConfidence: 10,
+          });
+          console.log(`  [RECONCILE] Closed ${pos.pair}: balance gone or below dust`);
+        }
+      }
+    } catch (e: any) {
+      this.cycleBalance = null;
+      this.balanceLoaded = true;
+      console.warn(`  [RECONCILE] Balance fetch failed (${e.message}); keeping memory positions`);
+    }
   }
 
   /**
@@ -289,16 +513,15 @@ class Exchange {
   async getPortfolioValue(mem: Memory): Promise<number> {
     try {
       if (!this.paper) {
-        // Live mode: ask Kraken for real balance
-        const balance = await this.ex.fetchBalance();
-        // Kraken returns USD as 'USD' or 'ZUSD'
-        const usd = (balance['USD']?.free || 0) + (balance['ZUSD']?.free || 0);
-        // Also add market value of any crypto holdings
+        const balance = this.balanceLoaded ? this.cycleBalance : await this.ex.fetchBalance();
+        this.cycleBalance = balance;
+        this.balanceLoaded = true;
+        if (!balance) throw new Error('balance unavailable');
+        const usd = this.getBalanceField(balance, 'USD', 'free') || this.getBalanceField(balance, 'USD', 'total');
         let cryptoValue = 0;
-        for (const pos of mem.getOpenPositions()) {
-          const coin = pos.pair.replace('/USD', '');
-          const holdings = (balance[coin]?.total || 0);
-          if (holdings > 0) cryptoValue += holdings * pos.currentPrice;
+        for (const [pair, holding] of Object.entries(this.mapHoldings(balance, false))) {
+          const price = await this.getCyclePrice(pair);
+          if (price !== null) cryptoValue += holding.qty * price;
         }
         const total = usd + cryptoValue;
         console.log(`  [BALANCE] API: ${fmt(usd)} cash + ${fmt(cryptoValue)} crypto = ${fmt(total)}`);
@@ -614,6 +837,9 @@ async function main() {
 }
 
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
+  // ── RECONCILE LIVE BALANCE ──
+  if (!exchange.paper) await exchange.reconcilePositions(mem);
+
   // ── FETCH REAL BALANCE ──
   const portfolioValue = await exchange.getPortfolioValue(mem);
 
@@ -629,12 +855,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     for (const alert of mem.checkStops(prices)) {
       const pos = mem.positions[alert.pair];
       console.warn(`  [ALERT] ${alert.action}: ${alert.pair} — ${alert.reason}`);
-      const ok = await exchange.sell(alert.pair, pos.qty);
-      if (ok) {
-        const closed = mem.closePosition(alert.pair, prices[alert.pair], alert.reason);
+      const fill = await exchange.sell(alert.pair, pos.qty);
+      if (fill) {
+        const closed = mem.closePosition(alert.pair, fill.price, alert.reason);
         if (closed) mem.logTrade({
           timestamp: new Date().toISOString(), pair: alert.pair, side: 'SELL',
-          price: prices[alert.pair], qty: pos.qty, costBasisUsd: pos.costBasisUsd,
+          price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
           stopLoss: pos.stopLoss, takeProfit: pos.takeProfit,
           pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
           sector: pos.sector, reason: alert.reason, aiVerdict: 'STOP/TARGET', aiConfidence: 10,
@@ -655,12 +881,24 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         console.log(`  [AI SELL] ${pos.pair}: ${d.reasoning}`);
         const price = await exchange.getPrice(pos.pair);
         if (price) {
-          await exchange.sell(pos.pair, pos.qty);
-          mem.closePosition(pos.pair, price, `AI: ${d.reasoning}`);
+          const fill = await exchange.sell(pos.pair, pos.qty);
+          if (fill) {
+            const reason = `AI: ${d.reasoning}`;
+            const closed = mem.closePosition(pos.pair, fill.price, reason);
+            if (closed) mem.logTrade({
+              timestamp: new Date().toISOString(), pair: pos.pair, side: 'SELL',
+              price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
+              stopLoss: pos.stopLoss, takeProfit: pos.takeProfit,
+              pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
+              sector: pos.sector, reason, aiVerdict: d.verdict, aiConfidence: d.confidence,
+            });
+          }
         }
       }
-      if (d.adjustedStop) { pos.stopLoss = d.adjustedStop; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} stop → ${fmt(d.adjustedStop)}`); }
-      if (d.adjustedTarget) { pos.takeProfit = d.adjustedTarget; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} target → ${fmt(d.adjustedTarget)}`); }
+      if (mem.positions[pos.pair]?.status === 'open') {
+        if (d.adjustedStop) { pos.stopLoss = d.adjustedStop; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} stop → ${fmt(d.adjustedStop)}`); }
+        if (d.adjustedTarget) { pos.takeProfit = d.adjustedTarget; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} target → ${fmt(d.adjustedTarget)}`); }
+      }
     }
   }
 
@@ -731,14 +969,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   R/R: ${rr.toFixed(1)}:1 | Size: ${fmt(finalSize)} | Sector: ${c.sector} (${(sw * 100).toFixed(0)}%)
   `);
 
-    const ok = await exchange.buy(c.pair, finalSize);
-    if (ok) {
-      const qty = finalSize / c.ta.currentPrice;
-      mem.openPosition(c.pair, qty, c.ta.currentPrice, sl, tp, c.sector,
+    const fill = await exchange.buy(c.pair, finalSize);
+    if (fill) {
+      const costBasisUsd = +(fill.qty * fill.price).toFixed(2);
+      mem.openPosition(c.pair, fill.qty, fill.price, sl, tp, c.sector,
         `RSI=${c.ta.rsi} ${c.ta.trend} R/R=${rr.toFixed(1)}`, d.reasoning);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: c.pair, side: 'BUY',
-        price: c.ta.currentPrice, qty, costBasisUsd: finalSize, stopLoss: sl, takeProfit: tp,
+        price: fill.price, qty: fill.qty, costBasisUsd, stopLoss: sl, takeProfit: tp,
         pnlUsd: 0, pnlPct: 0, status: 'open', sector: c.sector,
         reason: `RSI=${c.ta.rsi} R/R=${rr.toFixed(1)}`, aiVerdict: d.verdict, aiConfidence: d.confidence,
       });
