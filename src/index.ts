@@ -62,6 +62,7 @@ type TradingConfig = {
   minRrRatio: number | null;
   minTradeUsd: number | null;
   aiConfidenceThreshold: number | null;
+  aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
   loopMode: boolean;
 };
@@ -112,6 +113,7 @@ function loadConfig(): TradingConfig {
     minRrRatio: optionalEnvNumber('MIN_RR_RATIO', 0),
     minTradeUsd: optionalEnvNumber('MIN_TRADE_USD', 0),
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
+    aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     loopMode,
   };
@@ -557,8 +559,18 @@ class Exchange {
       const market = this.ex.market(pair);
       const minAmount = Number(market?.limits?.amount?.min || 0);
       const minCost = Number(market?.limits?.cost?.min || 0);
-      const exchangeMinimum = Math.max(minCost, minAmount * price);
-      return Math.max(CONFIG.minTradeUsd ?? 0, exchangeMinimum);
+      let requiredUsd = Math.max(CONFIG.minTradeUsd ?? 0, minCost, minAmount * price);
+      if (requiredUsd === 0) return 0;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const amount = Number(this.ex.amountToPrecision(pair, requiredUsd / price));
+        if (Number.isFinite(amount) && amount > 0 &&
+            amount >= minAmount && amount * price >= minCost) {
+          return Math.max(requiredUsd, amount * price);
+        }
+        requiredUsd *= 1.01;
+      }
+      console.warn(`  [SIZE] ${pair}: could not derive a precision-safe exchange minimum`);
+      return null;
     } catch (e: any) {
       console.warn(`  [SIZE] ${pair}: market metadata unavailable (${e.message})`);
       return null;
@@ -1007,7 +1019,7 @@ async function main() {
   console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
-  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
+  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
@@ -1095,7 +1107,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         const d = await ai.review(pos.pair, ta);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
-            (CONFIG.aiConfidenceThreshold === null || d.confidence >= CONFIG.aiConfidenceThreshold)) {
+            (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
           console.log(`  [AI SELL] ${pos.pair}: ${d.reasoning}`);
           const price = await exchange.getPrice(pos.pair);
           if (price) {

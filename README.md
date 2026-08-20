@@ -36,7 +36,8 @@ All settings live in `.env` (see `.env.example`):
 - `MAX_PORTFOLIO_RISK_PCT` — optional portfolio-risk cap as a portfolio fraction; disabled by default
 - `MIN_TRADE_USD` — optional bot-level minimum order value; disabled by default
 - `MIN_RR_RATIO` — optional minimum risk/reward filter; disabled by default
-- `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor from 1–10; disabled by default
+- `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor for buy decisions from 1–10; disabled by default
+- `AI_SELL_CONFIDENCE_THRESHOLD` — optional AI confidence floor for sell decisions from 1–10; disabled by default
 
 The AI owns position sizing and requests a portfolio percentage. By default, the bot's
 self-imposed risk, exposure, R/R, confidence, and minimum-size guardrails are **off**.
