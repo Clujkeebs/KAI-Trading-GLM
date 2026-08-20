@@ -325,13 +325,17 @@ class Exchange {
   private async getEntryPrice(pair: string, holdingQty: number, fallback: number): Promise<{ price: number; source: string }> {
     try {
       let records: any[] = [];
-      if (typeof this.ex.fetchMyTrades === 'function') records = await this.ex.fetchMyTrades(pair);
+      try {
+        if (typeof this.ex.fetchMyTrades === 'function') records = await this.ex.fetchMyTrades(pair);
+      } catch {}
       if (!records.length && typeof this.ex.fetchClosedOrders === 'function') {
-        const orders = await this.ex.fetchClosedOrders(pair);
-        records = orders.map((o: any) => ({
-          timestamp: o.timestamp, side: o.side, amount: o.filled ?? o.amount,
-          price: o.average ?? o.price, cost: o.cost,
-        }));
+        try {
+          const orders = await this.ex.fetchClosedOrders(pair);
+          records = orders.map((o: any) => ({
+            timestamp: o.timestamp, side: o.side, amount: o.filled ?? o.amount,
+            price: o.average ?? o.price, cost: o.cost,
+          }));
+        } catch {}
       }
       const lots: Array<{ qty: number; cost: number }> = [];
       for (const record of records.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))) {
