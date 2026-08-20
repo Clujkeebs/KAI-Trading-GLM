@@ -95,8 +95,9 @@ function optionalEnvNumber(name: string, min: number, max?: number): number | nu
 function envBoolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
-  if (raw === 'true') return true;
-  if (raw === 'false') return false;
+  const value = raw.trim().toLowerCase();
+  if (['true', '1', 'yes', 'y', 'on'].includes(value)) return true;
+  if (['false', '0', 'no', 'n', 'off'].includes(value)) return false;
   throw new Error(`${name} must be true or false; got "${raw}"`);
 }
 
