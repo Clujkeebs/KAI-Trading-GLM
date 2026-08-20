@@ -14,8 +14,10 @@ cp .env.example .env   # fill in AI_API_KEY and required Kraken keys
 ```bash
 npm run dev        # single scan cycle
 npm run dev:loop   # continuous loop on SCAN_INTERVAL_MINUTES
-npm run build && npm start   # compiled build
+npm run build && npm start   # compiled worker, continuous by default
 ```
+
+Use `LOOP_MODE=false` or `--once` for a single compiled/local cycle.
 
 ## Configuration
 
@@ -27,10 +29,12 @@ All settings live in `.env` (see `.env.example`):
 - `PAPER_MODE` — `false` by default for real money; set `true` for simulated trades
 - `PORTFOLIO_VALUE` — fallback portfolio size in USD when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle
 - `SCAN_INTERVAL_MINUTES` — scan cadence in loop mode
+- `LOOP_MODE` — continuous operation by default; set `false` for one cycle
+- `MAX_PORTFOLIO_RISK_PCT` — risk ceiling for minimum-sized trades (default `0.05`)
 
 ## Deployment
 
-`Procfile` defines a `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. State and trade history are persisted as JSON under `data/`; Railway-style ephemeral filesystems can wipe that state, so live mode reconciles positions from the Kraken balance each cycle.
+`Procfile` defines a continuous `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. Live mode reconciles and manages every held asset with an active Kraken `BASE/USD` spot market, while Phase 2 new-buy scanning remains limited to the watchlist. State and trade history are persisted as JSON under `data/`; Railway-style ephemeral filesystems can wipe that state, so live mode reconciles positions from the Kraken balance each cycle.
 
 ## Disclaimer
 

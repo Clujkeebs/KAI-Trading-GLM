@@ -55,9 +55,11 @@ interface BotState {
 const PAPER_MODE = process.env.PAPER_MODE === 'true';
 const FALLBACK_PORTFOLIO_VALUE = parseFloat(process.env.PORTFOLIO_VALUE || '200');
 const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '30') * 60 * 1000;
-const MAX_POSITIONS = 10;
 const MAX_EXPOSURE_PCT = 0.85;
 const MAX_RISK_PER_TRADE = 0.02;
+const configuredPortfolioRiskPct = parseFloat(process.env.MAX_PORTFOLIO_RISK_PCT || '0.05');
+const MAX_PORTFOLIO_RISK_PCT = Number.isFinite(configuredPortfolioRiskPct) && configuredPortfolioRiskPct > 0
+  ? configuredPortfolioRiskPct : 0.05;
 const MIN_RR_RATIO = 2.0;
 const MIN_TRADE_USD = 5;
 const BALANCE_DUST_USD = 1;
@@ -94,15 +96,14 @@ const fmt = (n: number) => n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
 const ASSET_ALIASES: Record<string, string> = {
   XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD',
 };
+const CASH_EQUIVALENTS = new Set([
+  'USD', 'USDC', 'USDT', 'DAI', 'PYUSD', 'TUSD', 'USDP', 'USDD', 'FDUSD',
+  'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
+]);
 
 function normalizeAsset(asset: string): string {
   const base = asset.toUpperCase().split('.')[0];
   return ASSET_ALIASES[base] || base;
-}
-
-function pairForAsset(asset: string): string | null {
-  const normalized = normalizeAsset(asset);
-  return ALL_PAIRS.find(pair => normalizeAsset(pair.split('/')[0]) === normalized) || null;
 }
 
 function getSector(pair: string): string {
@@ -232,6 +233,7 @@ class Exchange {
   readonly paper: boolean;
   private cycleBalance: any = null;
   private balanceLoaded = false;
+  private marketsLoaded = false;
   private cyclePrices: Record<string, number> = {};
 
   constructor(apiKey?: string, apiSecret?: string, paperMode = true) {
@@ -280,6 +282,32 @@ class Exchange {
     return price;
   }
 
+  private async ensureMarkets(): Promise<void> {
+    if (!this.marketsLoaded) {
+      await this.ex.loadMarkets();
+      this.marketsLoaded = true;
+    }
+  }
+
+  private usdMarketForAsset(asset: string): any | null {
+    const normalized = normalizeAsset(asset);
+    return Object.values(this.ex.markets || {}).find((market: any) =>
+      normalizeAsset(market.base || '') === normalized &&
+      normalizeAsset(market.quote || '') === 'USD' &&
+      market.active !== false &&
+      (market.spot === true || market.type === 'spot')
+    ) || null;
+  }
+
+  private isIgnoredAsset(asset: string): boolean {
+    const normalized = normalizeAsset(asset);
+    return normalized === 'KFEE' || normalized.startsWith('KFEE');
+  }
+
+  private isCashEquivalent(asset: string): boolean {
+    return CASH_EQUIVALENTS.has(normalizeAsset(asset));
+  }
+
   private getBalanceEntries(balance: any): Array<{ asset: string; qty: number }> {
     const source = balance?.total && typeof balance.total === 'object' ? balance.total : balance;
     return Object.entries(source || {}).flatMap(([asset, value]: [string, any]) => {
@@ -289,11 +317,34 @@ class Exchange {
     });
   }
 
-  private getBalanceField(balance: any, canonical: string, field: string): number {
+  private mapHoldings(balance: any, logUnknown: boolean): Record<string, { asset: string; qty: number }> {
+    const mapped: Record<string, { asset: string; qty: number }> = {};
+    for (const { asset, qty } of this.getBalanceEntries(balance)) {
+      if (this.isCashEquivalent(asset) || this.isIgnoredAsset(asset)) continue;
+      const market = this.usdMarketForAsset(asset);
+      if (!market) {
+        if (logUnknown && qty >= BALANCE_DUST_USD)
+          console.warn(`  [RECONCILE] Unmapped Kraken holding: ${asset} (${qty})`);
+        continue;
+      }
+      const pair = market.symbol;
+      if (mapped[pair]) mapped[pair].qty += qty;
+      else mapped[pair] = { asset, qty };
+    }
+    return mapped;
+  }
+
+  private getCashValue(balance: any): number {
+    return this.getBalanceEntries(balance)
+      .filter(({ asset }) => this.isCashEquivalent(asset))
+      .reduce((sum, { qty }) => sum + qty, 0);
+  }
+
+  private getCashField(balance: any, field: string): number {
     let found = false;
     let total = 0;
     for (const [asset, value] of Object.entries(balance || {})) {
-      if (normalizeAsset(asset) !== canonical || !value || typeof value !== 'object') continue;
+      if (!this.isCashEquivalent(asset) || !value || typeof value !== 'object') continue;
       const amount = Number((value as any)[field]);
       if (Number.isFinite(amount)) { total += amount; found = true; }
     }
@@ -301,26 +352,11 @@ class Exchange {
     const bucket = balance?.[field];
     if (!bucket || typeof bucket !== 'object') return 0;
     for (const [asset, value] of Object.entries(bucket)) {
-      if (normalizeAsset(asset) !== canonical) continue;
+      if (!this.isCashEquivalent(asset)) continue;
       const amount = Number(value);
       if (Number.isFinite(amount)) total += amount;
     }
     return total;
-  }
-
-  private mapHoldings(balance: any, logUnknown: boolean): Record<string, { asset: string; qty: number }> {
-    const mapped: Record<string, { asset: string; qty: number }> = {};
-    for (const { asset, qty } of this.getBalanceEntries(balance)) {
-      if (normalizeAsset(asset) === 'USD') continue;
-      const pair = pairForAsset(asset);
-      if (!pair) {
-        if (logUnknown) console.warn(`  [RECONCILE] Unmapped Kraken holding: ${asset} (${qty})`);
-        continue;
-      }
-      if (mapped[pair]) mapped[pair].qty += qty;
-      else mapped[pair] = { asset, qty };
-    }
-    return mapped;
   }
 
   private async getEntryPrice(pair: string, holdingQty: number, fallback: number): Promise<{ price: number; source: string }> {
@@ -394,7 +430,7 @@ class Exchange {
 
   private async normalizeOrderAmount(pair: string, qty: number, price: number): Promise<number | null> {
     try {
-      await this.ex.loadMarkets();
+      await this.ensureMarkets();
       const market = this.ex.market(pair);
       const amount = Number(this.ex.amountToPrecision(pair, qty));
       const minAmount = Number(market?.limits?.amount?.min || 0);
@@ -416,6 +452,25 @@ class Exchange {
       console.error(`  [ORDER SKIP] ${pair}: market metadata unavailable (${e.message})`);
       return null;
     }
+  }
+
+  async getMinimumTradeUsd(pair: string, price: number): Promise<number | null> {
+    try {
+      await this.ensureMarkets();
+      const market = this.ex.market(pair);
+      const minAmount = Number(market?.limits?.amount?.min || 0);
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      const exchangeMinimum = Math.max(minCost, minAmount * price * 1.01);
+      return Math.max(MIN_TRADE_USD, exchangeMinimum);
+    } catch (e: any) {
+      console.warn(`  [SIZE] ${pair}: market metadata unavailable (${e.message})`);
+      return null;
+    }
+  }
+
+  getAvailableCash(): number | null {
+    if (!this.balanceLoaded || !this.cycleBalance) return null;
+    return this.getCashField(this.cycleBalance, 'free');
   }
 
   private syncPositionQuantity(mem: Memory, pair: string, qty: number, currentPrice?: number) {
@@ -470,6 +525,7 @@ class Exchange {
     this.balanceLoaded = false;
     this.cyclePrices = {};
     try {
+      await this.ensureMarkets();
       this.cycleBalance = await this.ex.fetchBalance();
       this.balanceLoaded = true;
       const holdings = this.mapHoldings(this.cycleBalance, true);
@@ -542,11 +598,12 @@ class Exchange {
   async getPortfolioValue(mem: Memory): Promise<number> {
     try {
       if (!this.paper) {
+        await this.ensureMarkets();
         const balance = this.balanceLoaded ? this.cycleBalance : await this.ex.fetchBalance();
         this.cycleBalance = balance;
         this.balanceLoaded = true;
         if (!balance) throw new Error('balance unavailable');
-        const usd = this.getBalanceField(balance, 'USD', 'free') || this.getBalanceField(balance, 'USD', 'total');
+        const usd = this.getCashValue(balance);
         let cryptoValue = 0;
         for (const [pair, holding] of Object.entries(this.mapHoldings(balance, false))) {
           const price = await this.getCyclePrice(pair);
@@ -690,7 +747,7 @@ YOUR IDENTITY & GOALS:
 - Buy near support, sell at resistance. Cut losers fast, let winners run
 - Focus sectors (priority): AI tokens, RWA tokenization, DeFi blue chips, L1 infrastructure, DePIN, meme momentum
 - You hold 3-7 days typically. NOT a day trader
-- Max 10 positions, max 85% exposure, 2% risk per trade
+- Max 85% exposure, 2% risk per trade
 
 YOUR DECISION FRAMEWORK:
 1. RSI < 40 + neutral/bullish trend + near support = BUY candidate
@@ -814,7 +871,8 @@ HOLD, SELL, or ADJUST?`, pair);
 // ============================================================
 
 async function main() {
-  const loopMode = process.argv.includes('--loop');
+  const loopMode = !process.argv.includes('--once') &&
+    (process.argv.includes('--loop') || process.env.LOOP_MODE !== 'false');
   const fastMode = process.argv.includes('--fast');
 
   // Validate
@@ -934,10 +992,10 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // ── PHASE 2: SCAN FOR OPPORTUNITIES ──
   console.log('\n── PHASE 2: Scan market ──');
   const holding = new Set(mem.getOpenPositions().map(p => p.pair));
-  const exposure = mem.getOpenPositions().reduce((s, p) => s + p.costBasisUsd, 0);
-  const canOpen = mem.getOpenPositions().length < MAX_POSITIONS && exposure < portfolioValue * MAX_EXPOSURE_PCT;
+  const exposure = mem.getOpenPositions().reduce((s, p) => s + p.currentPrice * p.qty, 0);
+  const canOpen = exposure < portfolioValue * MAX_EXPOSURE_PCT;
 
-  if (!canOpen) { console.log('  Max positions/exposure reached, skipping scan.'); return; }
+  if (!canOpen) { console.log('  Exposure cap reached, skipping scan.'); return; }
 
   let aiBudget = 3;
   const candidates: Array<{ pair: string; sector: string; ta: TechnicalAnalysis; vol: number }> = [];
@@ -965,7 +1023,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PHASE 3: AI analysis ──');
 
   for (const c of candidates) {
-    if (aiBudget <= 0 || mem.getOpenPositions().length >= MAX_POSITIONS) break;
+    if (aiBudget <= 0) break;
     const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol);
     aiBudget--;
 
@@ -984,11 +1042,32 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     if (rr < MIN_RR_RATIO) { console.log(`  [PASS] ${c.pair}: R/R ${rr.toFixed(1)}:1 < ${MIN_RR_RATIO}:1`); continue; }
 
     const riskUsd = portfolioValue * MAX_RISK_PER_TRADE;
-    const sizeByRisk = risk > 0 ? riskUsd / risk : 0;
+    const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
+    const sizeByRisk = riskPct > 0 ? riskUsd / riskPct : 0;
     const sizeByAi = portfolioValue * (d.positionSizePct / 100 || 0.10);
-    const finalSize = Math.min(sizeByRisk, sizeByAi);
+    const riskDerivedSize = Math.min(sizeByRisk, sizeByAi);
+    const availableCash = exchange.getAvailableCash() ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
+    const exposureRoom = Math.max(0, portfolioValue * MAX_EXPOSURE_PCT - exposure);
+    const maxAllowedSize = Math.min(availableCash, exposureRoom);
+    const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
+    if (marketMinimum === null) continue;
 
-    if (finalSize < MIN_TRADE_USD) { console.log(`  [PASS] ${c.pair}: size ${fmt(finalSize)} < min`); continue; }
+    let finalSize = riskDerivedSize;
+    if (riskDerivedSize < marketMinimum) {
+      const minimumRisk = marketMinimum * riskPct;
+      if (marketMinimum > maxAllowedSize || minimumRisk > portfolioValue * MAX_PORTFOLIO_RISK_PCT) {
+        console.log(`  [PASS] ${c.pair}: account too small for setup (minimum ${fmt(marketMinimum)}, available ${fmt(maxAllowedSize)}, risk ${fmt(minimumRisk)}, ceiling ${fmt(portfolioValue * MAX_PORTFOLIO_RISK_PCT)})`);
+        continue;
+      }
+      finalSize = marketMinimum;
+      console.log(`  [MIN SIZE] ${c.pair}: using ${fmt(finalSize)} minimum; risk ${fmt(minimumRisk)} within ${fmt(portfolioValue * MAX_PORTFOLIO_RISK_PCT)} portfolio ceiling`);
+    } else {
+      finalSize = Math.min(finalSize, maxAllowedSize);
+      if (finalSize < marketMinimum) {
+        console.log(`  [PASS] ${c.pair}: account too small for setup (minimum ${fmt(marketMinimum)}, available ${fmt(maxAllowedSize)})`);
+        continue;
+      }
+    }
 
     const sw = SECTOR_WEIGHTS[c.sector] || 0.05;
     console.log(`
@@ -1023,7 +1102,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     totalVal += p.costBasisUsd;
   }
   const cash = portfolioValue - totalVal;
-  console.log(`  Cash: ${fmt(cash)} | Invested: ${fmt(totalVal)} | Total: ${fmt(portfolioValue)} | Open: ${positions.length}/${MAX_POSITIONS}`);
+  console.log(`  Cash: ${fmt(cash)} | Invested: ${fmt(totalVal)} | Total: ${fmt(portfolioValue)} | Open: ${positions.length}`);
   console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.state.totalTrades > 0 ? ((mem.state.wins / mem.state.totalTrades) * 100).toFixed(0) : 0}%`);
 }
 

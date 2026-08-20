@@ -6,9 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "dev": "tsx src/index.ts --once",
     "dev:loop": "tsx src/index.ts --loop",
-    "test": "tsx src/index.ts"
+    "test": "tsx src/index.ts --once"
   },
   "dependencies": {
     "ccxt": "^4.5.0",
