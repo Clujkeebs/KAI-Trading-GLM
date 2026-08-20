@@ -94,8 +94,9 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const fmt = (n: number) => n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
 const ASSET_ALIASES: Record<string, string> = {
-  XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD',
+  XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD', ETH2: 'ETH',
 };
+const STAKED_BALANCE_SUFFIXES = new Set(['S', 'B', 'F', 'M']);
 const CASH_EQUIVALENTS = new Set([
   'USD', 'USDC', 'USDT', 'DAI', 'PYUSD', 'TUSD', 'USDP', 'USDD', 'FDUSD',
   'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
@@ -104,6 +105,10 @@ const CASH_EQUIVALENTS = new Set([
 function normalizeAsset(asset: string): string {
   const base = asset.toUpperCase().split('.')[0];
   return ASSET_ALIASES[base] || base;
+}
+
+function isStakedBalance(asset: string): boolean {
+  return asset.toUpperCase().split('.').slice(1).some(suffix => STAKED_BALANCE_SUFFIXES.has(suffix));
 }
 
 function getSector(pair: string): string {
@@ -317,10 +322,15 @@ class Exchange {
     });
   }
 
-  private mapHoldings(balance: any, logUnknown: boolean): Record<string, { asset: string; qty: number }> {
+  private mapHoldings(balance: any, logUnknown: boolean, includeStaked = false): Record<string, { asset: string; qty: number }> {
     const mapped: Record<string, { asset: string; qty: number }> = {};
     for (const { asset, qty } of this.getBalanceEntries(balance)) {
       if (this.isCashEquivalent(asset) || this.isIgnoredAsset(asset)) continue;
+      if (isStakedBalance(asset)) {
+        if (!includeStaked && logUnknown)
+          console.log(`  [RECONCILE] Excluded staked holding: ${asset} (${qty}); not freely tradable`);
+        if (!includeStaked) continue;
+      }
       const market = this.usdMarketForAsset(asset);
       if (!market) {
         if (logUnknown && qty >= BALANCE_DUST_USD)
@@ -605,7 +615,7 @@ class Exchange {
         if (!balance) throw new Error('balance unavailable');
         const usd = this.getCashValue(balance);
         let cryptoValue = 0;
-        for (const [pair, holding] of Object.entries(this.mapHoldings(balance, false))) {
+        for (const [pair, holding] of Object.entries(this.mapHoldings(balance, false, true))) {
           const price = await this.getCyclePrice(pair);
           if (price !== null) cryptoValue += holding.qty * price;
         }
@@ -1099,7 +1109,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
     const pct = (pnl / p.costBasisUsd) * 100;
     console.log(`  ${p.pair}: ${fmt(p.costBasisUsd)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`);
-    totalVal += p.costBasisUsd;
+    totalVal += p.currentPrice * p.qty;
   }
   const cash = portfolioValue - totalVal;
   console.log(`  Cash: ${fmt(cash)} | Invested: ${fmt(totalVal)} | Total: ${fmt(portfolioValue)} | Open: ${positions.length}`);
