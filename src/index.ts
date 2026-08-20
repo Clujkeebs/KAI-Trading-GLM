@@ -51,8 +51,8 @@ interface BotState {
 
 // --- CONFIG ---
 
-const PAPER_MODE = process.env.PAPER_MODE !== 'false';
-const PORTFOLIO_VALUE = parseFloat(process.env.PORTFOLIO_VALUE || '200');
+const PAPER_MODE = process.env.PAPER_MODE === 'true';
+const FALLBACK_PORTFOLIO_VALUE = parseFloat(process.env.PORTFOLIO_VALUE || '200');
 const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '30') * 60 * 1000;
 const MAX_POSITIONS = 10;
 const MAX_EXPOSURE_PCT = 0.85;
@@ -222,7 +222,9 @@ class Exchange {
       opts.secret = apiSecret;
     }
     this.ex = new ccxt.kraken(opts);
-    console.log(paperMode ? '[EXCHANGE] PAPER MODE — real data, simulated trades' : '[EXCHANGE] *** LIVE MODE — REAL MONEY ***');
+    console.log(paperMode
+      ? '[EXCHANGE] PAPER MODE — real data, simulated trades'
+      : '[EXCHANGE] *** LIVE MODE — REAL MONEY ***');
   }
 
   async getPrice(pair: string): Promise<number | null> {
@@ -277,6 +279,39 @@ class Exchange {
       console.log(`  [LIVE SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
       return true;
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return false; }
+  }
+
+  /**
+   * Get total portfolio value in USD.
+   * LIVE: fetches real USD + ZUSD balance from Kraken API.
+   * PAPER: calculates from memory (invested + remaining cash).
+   */
+  async getPortfolioValue(mem: Memory): Promise<number> {
+    try {
+      if (!this.paper) {
+        // Live mode: ask Kraken for real balance
+        const balance = await this.ex.fetchBalance();
+        // Kraken returns USD as 'USD' or 'ZUSD'
+        const usd = (balance['USD']?.free || 0) + (balance['ZUSD']?.free || 0);
+        // Also add market value of any crypto holdings
+        let cryptoValue = 0;
+        for (const pos of mem.getOpenPositions()) {
+          const coin = pos.pair.replace('/USD', '');
+          const holdings = (balance[coin]?.total || 0);
+          if (holdings > 0) cryptoValue += holdings * pos.currentPrice;
+        }
+        const total = usd + cryptoValue;
+        console.log(`  [BALANCE] API: ${fmt(usd)} cash + ${fmt(cryptoValue)} crypto = ${fmt(total)}`);
+        return total > 0 ? total : FALLBACK_PORTFOLIO_VALUE;
+      }
+    } catch (e: any) {
+      console.warn(`  [BALANCE] API call failed (${e.message}), using calculated value`);
+    }
+    // Paper mode (or API fallback): calculate from memory
+    const invested = mem.getOpenPositions().reduce((s, p) => s + p.costBasisUsd, 0);
+    const cash = FALLBACK_PORTFOLIO_VALUE - invested;
+    console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(invested)} invested = ${fmt(FALLBACK_PORTFOLIO_VALUE)}`);
+    return FALLBACK_PORTFOLIO_VALUE;
   }
 }
 
@@ -398,7 +433,7 @@ class Memory {
 const SYSTEM_PROMPT = `You are an AI crypto trading bot with real money at stake.
 
 YOUR IDENTITY & GOALS:
-- You manage a ~$200 crypto portfolio on Kraken
+- You manage a crypto portfolio on Kraken (balance fetched from API each cycle)
 - Your strategy: find oversold coins with strong fundamentals and 2:1+ risk/reward
 - Buy near support, sell at resistance. Cut losers fast, let winners run
 - Focus sectors (priority): AI tokens, RWA tokenization, DeFi blue chips, L1 infrastructure, DePIN, meme momentum
@@ -536,8 +571,9 @@ async function main() {
     console.error('Copy .env.example to .env and fill in your key.');
     process.exit(1);
   }
-  if (!PAPER_MODE && (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET)) {
-    console.error('Missing KRAKEN_API_KEY or KRAKEN_API_SECRET for live mode.');
+  if (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET) {
+    console.error('Missing KRAKEN_API_KEY or KRAKEN_API_SECRET. Required for live trading.');
+    console.error('Get them from Kraken > Settings > API > Create Key (Trade permission only).');
     process.exit(1);
   }
 
@@ -549,7 +585,7 @@ async function main() {
 │  Strategy: AI-Powered Oversold Bounce        │
 │  Risk: 2%/trade | 85% max | 2:1 min R/R     │
 └──────────────────────────────────────────────┘`);
-  console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Portfolio: ${fmt(PORTFOLIO_VALUE)}`);
+  console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   console.log(`AI threshold: ${AI_CONFIDENCE_THRESHOLD}/10 | Loop: ${loopMode ? 'ON' : 'single'} | Interval: ${fastMode ? '5min' : `${SCAN_INTERVAL / 60000}min`}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, PAPER_MODE);
@@ -578,6 +614,9 @@ async function main() {
 }
 
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
+  // ── FETCH REAL BALANCE ──
+  const portfolioValue = await exchange.getPortfolioValue(mem);
+
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
   const open = mem.getOpenPositions();
@@ -629,7 +668,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PHASE 2: Scan market ──');
   const holding = new Set(mem.getOpenPositions().map(p => p.pair));
   const exposure = mem.getOpenPositions().reduce((s, p) => s + p.costBasisUsd, 0);
-  const canOpen = mem.getOpenPositions().length < MAX_POSITIONS && exposure < PORTFOLIO_VALUE * MAX_EXPOSURE_PCT;
+  const canOpen = mem.getOpenPositions().length < MAX_POSITIONS && exposure < portfolioValue * MAX_EXPOSURE_PCT;
 
   if (!canOpen) { console.log('  Max positions/exposure reached, skipping scan.'); return; }
 
@@ -677,9 +716,9 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
     if (rr < MIN_RR_RATIO) { console.log(`  [PASS] ${c.pair}: R/R ${rr.toFixed(1)}:1 < ${MIN_RR_RATIO}:1`); continue; }
 
-    const riskUsd = PORTFOLIO_VALUE * MAX_RISK_PER_TRADE;
+    const riskUsd = portfolioValue * MAX_RISK_PER_TRADE;
     const sizeByRisk = risk > 0 ? riskUsd / risk : 0;
-    const sizeByAi = PORTFOLIO_VALUE * (d.positionSizePct / 100 || 0.10);
+    const sizeByAi = portfolioValue * (d.positionSizePct / 100 || 0.10);
     const finalSize = Math.min(sizeByRisk, sizeByAi);
 
     if (finalSize < MIN_TRADE_USD) { console.log(`  [PASS] ${c.pair}: size ${fmt(finalSize)} < min`); continue; }
@@ -716,7 +755,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     console.log(`  ${p.pair}: ${fmt(p.costBasisUsd)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`);
     totalVal += p.costBasisUsd;
   }
-  console.log(`  Cash: ${fmt(PORTFOLIO_VALUE - totalVal)} | Invested: ${fmt(totalVal)} | Open: ${positions.length}/${MAX_POSITIONS}`);
+  const cash = portfolioValue - totalVal;
+  console.log(`  Cash: ${fmt(cash)} | Invested: ${fmt(totalVal)} | Total: ${fmt(portfolioValue)} | Open: ${positions.length}/${MAX_POSITIONS}`);
   console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.state.totalTrades > 0 ? ((mem.state.wins / mem.state.totalTrades) * 100).toFixed(0) : 0}%`);
 }
 
