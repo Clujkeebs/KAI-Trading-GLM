@@ -1,0 +1,23 @@
+{
+  "name": "ai-crypto-bot",
+  "version": "1.0.0",
+  "description": "AI-powered crypto trading bot with persistent memory",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "dev:loop": "tsx src/index.ts --loop",
+    "test": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "ccxt": "^4.5.0",
+    "openai": "^4.73.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}
