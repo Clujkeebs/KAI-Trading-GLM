@@ -61,6 +61,7 @@ const MAX_RISK_PER_TRADE = 0.02;
 const MIN_RR_RATIO = 2.0;
 const MIN_TRADE_USD = 5;
 const BALANCE_DUST_USD = 1;
+const POSITION_QTY_TOLERANCE_PCT = 0.01;
 const IMPORTED_POSITION_STOP_PCT = 0.05;
 const IMPORTED_POSITION_TARGET_PCT = 0.10;
 const AI_CONFIDENCE_THRESHOLD = 6;
@@ -349,8 +350,9 @@ class Exchange {
           while (remaining > 0 && lots.length > 0) {
             const lot = lots[0];
             const used = Math.min(remaining, lot.qty);
+            const originalQty = lot.qty;
             lot.qty -= used;
-            lot.cost -= used * (lot.cost / (lot.qty + used));
+            lot.cost -= used * (lot.cost / originalQty);
             remaining -= used;
             if (lot.qty <= 1e-12) lots.shift();
           }
@@ -416,6 +418,18 @@ class Exchange {
     }
   }
 
+  private syncPositionQuantity(mem: Memory, pair: string, qty: number, currentPrice?: number) {
+    const pos = mem.positions[pair];
+    if (!pos || pos.status !== 'open') return;
+    const tolerance = Math.max(pos.qty, qty) * POSITION_QTY_TOLERANCE_PCT;
+    if (Math.abs(pos.qty - qty) <= Math.max(tolerance, 1e-12)) return;
+    console.log(`  [RECONCILE] Adjusted ${pair} quantity ${pos.qty.toFixed(6)} → ${qty.toFixed(6)}; cost basis ${fmt(pos.costBasisUsd)} → ${fmt(qty * pos.entryPrice)}`);
+    pos.qty = qty;
+    pos.costBasisUsd = +(qty * pos.entryPrice).toFixed(2);
+    if (currentPrice !== undefined) pos.currentPrice = currentPrice;
+    mem.savePositions();
+  }
+
   async buy(pair: string, usd: number): Promise<OrderFill | null> {
     try {
       const price = await this.getPrice(pair);
@@ -463,6 +477,7 @@ class Exchange {
       for (const [pair, holding] of Object.entries(holdings)) {
         const price = await this.getCyclePrice(pair);
         if (price === null) {
+          this.syncPositionQuantity(mem, pair, holding.qty);
           console.warn(`  [RECONCILE] ${pair} price unavailable; preserving memory state`);
           continue;
         }
@@ -472,14 +487,24 @@ class Exchange {
       }
 
       for (const [pair, holding] of Object.entries(priced)) {
-        if (holding.value < MIN_TRADE_USD || mem.positions[pair]?.status === 'open') continue;
+        const existing = mem.positions[pair];
+        if (existing?.status === 'open') {
+          this.syncPositionQuantity(mem, pair, holding.qty, holding.price);
+          continue;
+        }
+        if (holding.value < MIN_TRADE_USD) continue;
         const entry = await this.getEntryPrice(pair, holding.qty, holding.price);
         const reason = `Imported from Kraken balance (${entry.source})`;
+        const entryStop = entry.price * (1 - IMPORTED_POSITION_STOP_PCT);
+        const entryTarget = entry.price * (1 + IMPORTED_POSITION_TARGET_PCT);
+        const currentStop = holding.price * (1 - IMPORTED_POSITION_STOP_PCT);
+        const currentTarget = holding.price * (1 + IMPORTED_POSITION_TARGET_PCT);
+        const stopLoss = entryStop < holding.price ? Math.max(entryStop, currentStop) : currentStop;
+        const takeProfit = entryTarget > holding.price ? Math.min(entryTarget, currentTarget) : currentTarget;
         mem.openPosition(pair, holding.qty, entry.price,
-          entry.price * (1 - IMPORTED_POSITION_STOP_PCT),
-          entry.price * (1 + IMPORTED_POSITION_TARGET_PCT),
+          stopLoss, takeProfit,
           getSector(pair), reason, 'Imported from Kraken balance; not opened by the bot.');
-        console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source})`);
+        console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source}) | stop ${fmt(stopLoss)} target ${fmt(takeProfit)}`);
       }
 
       for (const pos of mem.getOpenPositions()) {
