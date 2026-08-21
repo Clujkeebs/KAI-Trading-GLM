@@ -92,6 +92,28 @@ account thin loses a disproportionate share to fees and exchange minimums and le
 big enough to matter, while concentration raises variance — with four positions instead of nine,
 a single bad one hurts more than twice as much.
 
+### Alerts instead of automatic stop-outs
+
+A stop that fires on its own answers "is it down?" with "then sell". Every position also
+carries an **alert level** between entry and the stop: reaching it does not sell, it forces a
+review so the model can ask *why* it is down and answer sell, hold, or **add**. A fall into
+support with the thesis intact is not the same as a thesis breaking.
+
+The hard stop still sits underneath and still sells — the alert is the chance to act before it
+ever fires. Alerts jump the review budget, are consumed once they fire, and the model can set a
+new one via `alert_price`. `ALERT_AT_R` sets the default depth (0.5R); `0` disables it and
+leaves the stop alone. `ALLOW_AI_ADD_ONS` governs whether a review may add to a position.
+
+Adding re-bases the average entry on total cost and rescales the recorded entry stop, so 1R —
+which breakeven and the trail are measured in — keeps meaning what it says.
+
+### Position size
+
+`MIN_TRADE_USD` is the floor for opening a new position. Without it the bot falls back to the
+exchange minimum, which produced a book of roughly $5 positions where fees and minimums took a
+disproportionate share. Existing holdings below the floor are still imported and managed —
+applying it to imports would orphan real money with no stop and no review.
+
 ### Keeping exits possible
 
 A position that has fallen under Kraken's minimum sellable size is worse than an unprotected

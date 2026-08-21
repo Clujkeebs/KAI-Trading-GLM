@@ -38,6 +38,10 @@ export interface AiDecision {
   positionSizePct: number; adjustedStop: number | null; adjustedTarget: number | null;
   /** Fraction of the position a SELL should close, 0-1. Defaults to all of it. */
   trimFraction: number;
+  /** Price at which the model wants to be shown this position again. */
+  alertPrice: number | null;
+  /** True when this was recovered from an incomplete reply rather than parsed. */
+  salvaged: boolean;
 }
 interface BuyContext {
   portfolioValueUsd: number;
@@ -62,6 +66,13 @@ export interface Position {
   entryAtr?: number | null;
   /** When the AI last reviewed this position, used to stop reviews starving it. */
   lastReviewedAt?: string;
+  /**
+   * Price at which the model wants to be woken to look at this position, set
+   * above the hard stop. Reaching it forces a review instead of an exit, so a
+   * drawdown becomes a decision — sell, hold, or add — rather than an automatic
+   * sale. Cleared once it fires; the model may set a new one.
+   */
+  alertPrice?: number | null;
   /** P/L already booked from partial exits on this position. */
   bookedPnlUsd?: number;
   closedAt?: string; exitPrice?: number; exitValueUsd?: number;
@@ -148,6 +159,10 @@ type TradingConfig = {
   aiReviewsPerCycle: number | null;
   /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
   targetPositionCount: number | null;
+  /** Drawdown, in R, at which a position wakes the model for a decision. */
+  alertAtR: number;
+  /** Whether the model may add to an open position when it reviews one. */
+  allowAddOns: boolean;
   topUpStrandedPositions: boolean;
   topUpMaxPct: number;
   scanMaxRsi: number | null;
@@ -164,6 +179,7 @@ type TradingConfig = {
   maxSectorExposurePct: number | null;
   ohlcvConcurrency: number;
   maxStopDistancePct: number;
+  minStopDistancePct: number;
   aiReasoningEffort: 'off' | 'low' | 'medium' | 'high';
   preflight: boolean;
   preflightAiSamples: number;
@@ -245,6 +261,8 @@ function loadConfig(): TradingConfig {
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
     targetPositionCount: optionalEnvInteger('TARGET_POSITION_COUNT', 1, null),
+    alertAtR: envNumber('ALERT_AT_R', 0.5, 0, 5),
+    allowAddOns: envBoolean('ALLOW_AI_ADD_ONS', true),
     topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
     topUpMaxPct: envNumber('TOPUP_MAX_PCT', 0.05, 0, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
@@ -261,6 +279,7 @@ function loadConfig(): TradingConfig {
     maxSectorExposurePct: optionalEnvNumber('MAX_SECTOR_EXPOSURE_PCT', 0, 1),
     ohlcvConcurrency: envInteger('OHLCV_CONCURRENCY', 4, 1),
     maxStopDistancePct: envNumber('MAX_STOP_DISTANCE_PCT', 0.15, 0.01, 0.9),
+    minStopDistancePct: envNumber('MIN_STOP_DISTANCE_PCT', 0.005, 0.0001, 0.5),
     aiReasoningEffort: envEnum('AI_REASONING_EFFORT', ['off', 'low', 'medium', 'high'], 'low'),
     preflight: envBoolean('PREFLIGHT', true),
     preflightAiSamples: envInteger('PREFLIGHT_AI_SAMPLES', 2, 0),
@@ -276,8 +295,6 @@ const RECENT_TRADE_MEMORY = 25;
 const MAX_AI_TOKEN_BUDGET = 16_000;
 const ORDER_POLL_ATTEMPTS = 5;
 const ORDER_POLL_DELAY_MS = 1_000;
-/** A residual worth less than this after a partial exit is dust, not a position. */
-const PARTIAL_EXIT_DUST_PCT = 0.10;
 const TIMEFRAME_MS: Record<string, number> = {
   '1m': 60_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000,
   '1h': 3_600_000, '4h': 14_400_000, '1d': 86_400_000,
@@ -687,6 +704,50 @@ function applyPositionAdjustments(
 interface TradePlan { stop: number; target: number; rr: number; riskPct: number; basis: string }
 
 /**
+ * Re-expresses a plan against the price actually filled.
+ *
+ * Stops and targets are computed during the scan, but the order fills later at a
+ * fresh quote. Left alone, a position could open already below its own stop, and
+ * every R-based calculation — breakeven, the trail, the alert — would be measured
+ * from a price that was never paid. Holding the risk and reward *fractions*
+ * constant keeps the plan's shape while anchoring it to reality.
+ */
+export function rebasePlanToFill(plan: TradePlan, plannedPrice: number, fillPrice: number): TradePlan {
+  if (!(plannedPrice > 0) || !(fillPrice > 0) || plannedPrice === fillPrice) return plan;
+  const scale = fillPrice / plannedPrice;
+  const stop = plan.stop * scale;
+  const target = plan.target * scale;
+  const risk = fillPrice - stop;
+  if (!(risk > 0)) return plan;
+  return { stop, target, rr: (target - fillPrice) / risk, riskPct: risk / fillPrice, basis: plan.basis };
+}
+
+/**
+ * The price at which a position should wake the model, sitting between entry and
+ * the hard stop.
+ *
+ * A stop that fires automatically answers "is it down?" with "then sell". Being
+ * shown the position instead lets the model ask why it is down — and a fall into
+ * support on intact fundamentals is a different thing from a broken thesis. The
+ * hard stop still exists underneath as the floor; this only decides when the
+ * model gets to look first.
+ */
+export function defaultAlertPrice(entryPrice: number, stopPrice: number): number | null {
+  if (CONFIG.alertAtR <= 0) return null;
+  const risk = entryPrice - stopPrice;
+  if (!(risk > 0)) return null;
+  const alert = entryPrice - risk * CONFIG.alertAtR;
+  // An alert at or below the stop would never fire before the stop does.
+  return alert > stopPrice ? alert : null;
+}
+
+/** True when price has reached the level the model asked to be woken at. */
+export function alertTriggered(position: Position, price: number): boolean {
+  const alert = position.alertPrice;
+  return typeof alert === 'number' && Number.isFinite(alert) && price <= alert && price > position.stopLoss;
+}
+
+/**
  * How the operator wants capital concentrated, phrased for the model.
  *
  * Spreading a small account across many positions loses a disproportionate share
@@ -775,8 +836,14 @@ export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecis
 
   if (decision.adjustedStop !== null && Number.isFinite(decision.adjustedStop)) {
     const floor = price * (1 - CONFIG.maxStopDistancePct);
+    const ceiling = price * (1 - CONFIG.minStopDistancePct);
     if (decision.adjustedStop >= price) {
       notes.push(`ignored AI stop ${fmt(decision.adjustedStop)}: not below entry ${fmt(price)}`);
+    } else if (decision.adjustedStop > ceiling) {
+      // Risk per trade divides by this distance. A stop a hair below entry drives
+      // it toward zero, which silently makes every risk-based size cap unbounded.
+      stop = ceiling;
+      notes.push(`AI stop ${fmt(decision.adjustedStop)} is closer than the ${pct(CONFIG.minStopDistancePct)} floor; widened to ${fmt(ceiling)}`);
     } else if (decision.adjustedStop < floor) {
       stop = floor;
       notes.push(`AI stop ${fmt(decision.adjustedStop)} clamped to the ${pct(CONFIG.maxStopDistancePct)} risk cap at ${fmt(floor)}`);
@@ -1414,7 +1481,14 @@ class Exchange {
     } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return null; }
   }
 
-  async sell(pair: string, qty: number): Promise<OrderFill | null> {
+  /**
+   * @param exitAll sell the entire free balance rather than exactly `qty`.
+   *   Memory drifts from the exchange by fractions (rounding, fees, partial
+   *   fills), and selling the remembered quantity leaves that difference behind
+   *   as unsellable dust — the account had WLD, RENDER and UNI remnants worth
+   *   less than a thousandth of a cent from exactly this.
+   */
+  async sell(pair: string, qty: number, exitAll = false): Promise<OrderFill | null> {
     try {
       const price = await this.getPrice(pair, !this.paper);
       if (!price) return null;
@@ -1430,7 +1504,11 @@ class Exchange {
         console.warn(`  [ORDER SKIP] ${pair}: no free base balance available for sell`);
         return null;
       }
-      const sellQty = availableBase === null ? qty : Math.min(qty, availableBase);
+      const sellQty = availableBase === null
+        ? qty
+        : exitAll ? availableBase : Math.min(qty, availableBase);
+      if (exitAll && availableBase !== null && availableBase > qty)
+        console.log(`  [EXIT ALL] ${pair}: selling the full ${availableBase} balance rather than the tracked ${qty} so no dust is left behind`);
       const orderQty = await this.normalizeOrderAmount(pair, sellQty, price);
       if (orderQty === null) {
         // Worth shouting about: an exit blocked by exchange minimums means the stop
@@ -1484,13 +1562,18 @@ class Exchange {
       await this.ensureMarkets();
       const market = this.ex.market(pair);
       const minAmount = Number(market?.limits?.amount?.min || 0);
-      const shortfallQty = minAmount > 0 ? Math.max(0, minAmount - qty) : 0;
-      if (shortfallQty <= 0) return null;
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      // Kraken strands USD pairs on minimum *cost* at least as often as on
+      // minimum amount; handling only the latter left those unrepairable.
+      const amountShortfall = minAmount > 0 ? Math.max(0, minAmount - qty) * price : 0;
+      const costShortfall = minCost > 0 ? Math.max(0, minCost - qty * price) : 0;
+      const shortfallUsd = Math.max(amountShortfall, costShortfall);
+      if (shortfallUsd <= 0) return null;
       const orderMinimum = await this.getMinimumTradeUsd(pair, price);
       if (orderMinimum === null) return null;
       // A buy must clear the same minimums, so the top-up is the larger of the
       // shortfall and one minimum order.
-      return Math.max(shortfallQty * price, orderMinimum);
+      return Math.max(shortfallUsd, orderMinimum);
     } catch (e: any) {
       console.warn(`  [TOPUP] ${pair}: could not size a top-up (${e.message})`);
       return null;
@@ -1538,8 +1621,7 @@ class Exchange {
           continue;
         }
         priced[pair] = { qty: holding.qty, price, value: holding.qty * price };
-        if (CONFIG.minTradeUsd !== null && priced[pair].value < CONFIG.minTradeUsd && mem.positions[pair]?.status !== 'open')
-          console.log(`  [RECONCILE] ${pair} balance ${fmt(priced[pair].value)} below minimum; not importing`);
+
       }
 
       for (const [pair, holding] of Object.entries(priced)) {
@@ -1548,7 +1630,10 @@ class Exchange {
           this.syncPositionQuantity(mem, pair, holding.qty, holding.price);
           continue;
         }
-        if (CONFIG.minTradeUsd !== null && holding.value < CONFIG.minTradeUsd) continue;
+        // Import eligibility is deliberately NOT gated on MIN_TRADE_USD. That
+        // setting is a floor for opening new positions; applying it here would
+        // orphan every existing holding worth less than it — leaving real money
+        // unmanaged, with no stop and no review.
         // Leftover dust from a sale is not a position. Importing it spent a trade
         // history lookup and an OHLCV fetch, then the dust rule below closed it
         // again on the same pass and wrote a meaningless trade to the record.
@@ -1796,6 +1881,7 @@ class Memory {
   openPosition(
     pair: string, qty: number, price: number, sl: number, tp: number,
     sector: string, reason: string, aiReason: string, feeUsd = 0, atr: number | null = null,
+    alertPrice: number | null = null,
   ) {
     const pos: Position = {
       pair, status: 'open', sector, entryPrice: price, qty,
@@ -1804,6 +1890,7 @@ class Memory {
       costBasisUsd: qty * price + feeUsd, stopLoss: sl, takeProfit: tp,
       currentPrice: price, reason, aiReasoning: aiReason, openedAt: new Date().toISOString(),
       initialStopLoss: sl, highWaterMark: price, entryAtr: atr, bookedPnlUsd: 0,
+      alertPrice: alertPrice ?? defaultAlertPrice(price, sl),
     };
     this.positions[pair] = pos;
     this.savePositions();
@@ -1816,9 +1903,16 @@ class Memory {
   addToPosition(pair: string, qty: number, price: number, feeUsd = 0): boolean {
     const p = this.positions[pair];
     if (!p || p.status !== 'open' || !(qty > 0) || !(price > 0)) return false;
+    const previousEntry = p.entryPrice;
     p.qty += qty;
     p.costBasisUsd += qty * price + feeUsd;
     p.entryPrice = p.costBasisUsd / p.qty;
+    // The average entry moved, so a stop recorded against the old one no longer
+    // describes 1R. Rescaling keeps the original risk *fraction*, which is what
+    // the breakeven ratchet and trail activation are actually measured in.
+    if (previousEntry > 0 && p.initialStopLoss !== undefined) {
+      p.initialStopLoss = p.initialStopLoss * (p.entryPrice / previousEntry);
+    }
     this.savePositions();
     return true;
   }
@@ -2071,6 +2165,23 @@ YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
 
+PRICE ALERTS — YOU DECIDE, NOT A STOP:
+Set "alert_price" to the level at which you want to be shown a position again.
+Reaching it does NOT sell. It forces a review and puts the decision in front of
+you, with fresh technicals, so you can ask *why* it is down. A fall into support
+with the thesis intact is not the same as a thesis breaking, and the right answer
+to the first may be to add rather than to sell.
+
+A hard stop still sits underneath as the floor, and it does sell. Your alert
+should sit above it: it is your chance to act before the stop ever fires.
+
+ADDING TO A POSITION:
+On a REVIEW you may answer BUY to add to the position you are looking at, with
+"position_size_pct" as the extra share of the portfolio to commit. Use it when a
+drawdown has improved the setup rather than broken it. Adding raises your average
+cost and your risk — a losing position you add to is a bigger losing position, so
+do it because the setup earned it, not to avoid being wrong.
+
 SELLING PART OF A POSITION:
 On a SELL you may set "trim_pct" to the percentage of that position to sell, from 1
 to 100. Omit it, or use 100, to exit completely. Use a partial trim to take some
@@ -2080,7 +2191,7 @@ in your stance without abandoning a thesis you still believe.
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Think briefly. Emit the JSON object as your very first output token.
 Keep "reasoning" under 12 words. Do not restate the data you were given.
-{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null}`;
+{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null, "alert_price": number or null}`;
 
 type AiParseResult = {
   decision: AiDecision | null;
@@ -2152,6 +2263,10 @@ function normalizeAiDecision(json: any, salvage = false): AiDecision {
     // A salvaged reply lost its tail, so assume a full exit rather than guessing
     // at a partial one from an incomplete payload.
     trimFraction: salvage ? 1 : normalizeTrimFraction(json?.trim_pct),
+    alertPrice: !salvage && json?.alert_price !== null && json?.alert_price !== undefined &&
+      Number.isFinite(Number(json.alert_price)) && Number(json.alert_price) > 0
+      ? Number(json.alert_price) : null,
+    salvaged: salvage,
   };
 }
 
@@ -2331,9 +2446,9 @@ ${context?.concentration ? `\n${context.concentration}\n` : ''}
 BUY or HOLD?`, pair);
   }
 
-  async review(pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = ''): Promise<AiDecision> {
+  async review(pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = '', alertNote = ''): Promise<AiDecision> {
     const p = this.memory.positions[pair];
-    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
+    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
     const percent = p.costBasisUsd > 0 ? (pnl / p.costBasisUsd) * 100 : 0;
     const days = ((Date.now() - new Date(p.openedAt).getTime()) / 86400000).toFixed(1);
@@ -2349,6 +2464,7 @@ Supports: ${ta.supports.join(', ') || 'none'} | Resistances: ${ta.resistances.jo
 
 The bot already trails the stop upward on its own; only propose adjusted_stop if you
 want it tighter than the value above. Stops are never widened.
+${alertNote}
 ${cashNote}
 ${concentration}
 
@@ -2359,7 +2475,7 @@ HOLD, SELL, or ADJUST?`, pair);
   }
 
   private async call(prompt: string, pair: string): Promise<AiDecision> {
-    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
+    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false };
     const messages: any[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
@@ -2398,12 +2514,10 @@ HOLD, SELL, or ADJUST?`, pair);
         } else {
           console.warn(`  [AI] ${parsed.kind === 'empty' ? 'Empty response' : 'Unparseable response'} for ${pair} (finish_reason=${finishReason}, budget=${this.tokenBudget}${parsed.error ? `; ${parsed.error}` : ''})`);
         }
-        if (truncated && this.growTokenBudget(pair)) continue;
-        if (parsed.decision) {
-          console.warn(`  [AI] Falling back to the salvaged decision for ${pair}; adjusted stop/target discarded`);
-          this.logDecision(pair, parsed.decision);
-          return parsed.decision;
-        }
+        // Never settle for a fragment while a retry is still available. Returning
+        // here meant the corrective-JSON retry never ran, and a salvaged BUY —
+        // which carries no position size — became a real minimum-sized order.
+        if (truncated) this.growTokenBudget(pair);
       } catch (e: any) {
         console.error(`  [AI] Error ${pair}: ${e.message}`);
       }
@@ -2771,6 +2885,14 @@ function reportPreflight(checks: CheckResult[]): boolean {
 // ============================================================
 
 let shutdownRequested = false;
+/**
+ * Set when preflight finds something critical — an unreachable exchange, an
+ * unpriceable market, a position that cannot be exited. Existing positions are
+ * still managed and still exit; only new risk is withheld, because opening a
+ * position you have just proven you may not be able to close is the one move
+ * worth refusing outright.
+ */
+let newEntriesBlocked: string | null = null;
 const shutdownWaiters: Array<() => void> = [];
 
 async function main() {
@@ -2825,9 +2947,13 @@ async function main() {
         console.log(healthy ? '[DOCTOR] Healthy.' : '[DOCTOR] Critical checks failed.');
         process.exit(healthy ? 0 : 1);
       }
-      if (!healthy) console.error('[PREFLIGHT] Critical checks failed; managing existing positions only where possible.');
+      if (!healthy) {
+        newEntriesBlocked = 'preflight reported a critical failure';
+        console.error('[PREFLIGHT] Critical checks failed; existing positions will still be managed and exited, but no new positions will be opened.');
+      }
     } catch (e: any) {
-      console.error(`[PREFLIGHT] Could not complete: ${e.message}`);
+      newEntriesBlocked = `preflight could not complete (${e.message})`;
+      console.error(`[PREFLIGHT] Could not complete: ${e.message}; no new positions will be opened.`);
       if (doctorOnly) process.exit(1);
     }
   }
@@ -2891,7 +3017,7 @@ async function executeExit(
   const requestedQty = fraction >= 1 ? positionQty : Math.min(positionQty, positionQty * fraction);
   if (!(requestedQty > 0)) return false;
 
-  const fill = await exchange.sell(pair, requestedQty);
+  const fill = await exchange.sell(pair, requestedQty, fraction >= 1);
   if (!fill) return false;
 
   const soldQty = Math.min(fill.qty, requestedQty);
@@ -2899,7 +3025,11 @@ async function executeExit(
   const residualValue = residualQty * fill.price;
   if (exchange.paper) mem.adjustPaperCash(soldQty * fill.price - fill.feeUsd);
 
-  const dustThreshold = Math.max(BALANCE_DUST_USD, costBasisUsd * PARTIAL_EXIT_DUST_PCT);
+  // Only a genuinely negligible remainder may be written off with the close. A
+  // larger one is still real coins on the exchange: booking it as a total loss
+  // against the full cost basis invented a loss that never happened, and the
+  // balance came back as a fresh position on the next reconcile.
+  const dustThreshold = BALANCE_DUST_USD;
   if (residualQty > 0 && residualValue > dustThreshold) {
     const bookedPnl = mem.reducePosition(pair, soldQty, fill.price, fill.feeUsd);
     if (bookedPnl !== null) {
@@ -3061,24 +3191,35 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const reviewLimit = CONFIG.aiReviewsPerCycle === null
       ? rankedReviews.length
       : Math.min(CONFIG.aiReviewsPerCycle, rankedReviews.length);
-    const reviewSet = new Set(selectReviews(stillOpen, reviewLimit).map(p => p.pair));
+    // A position that reached its alert level is being shown to the model on
+    // purpose; it jumps the budget rather than waiting its turn.
+    const alerted = stillOpen.filter(pos => alertTriggered(pos, prices[pos.pair] ?? pos.currentPrice));
+    for (const pos of alerted)
+      console.warn(`  [ALERT] ${pos.pair} reached ${fmt(pos.alertPrice!)} (now ${fmt(prices[pos.pair] ?? pos.currentPrice)}, stop ${fmt(pos.stopLoss)}) — asking the AI what to do`);
+    const budgeted = selectReviews(stillOpen.filter(pos => !alerted.includes(pos)),
+      Math.max(0, reviewLimit - alerted.length));
+    const reviewSet = new Set([...alerted, ...budgeted].map(p => p.pair));
     console.log(`  [PHASE 1] AI review budget: ${CONFIG.aiReviewsPerCycle === null ? 'all' : `${reviewLimit}/${rankedReviews.length}`}`);
 
     for (const [index, pos] of rankedReviews.entries()) {
       const ta = analysisByPair.get(pos.pair);
-      if (!ta) continue;
       try {
         // Deterministic risk management runs before the AI gets a say: the trail
         // only ever tightens, so it cannot be argued out of protecting a winner.
+        // It must not depend on fresh candles either — a pair whose history failed
+        // to load still has a position to protect, and trailingStop falls back to
+        // the ATR recorded at entry.
         const live = mem.positions[pos.pair];
         if (live?.status === 'open') {
-          const trail = trailingStop(live, live.currentPrice, ta.atr);
+          const trail = trailingStop(live, live.currentPrice, ta?.atr ?? null);
           if (trail) {
             live.stopLoss = trail.stop;
             mem.savePositions();
             console.log(`  [TRAIL] ${pos.pair} stop → ${fmt(trail.stop)} (${trail.reason})`);
           }
         }
+        // Everything past here needs technicals; the trail above did not.
+        if (!ta) continue;
 
         const urgency = reviewUrgency(pos);
         const pnlPct = reviewPnlPct(pos);
@@ -3088,11 +3229,18 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         }
         console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${rankedReviews.length} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
         const reviewed = mem.positions[pos.pair];
+        const wasAlerted = alerted.some(p => p.pair === pos.pair);
         if (reviewed) {
           reviewed.lastReviewedAt = new Date().toISOString();
+          // The alert has done its job; clear it so it cannot re-fire every
+          // cycle. The model may set a fresh one in its reply.
+          if (wasAlerted) reviewed.alertPrice = null;
           mem.savePositions();
         }
-        const d = await ai.review(pos.pair, ta, cashNote, concentration);
+        const alertNote = wasAlerted
+          ? `ALERT TRIGGERED: this position fell to the level you asked to be woken at. It has NOT been sold. Decide now: sell it, hold it, or add to it if the drawdown improved the setup rather than broke it. The hard stop at ${fmt(pos.stopLoss)} is still below you.`
+          : '';
+        const d = await ai.review(pos.pair, ta, cashNote, concentration, alertNote);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
@@ -3104,6 +3252,43 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         }
 
         const current = mem.positions[pos.pair];
+
+        // Adding to an open position: the model's answer to "why is it down" can
+        // legitimately be "because it is a better entry now".
+        if (!shutdownRequested && current?.status === 'open' && d.verdict === 'BUY' &&
+            CONFIG.allowAddOns && d.positionSizePct > 0 && !d.salvaged) {
+          const addUsd = portfolioValue * d.positionSizePct / 100;
+          const freeCash = exchange.paper ? mem.paperCash() : exchange.getAvailableCash(pos.pair) ?? 0;
+          // The dry powder the model asked for last cycle is off limits here too.
+          const spendable = Math.max(0, freeCash - cashTargetUsd) * (1 - CONFIG.feeReservePct);
+          const minimum = await exchange.getMinimumTradeUsd(pos.pair, current.currentPrice);
+          const size = Math.min(addUsd, spendable);
+          if (minimum === null) {
+            console.log(`  [ADD SKIP] ${pos.pair}: exchange minimum unavailable`);
+          } else if (size < minimum) {
+            console.log(`  [ADD SKIP] ${pos.pair}: wanted ${fmt(addUsd)} but only ${fmt(spendable)} is spendable against a ${fmt(minimum)} minimum`);
+          } else {
+            console.log(`  [ADD] ${pos.pair}: ${d.reasoning} — buying ${fmt(size)} more`);
+            const addFill = await exchange.buy(pos.pair, size);
+            if (addFill) {
+              if (exchange.paper) mem.adjustPaperCash(-(addFill.qty * addFill.price + addFill.feeUsd));
+              mem.addToPosition(pos.pair, addFill.qty, addFill.price, addFill.feeUsd);
+              await exchange.refreshBalanceSnapshot();
+              const after = mem.positions[pos.pair];
+              console.log(`  [ADD] ${pos.pair}: now ${after.qty.toFixed(6)} units at an average ${fmt(after.entryPrice)}`);
+              mem.logTrade({
+                timestamp: new Date().toISOString(), pair: pos.pair, side: 'BUY',
+                price: addFill.price, qty: addFill.qty,
+                costBasisUsd: addFill.qty * addFill.price + addFill.feeUsd,
+                stopLoss: after.stopLoss, takeProfit: after.takeProfit,
+                pnlUsd: 0, pnlPct: 0, status: 'add', sector: after.sector,
+                reason: `Added to position: ${d.reasoning}`,
+                aiVerdict: d.verdict, aiConfidence: d.confidence,
+              });
+            }
+          }
+        }
+
         if (current?.status === 'open') {
           const adjustments = applyPositionAdjustments(current, d.adjustedStop, d.adjustedTarget);
           for (const rejection of adjustments.rejected)
@@ -3116,7 +3301,15 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
             current.takeProfit = adjustments.target;
             console.log(`  [ADJUST] ${pos.pair} target → ${fmt(adjustments.target)}`);
           }
-          if (adjustments.stop !== null || adjustments.target !== null) mem.savePositions();
+          if (d.alertPrice !== null && Number.isFinite(d.alertPrice)) {
+            if (d.alertPrice > current.stopLoss && d.alertPrice < current.currentPrice) {
+              current.alertPrice = d.alertPrice;
+              console.log(`  [ALERT SET] ${pos.pair} → ${fmt(d.alertPrice)}`);
+            } else {
+              console.warn(`  [ALERT REJECT] ${pos.pair}: ${fmt(d.alertPrice)} must sit between the stop ${fmt(current.stopLoss)} and the price ${fmt(current.currentPrice)}`);
+            }
+          }
+          if (adjustments.stop !== null || adjustments.target !== null || d.alertPrice !== null) mem.savePositions();
         }
       } catch (e) {
         console.warn(`  [PHASE 1] ${pos.pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -3139,6 +3332,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const cycleCashSpent: Record<string, number> = {};
 
   const blockers: string[] = [];
+  if (newEntriesBlocked) blockers.push(newEntriesBlocked);
   if (CONFIG.maxExposurePct !== null && exposure >= portfolioValue * CONFIG.maxExposurePct)
     blockers.push(`exposure ${fmt(exposure)} at the ${pct(CONFIG.maxExposurePct)} cap`);
   if (CONFIG.maxOpenPositions !== null && holding.size >= CONFIG.maxOpenPositions)
@@ -3263,6 +3457,13 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     if (entry.notes.length) console.log(`  [PLAN] ${c.pair}: ${entry.notes.join('; ')}`);
     const d = decision;
 
+    if (d.salvaged && d.verdict === 'BUY') {
+      // Exiting on a fragment is safe; entering on one is not. A salvaged reply
+      // carries no position size, so it would open at the bare minimum with no
+      // sizing judgement behind it.
+      console.log(`  [PASS] ${c.pair}: BUY recovered from an incomplete reply; not opening a position on a fragment`);
+      continue;
+    }
     if (d.verdict !== 'BUY' ||
         (CONFIG.aiConfidenceThreshold !== null && d.confidence < CONFIG.aiConfidenceThreshold)) {
       console.log(`  [PASS] ${c.pair}: ${d.verdict} (${d.confidence}/10)`);
@@ -3313,12 +3514,19 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const fill = await exchange.buy(c.pair, finalSize);
     if (fill) {
       const filledCost = fill.qty * fill.price + fill.feeUsd;
-      mem.openPosition(c.pair, fill.qty, fill.price, sl, tp, c.sector,
-        `RSI=${c.ta.rsi} ${c.ta.trend}/${c.ta.htfTrend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd, c.ta.atr);
+      // The order filled at a fresh quote, not the scan price the plan was built
+      // from; move the levels with it so the position cannot open past its stop.
+      const settled = rebasePlanToFill(entry, c.ta.currentPrice, fill.price);
+      if (settled.stop !== sl)
+        console.log(`  [PLAN] ${c.pair}: filled at ${fmt(fill.price)} vs ${fmt(c.ta.currentPrice)} planned; stop ${fmt(sl)} → ${fmt(settled.stop)}, target ${fmt(tp)} → ${fmt(settled.target)}`);
+      mem.openPosition(c.pair, fill.qty, fill.price, settled.stop, settled.target, c.sector,
+        `RSI=${c.ta.rsi} ${c.ta.trend}/${c.ta.htfTrend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd, c.ta.atr,
+        d.alertPrice !== null && d.alertPrice > settled.stop && d.alertPrice < fill.price ? d.alertPrice : null);
       if (exchange.paper) mem.adjustPaperCash(-filledCost);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: c.pair, side: 'BUY',
-        price: fill.price, qty: fill.qty, costBasisUsd: filledCost, stopLoss: sl, takeProfit: tp,
+        price: fill.price, qty: fill.qty, costBasisUsd: filledCost,
+        stopLoss: settled.stop, takeProfit: settled.target,
         pnlUsd: 0, pnlPct: 0, status: 'open', sector: c.sector,
         reason: `RSI=${c.ta.rsi} R/R=${rr.toFixed(1)}`, aiVerdict: d.verdict, aiConfidence: d.confidence,
       });
