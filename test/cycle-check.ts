@@ -107,15 +107,19 @@ class FakeKraken {
 const fakeAi = (
   verdict: 'BUY' | 'HOLD' | 'SELL',
   sizePct = 20,
-  { stance, cashTargetPct = 0, requestedFundsUsd = 0 }: {
+  { stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict, trimFraction = 1 }: {
     stance?: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF'; cashTargetPct?: number; requestedFundsUsd?: number;
+    reviewVerdict?: 'HOLD' | 'SELL'; trimFraction?: number;
   } = {},
 ) => ({
   async analyze() {
-    return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null };
+    return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
   },
   async review() {
-    return { verdict: 'HOLD' as const, confidence: 5, reasoning: 'test', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
+    return {
+      verdict: reviewVerdict ?? ('HOLD' as const), confidence: 8, reasoning: 'test',
+      positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction,
+    };
   },
   async reviewPortfolio() {
     return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', cashTargetPct, requestedFundsUsd };
@@ -336,6 +340,43 @@ async function main() {
   assert.equal(fundingMem.state.fundingRequest?.usd, 750, 'a partial top-up does not clear it');
   fundingMem.clearFundingRequestIfFunded(750);
   assert.equal(fundingMem.state.fundingRequest, null);
+
+  // ── The model can trim a position to raise cash toward its target ─────────
+  // A cash target that can only block buying is half a lever: when the account is
+  // already invested, selling is the only route to it.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const trimMem = new Memory();
+  const trimPair = 'SOL/USD';
+  const trimPrice = fake.prices[trimPair];
+  // Sized so the account still holds real cash; otherwise this would only be
+  // exercising the zero-cash edge.
+  trimMem.openPosition(trimPair, 2, trimPrice, trimPrice * 0.8, trimPrice * 1.5, 'l1', 'seed', 'seed');
+  const cashBefore = trimMem.paperCash();
+  assert.ok(cashBefore > 0, 'the scenario must start with cash on hand');
+
+  // A standing stance asking for cash the account does not hold.
+  trimMem.recordStance({ stance: 'NEUTRAL', confidence: 7, reasoning: 'raise cash', cashTargetPct: 0.5, requestedFundsUsd: 0 });
+  await runCycle(paper, trimMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL', cashTargetPct: 0.5, reviewVerdict: 'SELL', trimFraction: 0.4 }));
+
+  const trimmedPosition = trimMem.positions[trimPair];
+  assert.equal(trimmedPosition.status, 'open', 'a trim keeps the position open');
+  assert.ok(Math.abs(trimmedPosition.qty - 1.2) < 1e-6, `expected 1.2 units left, got ${trimmedPosition.qty}`);
+  assert.ok(Math.abs(trimmedPosition.costBasisUsd - trimPrice * 1.2) < 1e-6,
+    'the cost basis shrinks in proportion');
+  assert.ok(Math.abs(trimMem.paperCash() - (cashBefore + trimPrice * 0.8)) < 1e-6,
+    'proceeds from the 0.8 units sold land in cash');
+  assert.ok(trimMem.paperCash() > cashBefore, 'the sale actually raised cash');
+  assert.equal(trimMem.state.totalTrades, 0, 'a trim is not a completed trade');
+
+  // A full SELL still closes the whole thing.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const exitMem = new Memory();
+  exitMem.openPosition(trimPair, 2, trimPrice, trimPrice * 0.8, trimPrice * 1.5, 'l1', 'seed', 'seed');
+  await runCycle(paper, exitMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL', reviewVerdict: 'SELL', trimFraction: 1 }));
+  assert.equal(exitMem.positions[trimPair].status, 'closed', 'trim_pct of 100 exits fully');
+  assert.equal(exitMem.state.totalTrades, 1);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');

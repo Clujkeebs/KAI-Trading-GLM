@@ -84,13 +84,17 @@ The AI is the decision maker. Each cycle it makes two calls:
 - `RISK_ON` / `NEUTRAL` / `RISK_OFF`. `RISK_OFF` means no new entries at all this cycle —
   the model can sit in cash and wait for lower prices rather than being forced to answer
   one pair at a time. Exits, stops and trailing stops keep running regardless.
-- `cash_target_pct` — dry powder to hold back for a dip. The bot will not spend below it.
+- `cash_target_pct` — dry powder to hold back for a dip. The bot will not spend below it, and
+  when the account is already below the target the position review is told how far short it is
+  so the model can trim to get there. A cash target that could only block buying would be half
+  a lever: once fully invested, selling is the only route to it.
 - `requested_funds_usd` — if the opportunity is bigger than the account can fund, the model
   asks for capital. The request is logged prominently, persisted across restarts, and shown
   in every portfolio summary until that much free cash actually appears.
 
 **The trade** — per pair: buy or not, how much of the portfolio, and its own stop and target,
-which override the bot's ATR defaults.
+which override the bot's ATR defaults. On a sell it can set `trim_pct` to close only part of a
+position — taking profit while staying in a winner, or raising cash without abandoning a thesis.
 
 The bot keeps exactly three rules, and they are about survival rather than opinion:
 
