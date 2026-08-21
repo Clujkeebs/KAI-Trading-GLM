@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import ccxt from 'ccxt';
-import { TA, applyPositionAdjustments, updateTradeExtremes } from '../src/index';
+import { TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse } from '../src/index';
 
 const closes = [
   44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08,
@@ -42,5 +42,27 @@ const requestedSell = 1.239;
 const normalizedSell = Number(kraken.amountToPrecision('FAKE/USD', requestedSell));
 assert.equal(normalizedSell, 1.23);
 assert.ok(normalizedSell <= requestedSell);
+
+const validAi = parseAiResponse('{"verdict":"BUY","confidence":8,"reasoning":"clear setup","position_size_pct":5,"adjusted_stop":90,"adjusted_target":120}');
+assert.equal(validAi.kind, 'parsed');
+assert.equal(validAi.decision?.verdict, 'BUY');
+assert.equal(validAi.decision?.adjustedStop, 90);
+
+const fencedAi = parseAiResponse('```json\n{"verdict":"HOLD","confidence":6,"reasoning":"wait"}\n```');
+assert.equal(fencedAi.kind, 'parsed');
+assert.equal(fencedAi.decision?.verdict, 'HOLD');
+
+const truncatedAi = parseAiResponse('{"verdict":"BUY","confidence":9,"reasoning":"strong setup","position_size_pct":12,"adjusted_stop":90');
+assert.equal(truncatedAi.kind, 'salvaged');
+assert.equal(truncatedAi.decision?.verdict, 'BUY');
+assert.equal(truncatedAi.decision?.confidence, 9);
+assert.equal(truncatedAi.decision?.positionSizePct, 0);
+assert.equal(truncatedAi.decision?.adjustedStop, null);
+assert.equal(truncatedAi.decision?.adjustedTarget, null);
+
+const reasoningAi = parseAiResponse('', '{"verdict":"SELL","confidence":7,"reasoning":"protect capital"}');
+assert.equal(reasoningAi.kind, 'parsed');
+assert.equal(reasoningAi.decision?.verdict, 'SELL');
+assert.equal(parseAiResponse('').kind, 'empty');
 
 console.log('logic checks passed');

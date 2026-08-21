@@ -25,6 +25,8 @@ All settings live in `.env` (see `.env.example`):
 
 - `AI_API_KEY` — OpenRouter API key (required)
 - `AI_PROVIDER` / `AI_MODEL` — defaults to `openrouter` / `z-ai/glm-5.2`
+- `AI_MAX_TOKENS` — AI completion/reasoning token budget (default `1500`, positive integer)
+- `AI_BASE_URL` — optional OpenAI-compatible API base URL override; blank uses the provider's configured URL
 - `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` — required to run (Trade permission only)
 - `PAPER_MODE` — `false` by default for real money; set `true` for simulated trades
 - `PORTFOLIO_VALUE` — fallback portfolio size in USD when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle
@@ -60,6 +62,9 @@ spend most or all of a tiny account if the AI requests it; use `PAPER_MODE=true`
 
 Exchange and AI calls use bounded retries with backoff. The worker handles SIGINT/SIGTERM,
 finishes the current operation, atomically flushes state, and stops between cycles.
+AI responses request JSON object output, tolerate surrounding markdown and truncated
+payloads, and retry once with a corrective JSON-only instruction before falling back to
+HOLD. Truncated responses never supply stop or target adjustments.
 
 ## Disclaimer
 

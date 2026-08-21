@@ -71,6 +71,8 @@ type TradingConfig = {
   aiDecisionsPerCycle: number;
   scanMaxRsi: number | null;
   feeReservePct: number;
+  aiMaxTokens: number;
+  aiBaseUrl: string | null;
   loopMode: boolean;
 };
 let CONFIG: TradingConfig;
@@ -125,6 +127,8 @@ function loadConfig(): TradingConfig {
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
+    aiMaxTokens: envInteger('AI_MAX_TOKENS', 1500, 1),
+    aiBaseUrl: process.env.AI_BASE_URL?.trim() || null,
     loopMode,
   };
 }
@@ -187,14 +191,19 @@ function getSector(pair: string): string {
   return 'unlisted';
 }
 
-async function withRetry<T>(label: string, operation: () => Promise<T>, attempts = RETRY_ATTEMPTS): Promise<T> {
+async function withRetry<T>(
+  label: string,
+  operation: () => Promise<T>,
+  attempts = RETRY_ATTEMPTS,
+  shouldRetry: (error: unknown) => boolean = () => true,
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       return await operation();
     } catch (error) {
       lastError = error;
-      if (attempt === attempts) break;
+      if (attempt === attempts || !shouldRetry(error)) break;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[RETRY] ${label} failed (${attempt}/${attempts}): ${message}`);
       await sleep(RETRY_BACKOFF_MS * attempt);
@@ -1033,13 +1042,122 @@ YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
 
-RESPOND WITH EXACTLY THIS FORMAT (JSON only, no markdown):
-{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null}`;
+RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
+Keep "reasoning" under 20 words. Do not restate the data you were given.
+{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null}`;
+
+type AiParseResult = {
+  decision: AiDecision | null;
+  kind: 'parsed' | 'salvaged' | 'empty' | 'invalid';
+  error?: string;
+};
+
+function textContent(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  return value.map(part => {
+    if (typeof part === 'string') return part;
+    if (part && typeof part === 'object' && typeof (part as any).text === 'string') return (part as any).text;
+    return '';
+  }).join('');
+}
+
+function extractJsonObject(text: string): string | null {
+  const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '');
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const char = cleaned[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      if (start < 0) start = i;
+      depth++;
+    } else if (char === '}' && start >= 0) {
+      depth--;
+      if (depth === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function normalizeAiDecision(json: any, salvage = false): AiDecision {
+  const verdict = String(json?.verdict || '').toUpperCase();
+  const confidenceValue = Number(json?.confidence);
+  const confidence = Number.isFinite(confidenceValue)
+    ? Math.min(10, Math.max(1, Math.round(confidenceValue)))
+    : 5;
+  const adjustedStop = !salvage && json?.adjusted_stop !== null && json?.adjusted_stop !== undefined &&
+    Number.isFinite(Number(json.adjusted_stop)) ? Number(json.adjusted_stop) : null;
+  const adjustedTarget = !salvage && json?.adjusted_target !== null && json?.adjusted_target !== undefined &&
+    Number.isFinite(Number(json.adjusted_target)) ? Number(json.adjusted_target) : null;
+  return {
+    verdict: verdict === 'BUY' || verdict === 'SELL' || verdict === 'HOLD' ? verdict : 'HOLD',
+    confidence,
+    reasoning: typeof json?.reasoning === 'string' && json.reasoning.trim() ? json.reasoning.trim() : 'No reason',
+    positionSizePct: salvage ? 0 : Math.max(0, Number(json?.position_size_pct) || 0),
+    adjustedStop,
+    adjustedTarget,
+  };
+}
+
+export function parseAiResponse(content: unknown, reasoningContent?: unknown): AiParseResult {
+  const contentText = textContent(content);
+  const text = contentText.trim() ? contentText : textContent(reasoningContent);
+  if (!text.trim()) return { decision: null, kind: 'empty' };
+
+  const objectText = extractJsonObject(text);
+  if (objectText) {
+    try {
+      return { decision: normalizeAiDecision(JSON.parse(objectText)), kind: 'parsed' };
+    } catch (e: any) {
+      const salvaged = salvageAiResponse(text);
+      return {
+        decision: salvaged,
+        kind: salvaged ? 'salvaged' : 'invalid',
+        error: e.message,
+      };
+    }
+  }
+
+  const salvaged = salvageAiResponse(text);
+  return salvaged
+    ? { decision: salvaged, kind: 'salvaged' }
+    : { decision: null, kind: 'invalid', error: 'No complete JSON object found' };
+}
+
+function isUnsupportedResponseFormat(error: unknown): boolean {
+  const value = error as any;
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  return status === 400 && /(response[_ -]?format|json[_ -]?object|structured output|unsupported|unrecognized)/i.test(message);
+}
+
+function salvageAiResponse(text: string): AiDecision | null {
+  const verdictMatch = text.match(/["']verdict["']\s*:\s*["'](BUY|HOLD|SELL)["']/i);
+  if (!verdictMatch) return null;
+  const confidenceMatch = text.match(/["']confidence["']\s*:\s*(-?\d+(?:\.\d+)?)/i);
+  const reasoningMatch = text.match(/["']reasoning["']\s*:\s*"([^"]*)/i);
+  return normalizeAiDecision({
+    verdict: verdictMatch[1],
+    confidence: confidenceMatch ? Number(confidenceMatch[1]) : 5,
+    reasoning: reasoningMatch?.[1] || 'Salvaged truncated response',
+  }, true);
+}
 
 class AiBrain {
   private client: OpenAI;
   private model: string;
   private memory: Memory;
+  private responseFormatSupported = true;
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -1062,7 +1180,7 @@ class AiBrain {
 
     this.client = new OpenAI({
       apiKey,
-      baseURL: urls[provider] || urls.openrouter,
+      baseURL: CONFIG.aiBaseUrl || urls[provider] || urls.openrouter,
       defaultHeaders: Object.keys(headers).length ? headers : undefined,
       timeout: REQUEST_TIMEOUT_MS,
       maxRetries: 0,
@@ -1116,35 +1234,64 @@ HOLD, SELL, or ADJUST?`, pair);
 
   private async call(prompt: string, pair: string): Promise<AiDecision> {
     const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
-    try {
-      const res = await withRetry(`AI request ${pair}`, () => this.client.chat.completions.create({
-        model: this.model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
-        ],
-        temperature: 0.2, max_tokens: 300,
-      }));
-      const raw = res.choices[0]?.message?.content?.trim();
-      if (!raw) { console.warn(`[AI] Empty response for ${pair}`); return fallback; }
-      const json = JSON.parse(raw.replace(/```json?\n?/g, '').replace(/```/g, '').trim());
-      const verdict = String(json.verdict || '').toUpperCase();
-      const d: AiDecision = {
-        verdict: verdict === 'BUY' || verdict === 'SELL' || verdict === 'HOLD' ? verdict : 'HOLD',
-        confidence: Math.min(10, Math.max(1, parseInt(json.confidence) || 5)),
-        reasoning: json.reasoning || 'No reason',
-        positionSizePct: Math.max(0, Number(json.position_size_pct) || 0),
-        adjustedStop: json.adjusted_stop ? +json.adjusted_stop : null,
-        adjustedTarget: json.adjusted_target ? +json.adjusted_target : null,
-      };
-      console.log(`  [AI] ${pair}: ${d.verdict} (${d.confidence}/10) — ${d.reasoning}`);
-      this.memory.state.lastAiDecision = `${pair}:${d.verdict}:${d.confidence}`;
-      this.memory.saveState();
-      return d;
-    } catch (e: any) {
-      console.error(`  [AI] Error ${pair}: ${e.message}`);
-      return fallback;
+    const messages: any[] = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
+    ];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const requestMessages = attempt === 0 ? messages : [
+        ...messages,
+        { role: 'user', content: 'Your previous reply was not valid JSON. Reply with the JSON object only, nothing else.' },
+      ];
+      try {
+        const res = await this.request(requestMessages, pair);
+        const message = res.choices?.[0]?.message;
+        const content = textContent(message?.content);
+        const reasoning = textContent(message?.reasoning);
+        if (!content.trim() && reasoning.trim())
+          console.warn(`  [AI] Empty content for ${pair}; trying message.reasoning (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'})`);
+        const parsed = parseAiResponse(content, reasoning);
+        if (parsed.decision) {
+          if (parsed.kind === 'salvaged')
+            console.warn(`  [AI] Salvaged decision for ${pair}; adjusted stop/target discarded`);
+          this.logDecision(pair, parsed.decision);
+          return parsed.decision;
+        }
+        console.warn(`  [AI] ${parsed.kind === 'empty' ? 'Empty response' : 'Unparseable response'} for ${pair} (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'}${parsed.error ? `; ${parsed.error}` : ''})`);
+      } catch (e: any) {
+        console.error(`  [AI] Error ${pair}: ${e.message}`);
+      }
+      if (attempt === 0)
+        console.warn(`  [AI] Retrying ${pair} with corrective JSON instruction`);
     }
+    console.warn(`  [AI] Falling back to HOLD for ${pair}`);
+    return fallback;
+  }
+
+  private async request(messages: any[], pair: string): Promise<any> {
+    const useStructuredOutput = this.responseFormatSupported;
+    const create = (structured: boolean) => this.client.chat.completions.create({
+      model: this.model,
+      messages,
+      temperature: 0.2,
+      max_tokens: CONFIG.aiMaxTokens,
+      ...(structured ? { response_format: { type: 'json_object' } } : {}),
+    });
+    try {
+      return await withRetry(`AI request ${pair}`, () => create(useStructuredOutput), RETRY_ATTEMPTS,
+        useStructuredOutput ? (error => !isUnsupportedResponseFormat(error)) : undefined);
+    } catch (e) {
+      if (!useStructuredOutput || !isUnsupportedResponseFormat(e)) throw e;
+      this.responseFormatSupported = false;
+      console.warn(`  [AI] ${pair}: response_format unsupported; retrying without structured output`);
+      return withRetry(`AI request ${pair} without response_format`, () => create(false));
+    }
+  }
+
+  private logDecision(pair: string, d: AiDecision) {
+    console.log(`  [AI] ${pair}: ${d.verdict} (${d.confidence}/10) — ${d.reasoning}`);
+    this.memory.state.lastAiDecision = `${pair}:${d.verdict}:${d.confidence}`;
+    this.memory.saveState();
   }
 }
 
@@ -1185,6 +1332,7 @@ async function main() {
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
+  console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
   const memory = new Memory();
