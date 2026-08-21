@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import ccxt from 'ccxt';
 import { TA, applyPositionAdjustments, updateTradeExtremes } from '../src/index';
 
 const closes = [
@@ -27,4 +28,18 @@ updateTradeExtremes(state, -2.5);
 updateTradeExtremes(state, 0.5);
 assert.equal(state.bestTrade, 1.25);
 assert.equal(state.worstTrade, -2.5);
+
+const kraken = new ccxt.kraken({ enableRateLimit: false });
+kraken.markets = {
+  'FAKE/USD': {
+    symbol: 'FAKE/USD',
+    precision: { amount: 0.01 },
+    limits: { amount: { min: 0 }, cost: { min: 0 } },
+  },
+} as any;
+const requestedSell = 1.239;
+const normalizedSell = Number(kraken.amountToPrecision('FAKE/USD', requestedSell));
+assert.equal(normalizedSell, 1.23);
+assert.ok(normalizedSell <= requestedSell);
+
 console.log('logic checks passed');

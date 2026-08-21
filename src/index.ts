@@ -621,18 +621,12 @@ class Exchange {
     return { qty, price, feeUsd };
   }
 
-  private async normalizeOrderAmount(pair: string, qty: number, price: number, truncate = false): Promise<number | null> {
+  // ccxt's amountToPrecision truncates, so an order never exceeds the requested quantity.
+  private async normalizeOrderAmount(pair: string, qty: number, price: number): Promise<number | null> {
     try {
       await this.ensureMarkets();
       const market = this.ex.market(pair);
-      const precisionMode = this.ex.precisionMode;
-      if (truncate) this.ex.precisionMode = ccxt.TRUNCATE;
-      let amount: number;
-      try {
-        amount = Number(this.ex.amountToPrecision(pair, qty));
-      } finally {
-        this.ex.precisionMode = precisionMode;
-      }
+      const amount = Number(this.ex.amountToPrecision(pair, qty));
       const minAmount = Number(market?.limits?.amount?.min || 0);
       const minCost = Number(market?.limits?.cost?.min || 0);
       if (!Number.isFinite(amount) || amount <= 0) {
@@ -730,12 +724,15 @@ class Exchange {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
         return { qty, price, feeUsd: 0 };
       }
+      // A stale or failed balance snapshot must not block an exit; Kraken rejects an
+      // oversized sell on its own.
       const availableBase = this.getAvailableBase(pair);
-      if (availableBase === null || availableBase <= 0) {
+      if (availableBase !== null && availableBase <= 0) {
         console.warn(`  [ORDER SKIP] ${pair}: no free base balance available for sell`);
         return null;
       }
-      const orderQty = await this.normalizeOrderAmount(pair, Math.min(qty, availableBase), price, true);
+      const sellQty = availableBase === null ? qty : Math.min(qty, availableBase);
+      const orderQty = await this.normalizeOrderAmount(pair, sellQty, price);
       if (orderQty === null) return null;
       const order = await this.ex.createMarketSellOrder(pair, orderQty);
       const fill = this.orderFill(order, orderQty, price, pair);
