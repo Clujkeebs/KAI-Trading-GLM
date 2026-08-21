@@ -143,6 +143,8 @@ type TradingConfig = {
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
   aiReviewsPerCycle: number | null;
+  topUpStrandedPositions: boolean;
+  topUpMaxPct: number;
   scanMaxRsi: number | null;
   feeReservePct: number;
   aiMaxTokens: number;
@@ -237,6 +239,8 @@ function loadConfig(): TradingConfig {
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
+    topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
+    topUpMaxPct: envNumber('TOPUP_MAX_PCT', 0.05, 0, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     aiMaxTokens: envInteger('AI_MAX_TOKENS', 4000, 1),
@@ -1398,6 +1402,29 @@ class Exchange {
   }
 
   /**
+   * The USD needed to lift a holding back over the exchange's minimum sellable
+   * size, or null when nothing is required or it cannot be determined. Buying has
+   * its own minimum, so the answer is usually "one minimum order".
+   */
+  async topUpCostToSell(pair: string, qty: number, price: number): Promise<number | null> {
+    try {
+      await this.ensureMarkets();
+      const market = this.ex.market(pair);
+      const minAmount = Number(market?.limits?.amount?.min || 0);
+      const shortfallQty = minAmount > 0 ? Math.max(0, minAmount - qty) : 0;
+      if (shortfallQty <= 0) return null;
+      const orderMinimum = await this.getMinimumTradeUsd(pair, price);
+      if (orderMinimum === null) return null;
+      // A buy must clear the same minimums, so the top-up is the larger of the
+      // shortfall and one minimum order.
+      return Math.max(shortfallQty * price, orderMinimum);
+    } catch (e: any) {
+      console.warn(`  [TOPUP] ${pair}: could not size a top-up (${e.message})`);
+      return null;
+    }
+  }
+
+  /**
    * Whether a full exit of `qty` would clear Kraken's amount, cost and precision
    * rules. A position that fails this has a stop loss that can never execute.
    */
@@ -1686,6 +1713,20 @@ class Memory {
     };
     this.positions[pair] = pos;
     this.savePositions();
+  }
+
+  /**
+   * Adds to an open position, re-basing the average entry on total cost. Used to
+   * lift a holding back over the exchange's minimum sellable size.
+   */
+  addToPosition(pair: string, qty: number, price: number, feeUsd = 0): boolean {
+    const p = this.positions[pair];
+    if (!p || p.status !== 'open' || !(qty > 0) || !(price > 0)) return false;
+    p.qty += qty;
+    p.costBasisUsd += qty * price + feeUsd;
+    p.entryPrice = p.costBasisUsd / p.qty;
+    this.savePositions();
+    return true;
   }
 
   /**
@@ -2789,6 +2830,69 @@ async function executeExit(
   return true;
 }
 
+/**
+ * Lifts positions that have fallen under the exchange's minimum sellable size back
+ * over it, so their stops can actually execute.
+ *
+ * A holding too small to sell is worse than an unprotected one: the bot reports a
+ * stop, the operator believes it, and the order would be rejected the moment it
+ * mattered. Production found MORPHO/USD sitting at 1.7602 against a 2.5 minimum.
+ * The spend is bounded by one exchange minimum order, and is skipped when cash is
+ * short or the pair cannot be priced.
+ */
+async function topUpStrandedPositions(
+  exchange: Exchange, mem: Memory, prices: Record<string, number>, portfolioValue: number,
+) {
+  if (!CONFIG.topUpStrandedPositions) return;
+  for (const position of mem.getOpenPositions()) {
+    if (shutdownRequested) return;
+    const price = prices[position.pair] ?? position.currentPrice;
+    if (!(price > 0)) continue;
+    const sellable = await exchange.checkSellable(position.pair, position.qty, price);
+    if (sellable.ok) continue;
+
+    const cost = await exchange.topUpCostToSell(position.pair, position.qty, price);
+    if (cost === null) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}) and no top-up size could be derived; the stop cannot execute`);
+      continue;
+    }
+    // Restoring an exit is a defensive act; buying a materially larger position is
+    // not. Past the cap this stops being a repair and becomes a discretionary
+    // trade the model never asked for, so it is reported instead.
+    const cap = portfolioValue * CONFIG.topUpMaxPct;
+    if (cost > cap) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}); restoring it would cost ${fmt(cost)}, above the ${pct(CONFIG.topUpMaxPct)} cap of ${fmt(cap)} — leaving it alone. The stop cannot execute; sell or top up by hand.`);
+      continue;
+    }
+    const freeCash = exchange.paper ? mem.paperCash() : exchange.getAvailableCash(position.pair) ?? 0;
+    const spendable = freeCash * (1 - CONFIG.feeReservePct);
+    if (spendable < cost) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}); needs ${fmt(cost)} to become sellable but only ${fmt(spendable)} is available — the stop cannot execute until it is topped up or sold by hand`);
+      continue;
+    }
+
+    console.log(`  [TOPUP] ${position.pair}: ${sellable.detail}; buying ${fmt(cost)} so the stop can execute`);
+    const fill = await exchange.buy(position.pair, cost);
+    if (!fill) {
+      console.warn(`  [TOPUP] ${position.pair}: top-up order did not fill; the stop still cannot execute`);
+      continue;
+    }
+    if (exchange.paper) mem.adjustPaperCash(-(fill.qty * fill.price + fill.feeUsd));
+    if (mem.addToPosition(position.pair, fill.qty, fill.price, fill.feeUsd)) {
+      const updated = mem.positions[position.pair];
+      console.log(`  [TOPUP] ${position.pair}: now ${updated.qty.toFixed(6)} units at an average ${fmt(updated.entryPrice)}; exit restored`);
+      mem.logTrade({
+        timestamp: new Date().toISOString(), pair: position.pair, side: 'BUY',
+        price: fill.price, qty: fill.qty, costBasisUsd: fill.qty * fill.price + fill.feeUsd,
+        stopLoss: updated.stopLoss, takeProfit: updated.takeProfit,
+        pnlUsd: 0, pnlPct: 0, status: 'topup', sector: updated.sector,
+        reason: 'Top-up to restore exchange-minimum sellable size',
+        aiVerdict: 'TOPUP', aiConfidence: 10,
+      });
+    }
+  }
+}
+
 /** Technicals for one pair, or null when history or pricing is insufficient. */
 async function analysePair(exchange: Exchange, pair: string, price: number): Promise<TechnicalAnalysis | null> {
   const candles = await exchange.getOhlcv(pair, '1h', 200);
@@ -2827,6 +2931,10 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (open.length > 0) {
     const prices = await exchange.getPricesBatch(open.map(p => p.pair));
     mem.updatePrices(prices);
+
+    // Restore exitability before any stop is evaluated, so a triggered stop is
+    // actually fillable rather than rejected for being too small.
+    await topUpStrandedPositions(exchange, mem, prices, account.tradableUsd);
 
     // Stop loss / take profit (non-negotiable)
     for (const alert of mem.checkStops(prices)) {

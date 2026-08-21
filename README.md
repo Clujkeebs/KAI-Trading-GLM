@@ -68,6 +68,17 @@ nearest resistance when that is at least 1.5R away, otherwise the ATR target. Th
 parked until the trade reaches `BREAKEVEN_AT_R`, so it never overrides the entry stop; after
 that it only ever tightens.
 
+### Keeping exits possible
+
+A position that has fallen under Kraken's minimum sellable size is worse than an unprotected
+one: the bot reports a stop, and the order would be rejected the moment it mattered. Preflight
+reports these, and the bot lifts them back over the minimum so the stop can execute.
+
+- `TOPUP_STRANDED_POSITIONS` — enabled by default
+- `TOPUP_MAX_PCT` — largest repair as a share of tradable value (default `0.05`). Past this the
+  position is reported rather than bought: restoring an exit is defensive, buying a much larger
+  position is not.
+
 ### Optional safety limits (disabled unless set)
 
 These are backstops, not a leash: they bound catastrophe, and leave normal decisions to the model.

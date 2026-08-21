@@ -378,6 +378,60 @@ async function main() {
   assert.equal(exitMem.positions[trimPair].status, 'closed', 'trim_pct of 100 exits fully');
   assert.equal(exitMem.state.totalTrades, 1);
 
+  // ── A position under the exchange minimum is topped up so its stop can fire ──
+  // Production found MORPHO/USD holding 1.7602 units against a 2.5 minimum: the
+  // bot reported a stop that Kraken would have rejected the moment it triggered.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const strandPair = 'ONDO/USD';
+  fake.markets[strandPair].limits.amount.min = 2.5;
+  const strandPrice = fake.prices[strandPair];
+  const strandedLive = new Memory();
+  strandedLive.openPosition(strandPair, 1.7602, strandPrice, strandPrice * 0.9, strandPrice * 1.2, 'rwa', 'seed', 'seed');
+
+  const before = await live.checkSellable(strandPair, 1.7602, strandPrice);
+  assert.equal(before.ok, false, 'the position starts unsellable');
+
+  // A repair costs about one exchange minimum; the account must be large enough
+  // that this stays inside the TOPUP_MAX_PCT cap.
+  fake.balance = { USD: { free: 20000, used: 0, total: 20000 }, ONDO: { free: 1.7602, used: 0, total: 1.7602 } };
+  const buysBefore = fake.orders.filter(o => o.side === 'buy').length;
+  await runCycle(live, strandedLive, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+
+  const restored = strandedLive.positions[strandPair];
+  assert.ok(restored.qty >= 2.5, `expected the holding lifted to at least 2.5, got ${restored.qty}`);
+  assert.equal((await live.checkSellable(strandPair, restored.qty, strandPrice)).ok, true,
+    'the stop must be executable after the top-up');
+  assert.ok(fake.orders.filter(o => o.side === 'buy').length > buysBefore, 'a buy was actually placed');
+  // The average entry re-bases on total cost so P/L stays honest.
+  assert.ok(Math.abs(restored.entryPrice - restored.costBasisUsd / restored.qty) < 1e-9);
+
+  // A repair that would dominate the account is refused: restoring an exit is
+  // defensive, buying a much larger position is not.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 400, used: 0, total: 400 }, ONDO: { free: 1.7602, used: 0, total: 1.7602 } };
+  const cappedMem = new Memory();
+  cappedMem.openPosition(strandPair, 1.7602, strandPrice, strandPrice * 0.9, strandPrice * 1.2, 'rwa', 'seed', 'seed');
+  const buysBeforeCap = fake.orders.filter(o => o.side === 'buy').length;
+  await runCycle(live, cappedMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+  assert.ok(Math.abs(cappedMem.positions[strandPair].qty - 1.7602) < 1e-9,
+    'an oversized repair must be refused');
+  assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeCap);
+
+  // With no cash it must warn rather than silently leave a fake stop in place.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 0, used: 0, total: 0 }, ONDO: { free: 1.7602, used: 0, total: 1.7602 } };
+  const brokeStranded = new Memory();
+  brokeStranded.openPosition(strandPair, 1.7602, strandPrice, strandPrice * 0.9, strandPrice * 1.2, 'rwa', 'seed', 'seed');
+  const buysBeforeBroke = fake.orders.filter(o => o.side === 'buy').length;
+  await runCycle(live, brokeStranded, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+  assert.ok(Math.abs(brokeStranded.positions[strandPair].qty - 1.7602) < 1e-9,
+    'without cash the position is left untouched');
+  assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeBroke, 'and no order is placed');
+  fake.markets[strandPair].limits.amount.min = 0.0001;
+
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');
 }
