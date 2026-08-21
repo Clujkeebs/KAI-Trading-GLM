@@ -5,6 +5,7 @@ import {
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
+  concentrationNote,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -386,3 +387,31 @@ assert.equal(cutOff.kind, 'salvaged');
 assert.equal(cutOff.decision?.trimFraction, 1);
 
 console.log('trim checks passed');
+
+// ── Concentration preference ─────────────────────────────────────────────────
+// Guidance, not a cap: it tells the model what a full-size position looks like
+// and lets it disagree. With no preference set it must say nothing at all.
+setConfig({ ...loadConfig(), targetPositionCount: null });
+assert.equal(concentrationNote(1000, 5), '', 'no preference means no instruction');
+
+setConfig({ ...loadConfig(), targetPositionCount: 4 });
+const spread = concentrationNote(1000, 9);
+assert.match(spread, /around 4 positions/);
+assert.match(spread, /You currently hold 9/);
+assert.match(spread, /full-size position is about \$250\.00/, '1000 split 4 ways');
+assert.match(spread, /average \$111\.11/, '1000 spread across 9');
+assert.match(spread, /holding more names than preferred/);
+assert.match(spread, /preference, not a rule/, 'the model keeps the final say');
+
+// At or under the target it should not be nagged to consolidate.
+const focused = concentrationNote(1000, 3);
+assert.ok(!/holding more names than preferred/.test(focused));
+assert.match(focused, /You currently hold 3/);
+
+// An empty book still gets a size to aim at, without a nonsense average.
+const empty = concentrationNote(800, 0);
+assert.match(empty, /full-size position is about \$200\.00/);
+assert.ok(!/average/.test(empty), 'no positions means no average to quote');
+
+setConfig(loadConfig());
+console.log('concentration checks passed');
