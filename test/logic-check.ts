@@ -4,7 +4,7 @@ import {
   TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse,
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
-  normalizeStance, applyEntryPlan, normalizeTrimFraction,
+  normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -279,6 +279,15 @@ const reasoningAi = parseAiResponse('', '{"verdict":"SELL","confidence":7,"reaso
 assert.equal(reasoningAi.kind, 'parsed');
 assert.equal(reasoningAi.decision?.verdict, 'SELL');
 assert.equal(parseAiResponse('').kind, 'empty');
+
+const reviewPositions = [
+  { ...position, pair: 'URGENT/USD', entryPrice: 90, currentPrice: 100, stopLoss: 99, takeProfit: 130 },
+  { ...position, pair: 'LOWER_PNL/USD', entryPrice: 110, currentPrice: 100, stopLoss: 80, takeProfit: 102 },
+  { ...position, pair: 'HIGHER_PNL/USD', entryPrice: 80, currentPrice: 100, stopLoss: 98, takeProfit: 110 },
+];
+assert.deepEqual(rankReviewPositions(reviewPositions).map(p => p.pair), [
+  'URGENT/USD', 'HIGHER_PNL/USD', 'LOWER_PNL/USD',
+]);
 
 console.log('logic checks passed');
 

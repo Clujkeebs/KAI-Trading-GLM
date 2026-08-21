@@ -142,6 +142,9 @@ type TradingConfig = {
   aiConfidenceThreshold: number | null;
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
+  aiReviewsPerCycle: number | null;
+  topUpStrandedPositions: boolean;
+  topUpMaxPct: number;
   scanMaxRsi: number | null;
   feeReservePct: number;
   aiMaxTokens: number;
@@ -180,6 +183,16 @@ function envNumber(name: string, fallback: number, min: number, max?: number): n
 function envInteger(name: string, fallback: number, min: number): number {
   const value = envNumber(name, fallback, min);
   if (!Number.isInteger(value)) throw new Error(`${name} must be a whole number; got "${process.env[name]}"`);
+  return value;
+}
+
+function optionalEnvInteger(name: string, min: number, fallback: number): number | null {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (raw.trim() === '') return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || !Number.isInteger(value))
+    throw new Error(`${name} must be a positive whole number; got "${raw}"`);
   return value;
 }
 
@@ -225,6 +238,9 @@ function loadConfig(): TradingConfig {
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
+    aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
+    topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
+    topUpMaxPct: envNumber('TOPUP_MAX_PCT', 0.05, 0, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     aiMaxTokens: envInteger('AI_MAX_TOKENS', 4000, 1),
@@ -830,6 +846,28 @@ export function scoreSetup(ta: TechnicalAnalysis): SetupScore {
   };
 }
 
+function reviewUrgency(position: Position): number {
+  if (!Number.isFinite(position.currentPrice) || position.currentPrice <= 0) return Number.POSITIVE_INFINITY;
+  return Math.min(
+    Math.abs(position.currentPrice - position.stopLoss),
+    Math.abs(position.takeProfit - position.currentPrice),
+  ) / position.currentPrice;
+}
+
+function reviewPnlPct(position: Position): number {
+  return position.entryPrice > 0
+    ? ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100
+    : 0;
+}
+
+export function rankReviewPositions(positions: Position[]): Position[] {
+  return [...positions].sort((a, b) => {
+    const urgencyDelta = reviewUrgency(a) - reviewUrgency(b);
+    if (urgencyDelta !== 0) return urgencyDelta;
+    return Math.abs(reviewPnlPct(b)) - Math.abs(reviewPnlPct(a));
+  });
+}
+
 // ============================================================
 // EXCHANGE CLIENT — Kraken via ccxt (paper or live)
 // ============================================================
@@ -839,6 +877,7 @@ class Exchange {
   readonly paper: boolean;
   private cycleBalance: any = null;
   private balanceLoaded = false;
+  private balanceDirty = false;
   private marketsPromise: Promise<void> | null = null;
   private cyclePrices: Record<string, number> = {};
   private cycleTickers: Record<string, { price: number; volume24h: number }> = {};
@@ -948,6 +987,7 @@ class Exchange {
   beginCycle() {
     this.cyclePrices = {};
     this.cycleTickers = {};
+    this.balanceDirty = false;
     // The balance snapshot is cycle-scoped too. Leaving it behind let a later
     // cycle size orders against a previous cycle's cash.
     this.cycleBalance = null;
@@ -1307,6 +1347,7 @@ class Exchange {
       if (!price) return null;
       if (this.paper) {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
+        this.balanceDirty = true;
         return { qty, price, feeUsd: 0 };
       }
       // A stale or failed balance snapshot must not block an exit; Kraken rejects an
@@ -1331,6 +1372,7 @@ class Exchange {
         return null;
       }
       const fill = this.orderFill(order, orderQty, price, pair);
+      this.balanceDirty = true;
       console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)} (fee ${fmt(fill.feeUsd)})`);
       return fill;
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
@@ -1357,6 +1399,29 @@ class Exchange {
     return pairs.filter(pair => {
       try { return !this.ex.market(pair); } catch { return true; }
     });
+  }
+
+  /**
+   * The USD needed to lift a holding back over the exchange's minimum sellable
+   * size, or null when nothing is required or it cannot be determined. Buying has
+   * its own minimum, so the answer is usually "one minimum order".
+   */
+  async topUpCostToSell(pair: string, qty: number, price: number): Promise<number | null> {
+    try {
+      await this.ensureMarkets();
+      const market = this.ex.market(pair);
+      const minAmount = Number(market?.limits?.amount?.min || 0);
+      const shortfallQty = minAmount > 0 ? Math.max(0, minAmount - qty) : 0;
+      if (shortfallQty <= 0) return null;
+      const orderMinimum = await this.getMinimumTradeUsd(pair, price);
+      if (orderMinimum === null) return null;
+      // A buy must clear the same minimums, so the top-up is the larger of the
+      // shortfall and one minimum order.
+      return Math.max(shortfallQty * price, orderMinimum);
+    } catch (e: any) {
+      console.warn(`  [TOPUP] ${pair}: could not size a top-up (${e.message})`);
+      return null;
+    }
   }
 
   /**
@@ -1480,9 +1545,12 @@ class Exchange {
     try {
       if (!this.paper) {
         await this.ensureMarkets();
-        const balance = this.balanceLoaded ? this.cycleBalance : await withRetry('balance fetch', () => this.ex.fetchBalance());
+        const balance = this.balanceLoaded && !this.balanceDirty
+          ? this.cycleBalance
+          : await withRetry('balance refresh', () => this.ex.fetchBalance());
         this.cycleBalance = balance;
         this.balanceLoaded = true;
+        this.balanceDirty = false;
         if (!balance) throw new Error('balance unavailable');
         const cashUsd = this.getCashValue(balance);
         const valueOf = async (holdings: Record<string, { asset: string; qty: number }>) => {
@@ -1507,6 +1575,10 @@ class Exchange {
         throw new Error('balance totals zero');
       }
     } catch (e: any) {
+      if (!this.paper && this.balanceDirty) {
+        this.cycleBalance = null;
+        this.balanceLoaded = false;
+      }
       console.warn(`  [BALANCE] API call failed (${e.message}), using PORTFOLIO_VALUE fallback`);
     }
     let marketValue = 0;
@@ -1530,7 +1602,17 @@ class Exchange {
     const total = cash + marketValue;
     console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(marketValue)} positions = ${fmt(total)}`);
     const value = total > 0 ? total : CONFIG.fallbackPortfolioValue;
+    if (this.paper) this.balanceDirty = false;
     return { totalUsd: value, cashUsd: cash, tradableUsd: value, stakedUsd: 0 };
+  }
+
+  async refreshAfterPhase1Sales(mem: Memory): Promise<PortfolioSnapshot | null> {
+    if (!this.balanceDirty) return null;
+    console.log(`  [BALANCE] Refreshing after Phase 1 sell; using settled ${this.paper ? 'paper' : 'Kraken'} balance for Phase 2`);
+    const value = await this.getPortfolioValue(mem);
+    if (!this.paper && this.balanceDirty)
+      console.warn('  [BALANCE] Post-sell refresh failed; live buying power remains unavailable');
+    return value;
   }
 }
 
@@ -1631,6 +1713,20 @@ class Memory {
     };
     this.positions[pair] = pos;
     this.savePositions();
+  }
+
+  /**
+   * Adds to an open position, re-basing the average entry on total cost. Used to
+   * lift a holding back over the exchange's minimum sellable size.
+   */
+  addToPosition(pair: string, qty: number, price: number, feeUsd = 0): boolean {
+    const p = this.positions[pair];
+    if (!p || p.status !== 'open' || !(qty > 0) || !(price > 0)) return false;
+    p.qty += qty;
+    p.costBasisUsd += qty * price + feeUsd;
+    p.entryPrice = p.costBasisUsd / p.qty;
+    this.savePositions();
+    return true;
   }
 
   /**
@@ -2609,7 +2705,7 @@ async function main() {
   console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
-  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
+  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
   console.log(`[CONFIG] State directory: ${DATA_DIR}`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
@@ -2734,6 +2830,69 @@ async function executeExit(
   return true;
 }
 
+/**
+ * Lifts positions that have fallen under the exchange's minimum sellable size back
+ * over it, so their stops can actually execute.
+ *
+ * A holding too small to sell is worse than an unprotected one: the bot reports a
+ * stop, the operator believes it, and the order would be rejected the moment it
+ * mattered. Production found MORPHO/USD sitting at 1.7602 against a 2.5 minimum.
+ * The spend is bounded by one exchange minimum order, and is skipped when cash is
+ * short or the pair cannot be priced.
+ */
+async function topUpStrandedPositions(
+  exchange: Exchange, mem: Memory, prices: Record<string, number>, portfolioValue: number,
+) {
+  if (!CONFIG.topUpStrandedPositions) return;
+  for (const position of mem.getOpenPositions()) {
+    if (shutdownRequested) return;
+    const price = prices[position.pair] ?? position.currentPrice;
+    if (!(price > 0)) continue;
+    const sellable = await exchange.checkSellable(position.pair, position.qty, price);
+    if (sellable.ok) continue;
+
+    const cost = await exchange.topUpCostToSell(position.pair, position.qty, price);
+    if (cost === null) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}) and no top-up size could be derived; the stop cannot execute`);
+      continue;
+    }
+    // Restoring an exit is a defensive act; buying a materially larger position is
+    // not. Past the cap this stops being a repair and becomes a discretionary
+    // trade the model never asked for, so it is reported instead.
+    const cap = portfolioValue * CONFIG.topUpMaxPct;
+    if (cost > cap) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}); restoring it would cost ${fmt(cost)}, above the ${pct(CONFIG.topUpMaxPct)} cap of ${fmt(cap)} — leaving it alone. The stop cannot execute; sell or top up by hand.`);
+      continue;
+    }
+    const freeCash = exchange.paper ? mem.paperCash() : exchange.getAvailableCash(position.pair) ?? 0;
+    const spendable = freeCash * (1 - CONFIG.feeReservePct);
+    if (spendable < cost) {
+      console.warn(`  [TOPUP] ${position.pair}: stranded (${sellable.detail}); needs ${fmt(cost)} to become sellable but only ${fmt(spendable)} is available — the stop cannot execute until it is topped up or sold by hand`);
+      continue;
+    }
+
+    console.log(`  [TOPUP] ${position.pair}: ${sellable.detail}; buying ${fmt(cost)} so the stop can execute`);
+    const fill = await exchange.buy(position.pair, cost);
+    if (!fill) {
+      console.warn(`  [TOPUP] ${position.pair}: top-up order did not fill; the stop still cannot execute`);
+      continue;
+    }
+    if (exchange.paper) mem.adjustPaperCash(-(fill.qty * fill.price + fill.feeUsd));
+    if (mem.addToPosition(position.pair, fill.qty, fill.price, fill.feeUsd)) {
+      const updated = mem.positions[position.pair];
+      console.log(`  [TOPUP] ${position.pair}: now ${updated.qty.toFixed(6)} units at an average ${fmt(updated.entryPrice)}; exit restored`);
+      mem.logTrade({
+        timestamp: new Date().toISOString(), pair: position.pair, side: 'BUY',
+        price: fill.price, qty: fill.qty, costBasisUsd: fill.qty * fill.price + fill.feeUsd,
+        stopLoss: updated.stopLoss, takeProfit: updated.takeProfit,
+        pnlUsd: 0, pnlPct: 0, status: 'topup', sector: updated.sector,
+        reason: 'Top-up to restore exchange-minimum sellable size',
+        aiVerdict: 'TOPUP', aiConfidence: 10,
+      });
+    }
+  }
+}
+
 /** Technicals for one pair, or null when history or pricing is insufficient. */
 async function analysePair(exchange: Exchange, pair: string, price: number): Promise<TechnicalAnalysis | null> {
   const candles = await exchange.getOhlcv(pair, '1h', 200);
@@ -2747,11 +2906,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (!exchange.paper) await exchange.reconcilePositions(mem);
 
   // ── FETCH REAL BALANCE ──
-  const account = await exchange.getPortfolioValue(mem);
+  let account = await exchange.getPortfolioValue(mem);
   mem.clearFundingRequestIfFunded(account.cashUsd);
   // Sizing runs off tradable value: staked balances are real money the bot cannot
   // spend, and counting them inflated every position size the AI was asked for.
-  const portfolioValue = account.tradableUsd;
+  let portfolioValue = account.tradableUsd;
 
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
@@ -2773,6 +2932,10 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const prices = await exchange.getPricesBatch(open.map(p => p.pair));
     mem.updatePrices(prices);
 
+    // Restore exitability before any stop is evaluated, so a triggered stop is
+    // actually fillable rather than rejected for being too small.
+    await topUpStrandedPositions(exchange, mem, prices, account.tradableUsd);
+
     // Stop loss / take profit (non-negotiable)
     for (const alert of mem.checkStops(prices)) {
       if (shutdownRequested) break;
@@ -2791,9 +2954,15 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         return null;
       }
     });
+    const analysisByPair = new Map(stillOpen.map((pos, index) => [pos.pair, analyses[index]]));
+    const rankedReviews = rankReviewPositions(stillOpen);
+    const reviewLimit = CONFIG.aiReviewsPerCycle === null
+      ? rankedReviews.length
+      : Math.min(CONFIG.aiReviewsPerCycle, rankedReviews.length);
+    console.log(`  [PHASE 1] AI review budget: ${CONFIG.aiReviewsPerCycle === null ? 'all' : `${reviewLimit}/${rankedReviews.length}`}`);
 
-    for (const [index, pos] of stillOpen.entries()) {
-      const ta = analyses[index];
+    for (const [index, pos] of rankedReviews.entries()) {
+      const ta = analysisByPair.get(pos.pair);
       if (!ta) continue;
       try {
         // Deterministic risk management runs before the AI gets a say: the trail
@@ -2808,6 +2977,13 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           }
         }
 
+        const urgency = reviewUrgency(pos);
+        const pnlPct = reviewPnlPct(pos);
+        if (index >= reviewLimit) {
+          console.log(`  [PHASE 1] AI review skipped ${pos.pair}: budget (${index + 1}/${rankedReviews.length}) | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
+          continue;
+        }
+        console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${reviewLimit} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
         const d = await ai.review(pos.pair, ta, cashNote);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
@@ -2837,6 +3013,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       } catch (e) {
         console.warn(`  [PHASE 1] ${pos.pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+    const refreshedPortfolioValue = await exchange.refreshAfterPhase1Sales(mem);
+    if (refreshedPortfolioValue !== null) {
+      account = refreshedPortfolioValue;
+      portfolioValue = account.tradableUsd;
     }
   }
 

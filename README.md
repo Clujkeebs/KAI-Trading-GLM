@@ -38,6 +38,7 @@ All settings live in `.env` (see `.env.example`):
 - `SCAN_INTERVAL_MINUTES` — scan cadence in loop mode
 - `LOOP_MODE` — continuous operation by default; set `false` for one cycle
 - `AI_DECISIONS_PER_CYCLE` — maximum new-buy decisions per cycle (default `3`)
+- `AI_REVIEWS_PER_CYCLE` — maximum Phase 1 AI position reviews per cycle (default `5`); blank reviews all positions, ranked by stop/target urgency
 - `MAX_EXPOSURE_PCT` — optional exposure cap as a portfolio fraction; disabled by default
 - `MAX_RISK_PER_TRADE_PCT` — optional per-trade risk cap as a portfolio fraction; disabled by default
 - `MAX_PORTFOLIO_RISK_PCT` — optional portfolio-risk cap as a portfolio fraction; disabled by default
@@ -66,6 +67,17 @@ The stop is placed at whichever is safer of "just under the nearest support" and
 nearest resistance when that is at least 1.5R away, otherwise the ATR target. The trail stays
 parked until the trade reaches `BREAKEVEN_AT_R`, so it never overrides the entry stop; after
 that it only ever tightens.
+
+### Keeping exits possible
+
+A position that has fallen under Kraken's minimum sellable size is worse than an unprotected
+one: the bot reports a stop, and the order would be rejected the moment it mattered. Preflight
+reports these, and the bot lifts them back over the minimum so the stop can execute.
+
+- `TOPUP_STRANDED_POSITIONS` — enabled by default
+- `TOPUP_MAX_PCT` — largest repair as a share of tradable value (default `0.05`). Past this the
+  position is reported rather than bought: restoring an exit is defensive, buying a much larger
+  position is not.
 
 ### Optional safety limits (disabled unless set)
 
@@ -143,6 +155,10 @@ finishes the current operation, atomically flushes state, and stops between cycl
 AI responses request JSON object output, tolerate surrounding markdown and truncated
 payloads, and retry once with a corrective JSON-only instruction before falling back to
 HOLD. Truncated responses never supply stop or target adjustments.
+Phase 1 stop-loss and take-profit checks always run for every open position. When
+AI reviews are budgeted, positions nearest to either exit level are reviewed first;
+lower-urgency positions are logged as skipped. If a Phase 1 sell fills, the bot refreshes
+its settled balance before Phase 2 so the freed quote cash can fund a same-cycle buy.
 
 ## Preflight and the doctor
 
