@@ -1325,6 +1325,7 @@ class Exchange {
       const qty = usd / price;
       if (this.paper) {
         console.log(`  [PAPER BUY] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(usd)}`);
+        this.balanceDirty = true;
         return { qty, price, feeUsd: 0 };
       }
       const orderQty = await this.normalizeOrderAmount(pair, qty, price);
@@ -1336,6 +1337,9 @@ class Exchange {
         return null;
       }
       const fill = this.orderFill(order, orderQty, price, pair);
+      // Any fill invalidates the cached balance, not just a sale: a Phase 1 top-up
+      // spends cash that Phase 3 would otherwise still believe it has.
+      this.balanceDirty = true;
       console.log(`  [LIVE BUY] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)} (fee ${fmt(fill.feeUsd)})`);
       return fill;
     } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return null; }
@@ -1608,7 +1612,7 @@ class Exchange {
 
   async refreshAfterPhase1Sales(mem: Memory): Promise<PortfolioSnapshot | null> {
     if (!this.balanceDirty) return null;
-    console.log(`  [BALANCE] Refreshing after Phase 1 sell; using settled ${this.paper ? 'paper' : 'Kraken'} balance for Phase 2`);
+    console.log(`  [BALANCE] Refreshing after Phase 1 trades; using settled ${this.paper ? 'paper' : 'Kraken'} balance for Phase 2`);
     const value = await this.getPortfolioValue(mem);
     if (!this.paper && this.balanceDirty)
       console.warn('  [BALANCE] Post-sell refresh failed; live buying power remains unavailable');

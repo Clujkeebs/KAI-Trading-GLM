@@ -84,7 +84,8 @@ class FakeKraken {
     return bouncing(pair.length, this.prices[pair])
       .map(c => [c.timestamp + offset, c.open, c.high, c.low, c.close, c.volume]);
   }
-  async fetchBalance() { return this.balance; }
+  balanceFetches = 0;
+  async fetchBalance() { this.balanceFetches++; return this.balance; }
   async fetchOrder(id: string) { return this.placed.get(id); }
 
   private placed = new Map<string, FakeOrder>();
@@ -396,6 +397,7 @@ async function main() {
   // that this stays inside the TOPUP_MAX_PCT cap.
   fake.balance = { USD: { free: 20000, used: 0, total: 20000 }, ONDO: { free: 1.7602, used: 0, total: 1.7602 } };
   const buysBefore = fake.orders.filter(o => o.side === 'buy').length;
+  fake.balanceFetches = 0;
   await runCycle(live, strandedLive, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
 
   const restored = strandedLive.positions[strandPair];
@@ -405,6 +407,9 @@ async function main() {
   assert.ok(fake.orders.filter(o => o.side === 'buy').length > buysBefore, 'a buy was actually placed');
   // The average entry re-bases on total cost so P/L stays honest.
   assert.ok(Math.abs(restored.entryPrice - restored.costBasisUsd / restored.qty) < 1e-9);
+  // A Phase 1 top-up spends cash, so the balance must be refetched before Phase 3
+  // sizes anything against it.
+  assert.ok(fake.balanceFetches > 1, 'the balance is refreshed after a Phase 1 buy');
 
   // A repair that would dominate the account is refused: restoring an exit is
   // defensive, buying a much larger position is not.
