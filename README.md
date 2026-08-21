@@ -68,6 +68,16 @@ nearest resistance when that is at least 1.5R away, otherwise the ATR target. Th
 parked until the trade reaches `BREAKEVEN_AT_R`, so it never overrides the entry stop; after
 that it only ever tightens.
 
+### Review budget
+
+`AI_REVIEWS_PER_CYCLE` caps how many open positions the AI reviews each cycle, ranked by how
+close each sits to its stop or target. Trailing stops and stop/target exits still run for every
+position regardless — only the AI's judgement call is budgeted.
+
+Because that ranking is deterministic, the last slot is reserved for whichever position has gone
+longest without a review. Otherwise the same low-urgency names would be skipped every cycle, and
+a position that is never reviewed can never be trimmed or closed on judgement — only by its stop.
+
 ### Concentration
 
 `TARGET_POSITION_COUNT` tells the model how concentrated the operator wants the book. It is

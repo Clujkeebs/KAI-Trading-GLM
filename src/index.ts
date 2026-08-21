@@ -60,6 +60,8 @@ export interface Position {
   highWaterMark?: number;
   /** ATR at entry, so the trail keeps a consistent volatility distance. */
   entryAtr?: number | null;
+  /** When the AI last reviewed this position, used to stop reviews starving it. */
+  lastReviewedAt?: string;
   /** P/L already booked from partial exits on this position. */
   bookedPnlUsd?: number;
   closedAt?: string; exitPrice?: number; exitValueUsd?: number;
@@ -902,6 +904,37 @@ export function rankReviewPositions(positions: Position[]): Position[] {
     if (urgencyDelta !== 0) return urgencyDelta;
     return Math.abs(reviewPnlPct(b)) - Math.abs(reviewPnlPct(a));
   });
+}
+
+/** Milliseconds since this position was last reviewed; Infinity if never. */
+function reviewAge(position: Position, now: number): number {
+  if (!position.lastReviewedAt) return Number.POSITIVE_INFINITY;
+  const at = new Date(position.lastReviewedAt).getTime();
+  return Number.isFinite(at) ? Math.max(0, now - at) : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Chooses which positions the AI reviews this cycle.
+ *
+ * Urgency ranking alone is deterministic, so when there are more positions than
+ * budget the same low-urgency names are skipped every cycle — and a position that
+ * is never reviewed can never be trimmed or closed on judgement, only by its stop.
+ * The last slot therefore goes to whichever waiting position has gone longest
+ * without a review.
+ */
+export function selectReviews(positions: Position[], limit: number, now = Date.now()): Position[] {
+  const ranked = rankReviewPositions(positions);
+  if (limit <= 0) return [];
+  if (limit >= ranked.length) return ranked;
+
+  const selected = ranked.slice(0, limit);
+  const waiting = ranked.slice(limit);
+  const stalest = waiting.reduce((oldest, position) =>
+    reviewAge(position, now) > reviewAge(oldest, now) ? position : oldest);
+  const leastUrgent = selected[selected.length - 1];
+  if (reviewAge(stalest, now) > reviewAge(leastUrgent, now))
+    selected[selected.length - 1] = stalest;
+  return selected;
 }
 
 // ============================================================
@@ -3028,6 +3061,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const reviewLimit = CONFIG.aiReviewsPerCycle === null
       ? rankedReviews.length
       : Math.min(CONFIG.aiReviewsPerCycle, rankedReviews.length);
+    const reviewSet = new Set(selectReviews(stillOpen, reviewLimit).map(p => p.pair));
     console.log(`  [PHASE 1] AI review budget: ${CONFIG.aiReviewsPerCycle === null ? 'all' : `${reviewLimit}/${rankedReviews.length}`}`);
 
     for (const [index, pos] of rankedReviews.entries()) {
@@ -3048,11 +3082,16 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
         const urgency = reviewUrgency(pos);
         const pnlPct = reviewPnlPct(pos);
-        if (index >= reviewLimit) {
+        if (!reviewSet.has(pos.pair)) {
           console.log(`  [PHASE 1] AI review skipped ${pos.pair}: budget (${index + 1}/${rankedReviews.length}) | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
           continue;
         }
-        console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${reviewLimit} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
+        console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${rankedReviews.length} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
+        const reviewed = mem.positions[pos.pair];
+        if (reviewed) {
+          reviewed.lastReviewedAt = new Date().toISOString();
+          mem.savePositions();
+        }
         const d = await ai.review(pos.pair, ta, cashNote, concentration);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
