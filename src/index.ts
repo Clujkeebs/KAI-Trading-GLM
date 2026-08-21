@@ -151,7 +151,7 @@ interface SectorStat { trades: number; wins: number; pnlUsd: number }
  * pair at a time and had no way to say "this market is toppy, sit in cash and wait
  * for lower prices" — or to ask for more capital.
  */
-interface PortfolioStance {
+export interface PortfolioStance {
   stance: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF';
   confidence: number;
   reasoning: string;
@@ -161,6 +161,9 @@ interface PortfolioStance {
   cashTargetPct: number;
   /** Extra capital the model is asking the operator to add, in USD. */
   requestedFundsUsd: number;
+  /** Cycle and time at which this stance was persisted. */
+  recordedAt?: string;
+  cycle?: number;
 }
 interface FundingRequest { usd: number; reasoning: string; requestedAt: string }
 interface TradeRecord {
@@ -221,6 +224,7 @@ type TradingConfig = {
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
   aiReviewsPerCycle: number | null;
+  stanceMaxAgeCycles: number | null;
   /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
   targetPositionCount: number | null;
   /** Assets the bot must never buy, sell, or manage. The operator's property. */
@@ -253,6 +257,7 @@ type TradingConfig = {
   preflightAiSamples: number;
 };
 let CONFIG: TradingConfig;
+let legacyStanceWarningLogged = false;
 
 /** Installs the active configuration. `main()` calls this; tests use it to set up. */
 export function setConfig(config: TradingConfig): TradingConfig {
@@ -328,6 +333,7 @@ function loadConfig(): TradingConfig {
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
+    stanceMaxAgeCycles: optionalEnvInteger('STANCE_MAX_AGE_CYCLES', 1, 4),
     targetPositionCount: optionalEnvInteger('TARGET_POSITION_COUNT', 1, null),
     excludedAssets: new Set(
       (process.env.EXCLUDED_ASSETS || '')
@@ -1947,10 +1953,18 @@ class Exchange {
 class Memory {
   positions: Record<string, Position> = {};
   state: BotState;
+  private readonly dataDir: string;
+  private readonly positionsFile: string;
+  private readonly tradesFile: string;
+  private readonly stateFile: string;
 
-  constructor() {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const saved = this.loadJson<Partial<BotState>>(STATE_FILE, {});
+  constructor(dataDir = DATA_DIR) {
+    this.dataDir = path.resolve(dataDir);
+    this.positionsFile = path.join(this.dataDir, 'positions.json');
+    this.tradesFile = path.join(this.dataDir, 'trades.csv');
+    this.stateFile = path.join(this.dataDir, 'state.json');
+    fs.mkdirSync(this.dataDir, { recursive: true });
+    const saved = this.loadJson<Partial<BotState>>(this.stateFile, {});
     this.state = {
       startedAt: new Date().toISOString(), totalTrades: 0, wins: 0, losses: 0,
       totalPnl: 0, bestTrade: null, worstTrade: null,
@@ -1973,7 +1987,7 @@ class Memory {
     for (const key of ['totalTrades', 'wins', 'losses', 'totalPnl', 'cycleCount'] as const) {
       if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
     }
-    this.positions = this.loadJson<Record<string, Position>>(POSITIONS_FILE, {});
+    this.positions = this.loadJson<Record<string, Position>>(this.positionsFile, {});
     // Positions saved before origin existed: anything imported from the exchange
     // balance was, by definition, bought by the operator.
     for (const position of Object.values(this.positions)) {
@@ -2020,8 +2034,8 @@ class Memory {
     }
   }
 
-  savePositions() { this.saveAtomic(POSITIONS_FILE, this.positions); }
-  saveState() { this.saveAtomic(STATE_FILE, this.state); }
+  savePositions() { this.saveAtomic(this.positionsFile, this.positions); }
+  saveState() { this.saveAtomic(this.stateFile, this.state); }
 
   /** Wins over decided trades; break-even closes are neither a win nor a loss. */
   winRate(): number {
@@ -2153,7 +2167,11 @@ class Memory {
    * operator actually adds capital, so it survives restarts and stays visible.
    */
   recordStance(stance: PortfolioStance) {
-    this.state.lastStance = stance;
+    this.state.lastStance = {
+      ...stance,
+      recordedAt: new Date().toISOString(),
+      cycle: this.state.cycleCount + 1,
+    };
     if (stance.requestedFundsUsd > 0) {
       this.state.fundingRequest = {
         usd: stance.requestedFundsUsd,
@@ -2222,11 +2240,11 @@ class Memory {
   }
 
   logTrade(t: TradeRecord) {
-    const header = !fs.existsSync(TRADES_FILE);
+    const header = !fs.existsSync(this.tradesFile);
     const line = [t.timestamp, t.pair, t.side, t.price, t.qty, t.costBasisUsd, t.stopLoss, t.takeProfit,
       t.pnlUsd, t.pnlPct, t.status, t.sector, t.reason, t.aiVerdict, t.aiConfidence].map(csvField).join(',');
     try {
-      fs.appendFileSync(TRADES_FILE,
+      fs.appendFileSync(this.tradesFile,
         (header ? 'timestamp,pair,side,price,qty,cost,stop,target,pnl,pct,status,sector,reason,ai_verdict,ai_confidence\n' : '') + line + '\n');
     } catch (e: any) {
       console.error(`[STATE] Could not append to trades.csv: ${e.message}`);
@@ -2578,6 +2596,23 @@ export function normalizeStance(json: any): PortfolioStance {
   };
 }
 
+export function stanceAgeCycles(stance: PortfolioStance | null, currentCycle: number): number | null {
+  const cycle = stance?.cycle;
+  if (typeof cycle !== 'number' || !Number.isInteger(cycle) || cycle < 0 || !Number.isInteger(currentCycle))
+    return null;
+  return Math.max(0, currentCycle - cycle);
+}
+
+export function isStanceFresh(
+  stance: PortfolioStance | null, currentCycle: number, maxAgeCycles: number | null,
+): boolean {
+  if (!stance?.recordedAt || !Number.isFinite(Date.parse(stance.recordedAt)))
+    return false;
+  const age = stanceAgeCycles(stance, currentCycle);
+  if (age === null) return false;
+  return maxAgeCycles === null || age <= maxAgeCycles;
+}
+
 class AiBrain {
   private client: OpenAI;
   private model: string;
@@ -2846,6 +2881,7 @@ HOLD, SELL, or ADJUST?`, pair);
     account: PortfolioSnapshot,
     candidates: Array<{ pair: string; ta: TechnicalAnalysis; score: { score: number } }>,
     concentration = '',
+    marketNote = '',
   ): Promise<PortfolioStance> {
     const breadth = candidates.length;
     const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
@@ -2874,6 +2910,7 @@ MARKET BREADTH (${breadth} watchlist pairs with usable data):
 Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (<35)
 Best-ranked setups: ${best}
 ${concentration ? `\n${concentration}\n` : ''}
+${marketNote ? `\n${marketNote}\n` : ''}
 What is the stance for this cycle?`;
 
     const json = await this.requestJsonObject(CHARTERED_STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
@@ -3220,7 +3257,7 @@ async function main() {
   console.log(`Pairs: ${tradablePairs().length} of ${WATCHLIST_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
-  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
+  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Stance age: ${CONFIG.stanceMaxAgeCycles === null ? 'off' : `${CONFIG.stanceMaxAgeCycles} cycles`} | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
   console.log(`[CONFIG] State directory: ${DATA_DIR}`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
@@ -3449,7 +3486,22 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // The cash target the model set last cycle is only half a lever if it can merely
   // block buying. When the account is below that target the only way to reach it is
   // to sell something, so the review is told how far short it is and can trim.
-  const standingStance = mem.state.lastStance;
+  const currentCycle = mem.state.cycleCount + 1;
+  const savedStance = mem.state.lastStance;
+  const standingStance = isStanceFresh(savedStance, currentCycle, CONFIG.stanceMaxAgeCycles)
+    ? savedStance
+    : null;
+  if (savedStance && !standingStance) {
+    const age = stanceAgeCycles(savedStance, currentCycle);
+    if ((!savedStance.recordedAt || age === null) && !legacyStanceWarningLogged) {
+      console.warn('  [STANCE] Ignoring saved stance without valid recordedAt/cycle metadata; it is stale');
+      legacyStanceWarningLogged = true;
+    } else if (age !== null) {
+      console.log(`  [STANCE] Ignoring stale stance from cycle ${savedStance.cycle} (${age} cycles old; max ${CONFIG.stanceMaxAgeCycles ?? 'disabled'})`);
+    }
+  } else if (standingStance) {
+    console.log(`  [STANCE] Applying ${standingStance.stance} stance from cycle ${standingStance.cycle} (age ${stanceAgeCycles(standingStance, currentCycle)} cycle${stanceAgeCycles(standingStance, currentCycle) === 1 ? '' : 's'})`);
+  }
   const cashTargetUsd = standingStance ? account.tradableUsd * standingStance.cashTargetPct : 0;
   const cashShortfallUsd = Math.max(0, cashTargetUsd - account.cashUsd);
   const concentration = concentrationNote(account.tradableUsd, open.length);
@@ -3703,8 +3755,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // The model's call on the whole book comes first. It can decline to deploy
   // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
   let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
-  if (candidates.length > 0 && !shutdownRequested) {
-    stance = await ai.reviewPortfolio(account, candidates, concentrationNote(portfolioValue, mem.getOpenPositions().length));
+  if (!shutdownRequested) {
+    const marketNote = !canOpen
+      ? `NEW ENTRIES BLOCKED THIS CYCLE: ${blockers.join('; ')}.`
+      : candidates.length === 0
+        ? 'No watchlist pair produced a usable setup this cycle.'
+        : '';
+    stance = await ai.reviewPortfolio(account, candidates,
+      concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote);
     mem.recordStance(stance);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
     if (stance.counterCase) console.log(`  [STANCE] against it — ${stance.counterCase}`);

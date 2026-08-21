@@ -45,6 +45,7 @@ All settings live in `.env` (see `.env.example`):
 - `LOOP_MODE` — continuous operation by default; set `false` for one cycle
 - `AI_DECISIONS_PER_CYCLE` — maximum new-buy decisions per cycle (default `3`)
 - `AI_REVIEWS_PER_CYCLE` — maximum Phase 1 AI position reviews per cycle (default `5`); blank reviews all positions, ranked by stop/target urgency
+- `STANCE_MAX_AGE_CYCLES` — maximum age of a saved portfolio stance in cycles (default `4`); blank disables expiry. The stance is evaluated every cycle, including when no pairs are scannable
 - `MAX_EXPOSURE_PCT` — optional exposure cap as a portfolio fraction; disabled by default
 - `MAX_RISK_PER_TRADE_PCT` — optional per-trade risk cap as a portfolio fraction; disabled by default
 - `MAX_PORTFOLIO_RISK_PCT` — optional portfolio-risk cap as a portfolio fraction; disabled by default
@@ -83,6 +84,12 @@ position regardless — only the AI's judgement call is budgeted.
 Because that ranking is deterministic, the last slot is reserved for whichever position has gone
 longest without a review. Otherwise the same low-urgency names would be skipped every cycle, and
 a position that is never reviewed can never be trimmed or closed on judgement — only by its stop.
+
+The portfolio stance is evaluated once every cycle, even when entries are blocked, every
+watchlist pair is already held, or no scan produces usable data. A saved stance records its
+cycle and timestamp; `STANCE_MAX_AGE_CYCLES` prevents an old cash target from continuing to
+reserve cash or create trim pressure indefinitely. Blank disables age expiry, while legacy
+stances without metadata are treated as stale.
 
 ### Positions you bought yourself
 

@@ -37,6 +37,22 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-21 — Devin — Refresh portfolio stance on empty scans and expire old mandates
+
+**Changed:** The portfolio stance is now requested on every non-shutdown cycle, including
+blocked or empty scans, with a short explanation of the blocker or missing setup in the
+prompt. Saved stances now persist their ISO timestamp and cycle; `STANCE_MAX_AGE_CYCLES`
+defaults to four cycles, can be disabled with a blank value, and stale or legacy stances
+no longer apply cash-target trim pressure or reserve cash.
+**Why:** Gating stance evaluation on candidates left whole-book judgement, funding requests,
+and cash targets frozen exactly when no new entry could be made.
+**Verified:** `npm run build`, `npm test`, and `git diff --check`; a paper single-cycle run
+with every watchlist asset excluded produced no candidates, still sent a `PORTFOLIO`
+request, and persisted stance metadata at `/home/ubuntu/kai-stance-smoke-state/state.json`.
+Live Kraken balances, orders, and production model behaviour remain unverified.
+**Watch out:** The smoke log is `/home/ubuntu/kai-stance-empty-candidates.log`; it used
+dummy credentials and the local mock provider at `AI_BASE_URL`.
+
 ### 2026-08-22 — Devin — SOUL.md is the trader's charter, wired into the prompt
 
 **Changed:** Rewrote `SOUL.md` as the mandate for GLM (the trading model), not for us, and

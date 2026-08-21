@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import ccxt from 'ccxt';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse,
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
@@ -7,6 +10,7 @@ import {
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
+  isStanceFresh, Memory,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -334,6 +338,27 @@ assert.equal(normalizeStance({ cash_target_pct: -10 }).cashTargetPct, 0);
 assert.equal(normalizeStance({ requested_funds_usd: 500 }).requestedFundsUsd, 500);
 assert.equal(normalizeStance({ requested_funds_usd: -5 }).requestedFundsUsd, 0);
 assert.equal(normalizeStance({ confidence: 99 }).confidence, 10);
+
+const timestampedStance = {
+  stance: 'NEUTRAL' as const, confidence: 5, reasoning: 'test',
+  counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0,
+  recordedAt: new Date().toISOString(), cycle: 10,
+};
+assert.equal(isStanceFresh(timestampedStance, 14, 4), true);
+assert.equal(isStanceFresh(timestampedStance, 15, 4), false);
+assert.equal(isStanceFresh({ ...timestampedStance, recordedAt: undefined }, 10, null), false);
+assert.equal(isStanceFresh(timestampedStance, 100, null), true);
+
+const stanceStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kai-stance-'));
+const stanceMemory = new Memory(stanceStateDir);
+stanceMemory.state.cycleCount = 7;
+stanceMemory.recordStance(timestampedStance);
+assert.equal(stanceMemory.state.lastStance?.cycle, 8);
+assert.ok(stanceMemory.state.lastStance?.recordedAt);
+const reloadedStanceMemory = new Memory(stanceStateDir);
+assert.equal(reloadedStanceMemory.state.lastStance?.cycle, 8);
+assert.equal(reloadedStanceMemory.state.lastStance?.recordedAt, stanceMemory.state.lastStance?.recordedAt);
+fs.rmSync(stanceStateDir, { recursive: true, force: true });
 
 // ── The model owns the entry plan, inside the risk cap ───────────────────────
 const entryPlan = planTrade(base)!;
