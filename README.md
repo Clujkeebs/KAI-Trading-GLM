@@ -68,6 +68,20 @@ nearest resistance when that is at least 1.5R away, otherwise the ATR target. Th
 parked until the trade reaches `BREAKEVEN_AT_R`, so it never overrides the entry stop; after
 that it only ever tightens.
 
+### Concentration
+
+`TARGET_POSITION_COUNT` tells the model how concentrated the operator wants the book. It is
+**guidance, not a cap**: every decision point — the stance, each position review, and each entry
+— is told the preference, the current count, and what a full-size position works out to at that
+concentration. The model may still spread wider or concentrate further if it has a reason, and
+when it holds more names than preferred it is reminded that trimming the weakest is how it frees
+capital to size the best ones properly.
+
+Leave it blank for no preference. The trade-off is real in both directions: spreading a small
+account thin loses a disproportionate share to fees and exchange minimums and leaves no winner
+big enough to matter, while concentration raises variance — with four positions instead of nine,
+a single bad one hurts more than twice as much.
+
 ### Keeping exits possible
 
 A position that has fallen under Kraken's minimum sellable size is worse than an unprotected

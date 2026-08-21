@@ -47,6 +47,7 @@ interface BuyContext {
   exposureUsd: number;
   sectorExposureUsd: number;
   sectorTargetPct: number;
+  concentration: string;
 }
 export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
@@ -143,6 +144,8 @@ type TradingConfig = {
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
   aiReviewsPerCycle: number | null;
+  /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
+  targetPositionCount: number | null;
   topUpStrandedPositions: boolean;
   topUpMaxPct: number;
   scanMaxRsi: number | null;
@@ -186,7 +189,7 @@ function envInteger(name: string, fallback: number, min: number): number {
   return value;
 }
 
-function optionalEnvInteger(name: string, min: number, fallback: number): number | null {
+function optionalEnvInteger(name: string, min: number, fallback: number | null): number | null {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   if (raw.trim() === '') return null;
@@ -239,6 +242,7 @@ function loadConfig(): TradingConfig {
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
+    targetPositionCount: optionalEnvInteger('TARGET_POSITION_COUNT', 1, null),
     topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
     topUpMaxPct: envNumber('TOPUP_MAX_PCT', 0.05, 0, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
@@ -679,6 +683,38 @@ function applyPositionAdjustments(
 }
 
 interface TradePlan { stop: number; target: number; rr: number; riskPct: number; basis: string }
+
+/**
+ * How the operator wants capital concentrated, phrased for the model.
+ *
+ * Spreading a small account across many positions loses a disproportionate share
+ * to fees and to exchange minimums, and leaves no single winner big enough to
+ * matter. This is deliberately advisory: it tells the model what is preferred and
+ * what a full-size position looks like, and lets it disagree with a reason.
+ */
+export function concentrationNote(portfolioValue: number, openCount: number): string {
+  const target = CONFIG.targetPositionCount;
+  if (target === null) return '';
+  const fullSize = portfolioValue / target;
+  const average = openCount > 0 ? portfolioValue / openCount : 0;
+  const lines = [
+    'CONCENTRATION PREFERENCE:',
+    `The operator prefers a concentrated book — around ${target} positions rather than many small ones.`,
+    `You currently hold ${openCount}.`,
+    `At that concentration a full-size position is about ${fmt(fullSize)}.`,
+  ];
+  if (openCount > 0)
+    lines.push(`Your positions currently average ${fmt(average)}.`);
+  if (openCount > target)
+    lines.push(`You are holding more names than preferred. Closing or trimming the weakest is how you free capital to size the best ones properly.`);
+  lines.push(
+    'Fees and exchange minimums take a disproportionate bite out of small positions,',
+    'and a position too small to matter cannot pay for the risk of holding it.',
+    'Size toward full size when conviction is high; take nothing when it is not.',
+    'This is a preference, not a rule — concentrate further or spread wider if you can say why.',
+  );
+  return lines.join('\n');
+}
 
 /**
  * Builds the stop and target for a new entry.
@@ -2258,11 +2294,11 @@ This sector: ${fmt(context?.sectorExposureUsd ?? 0)} held vs a ${((context?.sect
 Free cash available for this pair after fee reserve: ${fmt(context?.spendableCashUsd ?? 0)}
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
-
+${context?.concentration ? `\n${context.concentration}\n` : ''}
 BUY or HOLD?`, pair);
   }
 
-  async review(pair: string, ta: TechnicalAnalysis, cashNote = ''): Promise<AiDecision> {
+  async review(pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = ''): Promise<AiDecision> {
     const p = this.memory.positions[pair];
     if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
@@ -2281,6 +2317,7 @@ Supports: ${ta.supports.join(', ') || 'none'} | Resistances: ${ta.resistances.jo
 The bot already trails the stop upward on its own; only propose adjusted_stop if you
 want it tighter than the value above. Stops are never widened.
 ${cashNote}
+${concentration}
 
 Buy reason: ${p.reason}
 AI reasoning at entry: ${p.aiReasoning}
@@ -2443,6 +2480,7 @@ HOLD, SELL, or ADJUST?`, pair);
   async reviewPortfolio(
     account: PortfolioSnapshot,
     candidates: Array<{ pair: string; ta: TechnicalAnalysis; score: { score: number } }>,
+    concentration = '',
   ): Promise<PortfolioStance> {
     const breadth = candidates.length;
     const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
@@ -2470,7 +2508,7 @@ MARKET BREADTH (${breadth} watchlist pairs with usable data):
 4h trend: ${bullish} bullish, ${bearish} bearish, ${breadth - bullish - bearish} neutral
 Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (<35)
 Best-ranked setups: ${best}
-
+${concentration ? `\n${concentration}\n` : ''}
 What is the stance for this cycle?`;
 
     const json = await this.requestJsonObject(STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
@@ -2735,6 +2773,7 @@ async function main() {
   console.log(`[CONFIG] State directory: ${DATA_DIR}`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
   console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
+  console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
   console.log(`[CONFIG] Daily loss breaker: ${limit(CONFIG.maxDailyLossPct)} | Max positions: ${limit(CONFIG.maxOpenPositions)} | Max sector exposure: ${limit(CONFIG.maxSectorExposurePct)}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
@@ -2951,6 +2990,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const standingStance = mem.state.lastStance;
   const cashTargetUsd = standingStance ? account.tradableUsd * standingStance.cashTargetPct : 0;
   const cashShortfallUsd = Math.max(0, cashTargetUsd - account.cashUsd);
+  const concentration = concentrationNote(account.tradableUsd, open.length);
   const cashNote = standingStance && cashShortfallUsd > 0
     ? `CASH TARGET: you asked to hold ${pct(standingStance.cashTargetPct)} of the portfolio in cash (${fmt(cashTargetUsd)}). The account holds ${fmt(account.cashUsd)}, so it is ${fmt(cashShortfallUsd)} short. Selling is the only way to close that gap — SELL with a "trim_pct" if you want to raise cash from this position, or HOLD if you would rather stay invested here and raise it elsewhere.`
     : '';
@@ -3013,7 +3053,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           continue;
         }
         console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${reviewLimit} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
-        const d = await ai.review(pos.pair, ta, cashNote);
+        const d = await ai.review(pos.pair, ta, cashNote, concentration);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
@@ -3111,7 +3151,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
   let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', cashTargetPct: 0, requestedFundsUsd: 0 };
   if (candidates.length > 0 && !shutdownRequested) {
-    stance = await ai.reviewPortfolio(account, candidates);
+    stance = await ai.reviewPortfolio(account, candidates, concentrationNote(portfolioValue, mem.getOpenPositions().length));
     mem.recordStance(stance);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
     if (stance.cashTargetPct > 0)
@@ -3173,6 +3213,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       exposureUsd: exposure,
       sectorExposureUsd: sectorExposure[c.sector] ?? 0,
       sectorTargetPct: SECTOR_WEIGHTS[c.sector] ?? 0.05,
+      concentration: concentrationNote(portfolioValue, mem.getOpenPositions().length),
     }, c.plan);
 
     // The model may set its own entry stop and target. The only rule the bot
