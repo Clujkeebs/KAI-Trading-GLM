@@ -1253,7 +1253,7 @@ HOLD, SELL, or ADJUST?`, pair);
         const parsed = parseAiResponse(content, reasoning);
         if (parsed.decision) {
           if (parsed.kind === 'salvaged')
-            console.warn(`  [AI] Salvaged decision for ${pair}; adjusted stop/target discarded`);
+            console.warn(`  [AI] Salvaged decision for ${pair} (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'}); adjusted stop/target discarded`);
           this.logDecision(pair, parsed.decision);
           return parsed.decision;
         }
