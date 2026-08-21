@@ -28,6 +28,11 @@ interface AiDecision {
   verdict: 'BUY' | 'HOLD' | 'SELL'; confidence: number; reasoning: string;
   positionSizePct: number; adjustedStop: number | null; adjustedTarget: number | null;
 }
+interface BuyContext {
+  portfolioValueUsd: number;
+  spendableCashUsd: number;
+  marketMinimumUsd: number | null;
+}
 interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
   entryPrice: number; qty: number; costBasisUsd: number;
@@ -1058,7 +1063,7 @@ class AiBrain {
     console.log(`[AI] GLM 5.2 via ${provider} (${model})`);
   }
 
-  async analyze(pair: string, sector: string, ta: TechnicalAnalysis, vol24h: number): Promise<AiDecision> {
+  async analyze(pair: string, sector: string, ta: TechnicalAnalysis, vol24h: number, context?: BuyContext): Promise<AiDecision> {
     return this.call(`NEW OPPORTUNITY:
 ${pair} (Sector: ${sector}) | Price: ${fmt(ta.currentPrice)}
 24h Volume: ${fmt(vol24h)}
@@ -1070,6 +1075,12 @@ Bollinger: ${fmt(ta.bollinger.upper || 0)} / ${fmt(ta.bollinger.middle || 0)} / 
 Volume: ${ta.volumeRatio}x avg | StochRSI K=${ta.stochRsiK} D=${ta.stochRsiD}
 Supports: ${ta.supports.join(', ') || 'none'}
 Resistances: ${ta.resistances.join(', ') || 'none'}
+
+ACCOUNT & ORDER CONTEXT:
+Total portfolio value: ${fmt(context?.portfolioValueUsd ?? 0)}
+Free cash available for this pair after fee reserve: ${fmt(context?.spendableCashUsd ?? 0)}
+Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
+A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
 
 BUY or HOLD?`, pair);
   }
@@ -1343,7 +1354,25 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (aiCandidates.length > 0)
     console.log(`  [AI BUDGET] Reached: ${aiCandidates.map(c => `${c.pair} (${c.score.score.toFixed(2)})`).join(', ')}`);
   for (const c of aiCandidates) {
-    const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol);
+    const support = c.ta.supports[0] || c.ta.bollinger.lower || c.ta.currentPrice * 0.95;
+    const sl = support * 0.97;
+    const tp = c.ta.resistances[0] || c.ta.currentPrice * 1.20;
+    const risk = c.ta.currentPrice - sl;
+    const reward = tp - c.ta.currentPrice;
+    const rr = risk > 0 ? reward / risk : 0;
+    const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
+    const availableCashSnapshot = exchange.getAvailableCash(c.pair);
+    if (availableCashSnapshot === null && !exchange.paper)
+      console.warn(`  [BUY CASH] ${c.pair}: free quote balance unavailable; buy size will be treated as $0`);
+    const availableCash = availableCashSnapshot ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
+    const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
+    const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
+
+    const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
+      portfolioValueUsd: portfolioValue,
+      spendableCashUsd: spendableCash,
+      marketMinimumUsd: marketMinimum,
+    });
 
     if (d.verdict !== 'BUY' ||
         (CONFIG.aiConfidenceThreshold !== null && d.confidence < CONFIG.aiConfidenceThreshold)) {
@@ -1351,45 +1380,41 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       continue;
     }
 
-    const support = c.ta.supports[0] || c.ta.bollinger.lower || c.ta.currentPrice * 0.95;
-    const sl = support * 0.97;
-    const tp = c.ta.resistances[0] || c.ta.currentPrice * 1.20;
-    const risk = c.ta.currentPrice - sl;
-    const reward = tp - c.ta.currentPrice;
-    const rr = risk > 0 ? reward / risk : 0;
-
     if (CONFIG.minRrRatio !== null && rr < CONFIG.minRrRatio) {
       console.log(`  [PASS] ${c.pair}: R/R ${rr.toFixed(1)}:1 < ${CONFIG.minRrRatio}:1`);
       continue;
     }
 
-    const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
     const aiSize = portfolioValue * d.positionSizePct / 100;
-    const availableCash = exchange.getAvailableCash(c.pair) ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
-    const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
-    const exposureRoom = CONFIG.maxExposurePct === null
-      ? Number.POSITIVE_INFINITY
-      : Math.max(0, portfolioValue * CONFIG.maxExposurePct - exposure);
-    const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
-    if (marketMinimum === null) continue;
-
-    let maxAllowedSize = Math.min(spendableCash, exposureRoom);
-    if (CONFIG.maxRiskPerTradePct !== null && riskPct > 0)
-      maxAllowedSize = Math.min(maxAllowedSize, portfolioValue * CONFIG.maxRiskPerTradePct / riskPct);
-    if (CONFIG.maxPortfolioRiskPct !== null && riskPct > 0)
-      maxAllowedSize = Math.min(maxAllowedSize, portfolioValue * CONFIG.maxPortfolioRiskPct / riskPct);
-    const finalSize = Math.min(aiSize, maxAllowedSize);
-    if (aiSize <= 0) {
-      console.log(`  [PASS] ${c.pair}: AI requested zero position size`);
+    if (marketMinimum === null) {
+      console.log(`  [PASS] ${c.pair}: exchange minimum unavailable; cannot size buy safely`);
       continue;
     }
+
+    let configuredLimitSize = Number.POSITIVE_INFINITY;
+    if (CONFIG.maxExposurePct !== null)
+      configuredLimitSize = Math.min(configuredLimitSize, Math.max(0, portfolioValue * CONFIG.maxExposurePct - exposure));
+    if (CONFIG.maxRiskPerTradePct !== null && riskPct > 0)
+      configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxRiskPerTradePct / riskPct);
+    if (CONFIG.maxPortfolioRiskPct !== null && riskPct > 0)
+      configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxPortfolioRiskPct / riskPct);
+
     if (spendableCash < marketMinimum) {
       console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve (free ${fmt(availableCash)})`);
       continue;
     }
-    if (finalSize < marketMinimum) {
-      console.log(`  [PASS] ${c.pair}: configured limits leave ${fmt(finalSize)}, below exchange minimum ${fmt(marketMinimum)}`);
+    if (configuredLimitSize < marketMinimum) {
+      console.log(`  [PASS] ${c.pair}: configured limits leave ${fmt(configuredLimitSize)}, below exchange minimum ${fmt(marketMinimum)}`);
       continue;
+    }
+
+    let finalSize = Math.min(aiSize, spendableCash, configuredLimitSize);
+    if (aiSize <= 0) {
+      finalSize = marketMinimum;
+      console.log(`  [MIN SIZE] ${c.pair}: AI requested no position size; using exchange minimum ${fmt(marketMinimum)}`);
+    } else if (aiSize < marketMinimum) {
+      finalSize = marketMinimum;
+      console.log(`  [MIN SIZE] ${c.pair}: raising ${fmt(aiSize)} to exchange minimum ${fmt(marketMinimum)}`);
     }
 
     const sw = SECTOR_WEIGHTS[c.sector] || 0.05;
