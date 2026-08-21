@@ -1,7 +1,7 @@
 node_modules/
 dist/
-data/*.json
-logs/*.log
+data/
+logs/
 .env
 *.log
 .DS_Store
