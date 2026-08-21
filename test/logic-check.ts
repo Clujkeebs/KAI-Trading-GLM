@@ -5,7 +5,7 @@ import {
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
-  concentrationNote, selectReviews,
+  concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -461,3 +461,79 @@ assert.equal(selectReviews(book, 9, reviewNow).length, 4);
 assert.deepEqual(selectReviews(book, 0, reviewNow), []);
 
 console.log('review selection checks passed');
+
+// ── Price alerts ─────────────────────────────────────────────────────────────
+// A stop that fires automatically answers "is it down?" with "then sell". An
+// alert instead puts the position in front of the model so it can ask why.
+setConfig({ ...loadConfig(), alertAtR: 0.5 });
+// Entry 100, stop 90 → 1R is 10, so a 0.5R drawdown alerts at 95.
+assert.equal(defaultAlertPrice(100, 90), 95);
+assert.equal(defaultAlertPrice(100, 80), 90);
+// Nonsense geometry yields no alert rather than one that can never fire.
+assert.equal(defaultAlertPrice(100, 100), null);
+assert.equal(defaultAlertPrice(100, 110), null);
+
+setConfig({ ...loadConfig(), alertAtR: 0 });
+assert.equal(defaultAlertPrice(100, 90), null, 'ALERT_AT_R=0 disables alerts');
+// An alert at or below the stop would never fire before the stop does.
+setConfig({ ...loadConfig(), alertAtR: 1 });
+assert.equal(defaultAlertPrice(100, 90), null);
+setConfig({ ...loadConfig(), alertAtR: 0.5 });
+
+const alertPos = (over: Record<string, unknown> = {}) => ({
+  pair: 'AAA/USD', status: 'open', sector: 'ai', entryPrice: 100, qty: 1,
+  costBasisUsd: 100, stopLoss: 90, takeProfit: 120, currentPrice: 100,
+  reason: '', aiReasoning: '', openedAt: new Date().toISOString(),
+  alertPrice: 95, ...over,
+}) as any;
+
+assert.equal(alertTriggered(alertPos(), 96), false, 'above the alert, nothing happens');
+assert.equal(alertTriggered(alertPos(), 95), true, 'at the alert it fires');
+assert.equal(alertTriggered(alertPos(), 93), true);
+// Below the hard stop the stop owns the outcome, not the alert.
+assert.equal(alertTriggered(alertPos(), 89), false);
+assert.equal(alertTriggered(alertPos({ alertPrice: null }), 50), false);
+assert.equal(alertTriggered(alertPos({ alertPrice: undefined }), 50), false);
+assert.equal(alertTriggered(alertPos({ alertPrice: Number.NaN }), 50), false);
+
+// The model can set its own alert level in a reply.
+const withAlert = parseAiResponse('{"verdict":"HOLD","confidence":6,"reasoning":"watch support","alert_price":93.5}');
+assert.equal(withAlert.decision?.alertPrice, 93.5);
+assert.equal(parseAiResponse('{"verdict":"HOLD","confidence":6,"reasoning":"x"}').decision?.alertPrice, null);
+assert.equal(parseAiResponse('{"verdict":"HOLD","confidence":6,"reasoning":"x","alert_price":-5}').decision?.alertPrice, null);
+// A truncated reply must not be read as setting an alert it never expressed.
+assert.equal(parseAiResponse('{"verdict":"SELL","confidence":9,"reasoning":"cut').decision?.alertPrice, null);
+
+setConfig(loadConfig());
+console.log('alert checks passed');
+
+// ── The plan follows the price actually paid ─────────────────────────────────
+// Levels are computed during the scan but the order fills later at a fresh
+// quote. Left alone a position could open already below its own stop.
+const planned = planTrade(base)!;   // entry 100, stop 94.05, target 115
+const filled = rebasePlanToFill(planned, 100, 92);
+assert.ok(filled.stop < 92, 'the stop must end up below the price actually paid');
+assert.ok(Math.abs(filled.riskPct - planned.riskPct) < 1e-9, 'risk fraction is preserved');
+assert.ok(Math.abs(filled.rr - planned.rr) < 1e-9, 'reward ratio is preserved');
+assert.equal(rebasePlanToFill(planned, 100, 100).stop, planned.stop, 'no drift, no change');
+assert.equal(rebasePlanToFill(planned, 0, 92), planned, 'nonsense input leaves the plan alone');
+
+// ── A stop too close to entry cannot smuggle past the risk caps ──────────────
+// Position size limits divide by the stop distance, so a stop a hair below entry
+// drives risk toward zero and makes every risk-based cap unbounded.
+const hairline = applyEntryPlan(planned, 100, decide({ adjustedStop: 99.9 }));
+assert.equal(hairline.stop, 99.5, 'widened to the 0.5% floor');
+assert.ok(hairline.riskPct >= 0.005 - 1e-9);
+assert.match(hairline.notes.join(' '), /closer than the .* floor/);
+// A stop comfortably inside the band is still honoured untouched.
+assert.equal(applyEntryPlan(planned, 100, decide({ adjustedStop: 97 })).stop, 97);
+
+// ── A fragment never opens a position ────────────────────────────────────────
+const fragment = parseAiResponse('{"verdict":"BUY","confidence":9,"reasoning":"strong setup and the higher timef');
+assert.equal(fragment.kind, 'salvaged');
+assert.equal(fragment.decision?.salvaged, true, 'salvaged replies are flagged as such');
+assert.equal(fragment.decision?.positionSizePct, 0);
+const complete = parseAiResponse('{"verdict":"BUY","confidence":8,"reasoning":"ok","position_size_pct":10}');
+assert.equal(complete.decision?.salvaged, false);
+
+console.log('fill-rebase and salvage-guard checks passed');

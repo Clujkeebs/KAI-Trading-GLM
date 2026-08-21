@@ -119,18 +119,19 @@ class FakeKraken {
 const fakeAi = (
   verdict: 'BUY' | 'HOLD' | 'SELL',
   sizePct = 20,
-  { stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict, trimFraction = 1 }: {
+  { stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict, trimFraction = 1, reviewSizePct = 0 }: {
     stance?: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF'; cashTargetPct?: number; requestedFundsUsd?: number;
-    reviewVerdict?: 'HOLD' | 'SELL'; trimFraction?: number;
+    reviewVerdict?: 'HOLD' | 'SELL' | 'BUY'; trimFraction?: number; reviewSizePct?: number;
   } = {},
 ) => ({
   async analyze() {
-    return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
+    return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null };
   },
   async review() {
     return {
       verdict: reviewVerdict ?? ('HOLD' as const), confidence: 8, reasoning: 'test',
-      positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction,
+      positionSizePct: reviewSizePct, adjustedStop: null, adjustedTarget: null,
+      trimFraction, alertPrice: null,
     };
   },
   async reviewPortfolio() {
@@ -464,6 +465,59 @@ async function main() {
     'without cash the position is left untouched');
   assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeBroke, 'and no order is placed');
   fake.markets[strandPair].limits.amount.min = 0.0001;
+
+  // ── A full exit clears the whole balance, leaving no dust ─────────────────
+  // The live account accumulated WLD, RENDER and UNI remnants worth fractions of
+  // a cent because exits sold the remembered quantity while the exchange held
+  // slightly more.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const dustPair = 'LINK/USD';
+  const dustPrice = fake.prices[dustPair];
+  // Memory says 5 units; the exchange actually holds slightly more.
+  fake.balance = { USD: { free: 500, used: 0, total: 500 }, LINK: { free: 5.00004, used: 0, total: 5.00004 } };
+  const exitAllMem = new Memory();
+  exitAllMem.openPosition(dustPair, 5, dustPrice, dustPrice * 1.05, dustPrice * 2, 'defi', 'seed', 'seed');
+  const sellsBeforeExit = fake.orders.filter(o => o.side === 'sell' && o.pair === dustPair).length;
+  await runCycle(live, exitAllMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+  const dustSells = fake.orders.filter(o => o.side === 'sell' && o.pair === dustPair);
+  assert.ok(dustSells.length > sellsBeforeExit, 'the stop placed a sell');
+  assert.ok(Math.abs(dustSells[dustSells.length - 1].amount - 5.00004) < 1e-9,
+    `a full exit must sell the entire balance, sold ${dustSells[dustSells.length - 1].amount}`);
+  assert.ok(Math.abs((fake.balance.LINK?.total ?? 0)) < 1e-9, 'nothing is left behind');
+
+  // ── An alert wakes the model instead of selling ───────────────────────────
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const alertPair = 'ADA/USD';
+  const alertPrice = fake.prices[alertPair];
+  fake.balance = { USD: { free: 500, used: 0, total: 500 }, ADA: { free: 4, used: 0, total: 4 } };
+  const alertMem = new Memory();
+  // Alert sits just above the market; the hard stop is well below it.
+  alertMem.openPosition(alertPair, 4, alertPrice * 1.1, alertPrice * 0.8, alertPrice * 2,
+    'l1', 'seed', 'seed', 0, null, alertPrice * 1.02);
+  const sellsBeforeAlert = fake.orders.filter(o => o.side === 'sell' && o.pair === alertPair).length;
+  await runCycle(live, alertMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+  const alerted = alertMem.positions[alertPair];
+  assert.equal(alerted.status, 'open', 'an alert must not sell the position');
+  assert.equal(fake.orders.filter(o => o.side === 'sell' && o.pair === alertPair).length, sellsBeforeAlert,
+    'no exit order is placed by an alert');
+  assert.equal(alerted.alertPrice, null, 'the alert is consumed once it fires');
+  assert.ok(alerted.lastReviewedAt, 'and the position was actually reviewed');
+
+  // ── The model can add to a position it is shown ───────────────────────────
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 500, used: 0, total: 500 }, ADA: { free: 4, used: 0, total: 4 } };
+  const addMem = new Memory();
+  addMem.openPosition(alertPair, 4, alertPrice, alertPrice * 0.8, alertPrice * 2, 'l1', 'seed', 'seed');
+  const qtyBeforeAdd = addMem.positions[alertPair].qty;
+  await runCycle(live, addMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL', reviewVerdict: 'BUY', reviewSizePct: 20 }));
+  const added = addMem.positions[alertPair];
+  assert.ok(added.qty > qtyBeforeAdd, `adding must increase the position, ${qtyBeforeAdd} → ${added.qty}`);
+  assert.ok(Math.abs(added.entryPrice - added.costBasisUsd / added.qty) < 1e-9,
+    'the average entry re-bases on total cost');
+  assert.equal(added.status, 'open');
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');
