@@ -1223,6 +1223,25 @@ class Exchange {
     }
   }
 
+  /**
+   * Free vs total balance of a pair's quote asset. The gap is money the account
+   * holds but cannot spend right now — typically reserved against open orders.
+   */
+  getQuoteBalance(pair: string): { asset: string; free: number; total: number } | null {
+    if (!this.balanceLoaded || !this.cycleBalance) return null;
+    try {
+      const market = this.ex.market(pair);
+      if (!market?.quote) return null;
+      return {
+        asset: normalizeAsset(String(market.quote)),
+        free: this.getAssetField(this.cycleBalance, market.quote, 'free'),
+        total: this.getAssetField(this.cycleBalance, market.quote, 'total'),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   getQuoteAsset(pair: string): string | null {
     try {
       const quote = this.ex.market(pair)?.quote;
@@ -2474,10 +2493,18 @@ export async function runPreflight(
       if (spendable >= minimum && (!bestFunded || spendable - minimum > bestFunded.spendable - bestFunded.minimum))
         bestFunded = { pair, spendable, minimum };
     }
-    const idleCash = Math.max(0, account.cashUsd - quoteCash);
-    const idleNote = idleCash > 0.01
-      ? ` (${fmt(idleCash)} of the ${fmt(account.cashUsd)} cash balance is in stablecoins no USD pair can spend)`
-      : '';
+    // Say *why* cash is unavailable rather than guessing. Money can be missing
+    // because it sits in another stablecoin no USD pair can spend, or because it
+    // is reserved against open orders — very different problems.
+    const quoteBalance = cheapest ? exchange.getQuoteBalance(cheapest.pair) : null;
+    const reserved = quoteBalance ? Math.max(0, quoteBalance.total - quoteBalance.free) : 0;
+    const otherCash = Math.max(0, account.cashUsd - (quoteBalance?.total ?? quoteCash));
+    const reasons: string[] = [];
+    if (reserved > 0.01)
+      reasons.push(`${fmt(reserved)} of ${quoteBalance!.asset} is reserved against open orders`);
+    if (otherCash > 0.01)
+      reasons.push(`${fmt(otherCash)} sits in other stablecoins no ${quoteBalance?.asset ?? 'USD'} pair can spend`);
+    const idleNote = reasons.length ? ` (${reasons.join('; ')})` : '';
     add('Buying power', bestFunded !== null,
       cheapest === null
         ? 'could not determine any exchange minimum'
