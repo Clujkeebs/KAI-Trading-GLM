@@ -168,6 +168,8 @@ type TradingConfig = {
   aiReviewsPerCycle: number | null;
   /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
   targetPositionCount: number | null;
+  /** Assets the bot must never buy, sell, or manage. The operator's property. */
+  excludedAssets: Set<string>;
   /** Drawdown, in R, at which a position wakes the model for a decision. */
   alertAtR: number;
   /** Whether the model may add to an open position when it reviews one. */
@@ -270,6 +272,13 @@ function loadConfig(): TradingConfig {
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
     targetPositionCount: optionalEnvInteger('TARGET_POSITION_COUNT', 1, null),
+    excludedAssets: new Set(
+      (process.env.EXCLUDED_ASSETS || '')
+        .split(',')
+        .map(entry => entry.trim())
+        .filter(Boolean)
+        .map(normalizeAsset),
+    ),
     alertAtR: envNumber('ALERT_AT_R', 0.5, 0, 5),
     allowAddOns: envBoolean('ALLOW_AI_ADD_ONS', true),
     topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
@@ -319,7 +328,9 @@ const WATCHLIST: Record<string, string[]> = {
   momentum: ['PUMP/USD', 'DOGE/USD', 'BONK/USD'],
   privacy: ['XMR/USD'],
 };
-const ALL_PAIRS = Object.values(WATCHLIST).flat();
+const WATCHLIST_PAIRS = Object.values(WATCHLIST).flat();
+/** Watchlist minus anything the operator has reserved. */
+const tradablePairs = () => WATCHLIST_PAIRS.filter(pair => !isExcludedPair(pair));
 const SECTOR_WEIGHTS: Record<string, number> = {
   ai: 0.25, rwa: 0.20, defi: 0.25, l1: 0.10,
   perp_dex: 0.10, momentum: 0.05, depin: 0.03, privacy: 0.02,
@@ -381,6 +392,26 @@ const utcDay = () => new Date().toISOString().slice(0, 10);
 function csvField(value: unknown): string {
   const text = value === null || value === undefined ? '' : String(value);
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/**
+ * Whether an asset is off limits entirely.
+ *
+ * This is a hard boundary, not strategy guidance, and it is meant to be: these
+ * are holdings the operator has reserved. The bot will not buy them, will not
+ * sell them, will not adopt them as positions, and does not count them as
+ * capital it can deploy. Staked balances happen to be untradable today, which is
+ * not the same as being protected — unstaking one would otherwise hand it
+ * straight to the bot.
+ */
+function isExcludedAsset(asset: string): boolean {
+  return CONFIG.excludedAssets.has(normalizeAsset(asset));
+}
+
+/** Whether a pair trades an excluded asset, and so must never be touched. */
+export function isExcludedPair(pair: string): boolean {
+  const base = pair.split('/')[0];
+  return base ? isExcludedAsset(base) : false;
 }
 
 function getSector(pair: string): string {
@@ -769,7 +800,11 @@ export function concentrationNote(portfolioValue: number, openCount: number): st
   if (target === null) return '';
   const fullSize = portfolioValue / target;
   const average = openCount > 0 ? portfolioValue / openCount : 0;
+  const reserved = CONFIG.excludedAssets.size > 0
+    ? [`RESERVED: ${[...CONFIG.excludedAssets].sort().join(', ')} belong to the operator and are not yours to trade. They are not in your watchlist, they are not counted as capital you can deploy, and orders for them are refused. Do not propose them.`, '']
+    : [];
   const lines = [
+    ...reserved,
     'CONCENTRATION PREFERENCE:',
     `The operator prefers a concentrated book — around ${target} positions rather than many small ones.`,
     `You currently hold ${openCount}.`,
@@ -1185,6 +1220,11 @@ class Exchange {
     const mapped: Record<string, { asset: string; qty: number }> = {};
     for (const { asset, qty } of this.getBalanceEntries(balance)) {
       if (this.isCashEquivalent(asset) || this.isIgnoredAsset(asset)) continue;
+      if (isExcludedAsset(asset)) {
+        if (logUnknown)
+          console.log(`  [RESERVED] ${asset} (${qty}) is excluded; the bot will not trade or manage it`);
+        continue;
+      }
       if (isStakedBalance(asset)) {
         if (!includeStaked && logUnknown)
           console.log(`  [RECONCILE] Excluded staked holding: ${asset} (${qty}); not freely tradable`);
@@ -1196,6 +1236,20 @@ class Exchange {
           console.warn(`  [RECONCILE] Unmapped Kraken holding: ${asset} (${qty})`);
         continue;
       }
+      const pair = market.symbol;
+      if (mapped[pair]) mapped[pair].qty += qty;
+      else mapped[pair] = { asset, qty };
+    }
+    return mapped;
+  }
+
+  /** Holdings the operator has reserved, mapped for valuation only. */
+  private reservedHoldings(balance: any): Record<string, { asset: string; qty: number }> {
+    const mapped: Record<string, { asset: string; qty: number }> = {};
+    for (const { asset, qty } of this.getBalanceEntries(balance)) {
+      if (!isExcludedAsset(asset) || this.isCashEquivalent(asset) || this.isIgnoredAsset(asset)) continue;
+      const market = this.usdMarketForAsset(asset);
+      if (!market) continue;
       const pair = market.symbol;
       if (mapped[pair]) mapped[pair].qty += qty;
       else mapped[pair] = { asset, qty };
@@ -1466,6 +1520,10 @@ class Exchange {
   }
 
   async buy(pair: string, usd: number): Promise<OrderFill | null> {
+    if (isExcludedPair(pair)) {
+      console.error(`  [RESERVED] Refusing to buy ${pair}: this asset is excluded from trading`);
+      return null;
+    }
     try {
       // Sized off a fresh quote: the cycle cache can be an entire scan interval old,
       // which turns a "spend exactly this much cash" order into a rejected one.
@@ -1502,6 +1560,10 @@ class Exchange {
    *   less than a thousandth of a cent from exactly this.
    */
   async sell(pair: string, qty: number, exitAll = false): Promise<OrderFill | null> {
+    if (isExcludedPair(pair)) {
+      console.error(`  [RESERVED] Refusing to sell ${pair}: this asset is excluded from trading`);
+      return null;
+    }
     try {
       const price = await this.getPrice(pair, !this.paper);
       if (!price) return null;
@@ -1682,6 +1744,15 @@ class Exchange {
       }
 
       for (const pos of mem.getOpenPositions()) {
+        // Releasing, not closing: the coins stay exactly where they are and no
+        // trade is recorded. Treating a reserved asset as "balance gone" would
+        // have written a fictitious exit into the history.
+        if (isExcludedPair(pos.pair)) {
+          delete mem.positions[pos.pair];
+          mem.savePositions();
+          console.log(`  [RESERVED] ${pos.pair} is excluded; released from management without selling`);
+          continue;
+        }
         const holding = holdings[pos.pair];
         const price = priced[pos.pair]?.price ?? await this.getCyclePrice(pos.pair);
         if (price === null) {
@@ -1734,14 +1805,17 @@ class Exchange {
         };
         const tradableCrypto = await valueOf(this.mapHoldings(balance, false, false));
         const allCrypto = await valueOf(this.mapHoldings(balance, false, true));
-        const stakedUsd = Math.max(0, allCrypto - tradableCrypto);
+        // Reserved holdings are the operator's, not the bot's working capital;
+        // counting them would inflate every position size it asks for.
+        const reservedUsd = await valueOf(this.reservedHoldings(balance));
+        const stakedUsd = Math.max(0, allCrypto - tradableCrypto) + reservedUsd;
         const snapshot: PortfolioSnapshot = {
-          totalUsd: cashUsd + allCrypto,
+          totalUsd: cashUsd + allCrypto + reservedUsd,
           cashUsd,
           tradableUsd: cashUsd + tradableCrypto,
           stakedUsd,
         };
-        console.log(`  [BALANCE] API: ${fmt(cashUsd)} cash + ${fmt(tradableCrypto)} tradable crypto${stakedUsd > 0 ? ` + ${fmt(stakedUsd)} staked (locked)` : ''} = ${fmt(snapshot.totalUsd)}`);
+        console.log(`  [BALANCE] API: ${fmt(cashUsd)} cash + ${fmt(tradableCrypto)} tradable crypto${stakedUsd > 0 ? ` + ${fmt(stakedUsd)} staked or reserved (not the bot's to spend)` : ''} = ${fmt(snapshot.totalUsd)}`);
         if (snapshot.totalUsd > 0) return snapshot;
         throw new Error('balance totals zero');
       }
@@ -2783,12 +2857,20 @@ export async function runPreflight(
   // Always measure against fresh data, never a previous cycle's snapshot.
   exchange.beginCycle();
 
+  // 0. The operator's reserved holdings, stated plainly every run.
+  if (CONFIG.excludedAssets.size > 0) {
+    const reserved = [...CONFIG.excludedAssets].sort().join(', ');
+    const stillListed = WATCHLIST_PAIRS.filter(isExcludedPair);
+    add('Reserved assets', true,
+      `${reserved} will not be bought, sold or managed${stillListed.length ? ` (${stillListed.join(', ')} removed from the scan)` : ''}`);
+  }
+
   // 1. Market coverage — a watchlist pair Kraken does not list is dead weight.
   try {
-    const missing = await exchange.listMissingMarkets(ALL_PAIRS);
+    const missing = await exchange.listMissingMarkets(tradablePairs());
     add('Kraken markets', missing.length === 0,
       missing.length === 0
-        ? `all ${ALL_PAIRS.length} watchlist pairs are listed`
+        ? `all ${tradablePairs().length} watchlist pairs are listed`
         : `${missing.length} unlisted and permanently unreachable: ${missing.join(', ')}`,
       true);
   } catch (e: any) {
@@ -2799,8 +2881,8 @@ export async function runPreflight(
   const dataProblems: string[] = [];
   let analysed = 0;
   let freshestAgeMinutes = Number.POSITIVE_INFINITY;
-  const prices = await exchange.getPricesBatch(ALL_PAIRS);
-  await mapWithConcurrency(ALL_PAIRS, CONFIG.ohlcvConcurrency, async pair => {
+  const prices = await exchange.getPricesBatch(tradablePairs());
+  await mapWithConcurrency(tradablePairs(), CONFIG.ohlcvConcurrency, async pair => {
     const price = prices[pair];
     if (price === undefined) { dataProblems.push(`${pair}: no price`); return; }
     const candles = await exchange.getOhlcv(pair, '1h', 200);
@@ -2817,8 +2899,8 @@ export async function runPreflight(
   });
   add('Market data', dataProblems.length === 0,
     dataProblems.length === 0
-      ? `${analysed}/${ALL_PAIRS.length} pairs analysable, newest closed candle ${Math.round(freshestAgeMinutes)}min old`
-      : `${analysed}/${ALL_PAIRS.length} usable; ${dataProblems.join('; ')}`,
+      ? `${analysed}/${tradablePairs().length} pairs analysable, newest closed candle ${Math.round(freshestAgeMinutes)}min old`
+      : `${analysed}/${tradablePairs().length} usable; ${dataProblems.join('; ')}`,
     analysed === 0);
 
   // 3. Account — the numbers the bot sizes and reports against.
@@ -2840,7 +2922,7 @@ export async function runPreflight(
     let bestFunded: { pair: string; spendable: number; minimum: number } | null = null;
     let cheapest: { pair: string; minimum: number } | null = null;
     let quoteCash = 0;
-    for (const pair of ALL_PAIRS) {
+    for (const pair of tradablePairs()) {
       const price = prices[pair];
       if (price === undefined) continue;
       const minimum = await exchange.getMinimumTradeUsd(pair, price);
@@ -2955,7 +3037,7 @@ async function main() {
 │  Strategy: AI-Powered Oversold Bounce        │
 │  Risk: ATR stops + trailing exits            │
 └──────────────────────────────────────────────┘`);
-  console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
+  console.log(`Pairs: ${tradablePairs().length} of ${WATCHLIST_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
@@ -2964,6 +3046,7 @@ async function main() {
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
   console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
   console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
+  console.log(`[CONFIG] Reserved assets: ${CONFIG.excludedAssets.size ? [...CONFIG.excludedAssets].sort().join(', ') : 'none'} (never bought, sold or managed)`);
   console.log(`[CONFIG] Daily loss breaker: ${limit(CONFIG.maxDailyLossPct)} | Max positions: ${limit(CONFIG.maxOpenPositions)} | Max sector exposure: ${limit(CONFIG.maxSectorExposurePct)}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
@@ -3381,7 +3464,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const canOpen = blockers.length === 0;
   if (!canOpen) console.log(`  [PHASE 2] No new entries: ${blockers.join('; ')}.`);
 
-  const scanPairs = canOpen ? ALL_PAIRS.filter(pair => !holding.has(pair)) : [];
+  const scanPairs = canOpen ? tradablePairs().filter(pair => !holding.has(pair)) : [];
   const scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
 
   const scanned = await mapWithConcurrency(scanPairs, CONFIG.ohlcvConcurrency, async pair => {
