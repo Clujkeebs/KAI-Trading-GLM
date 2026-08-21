@@ -119,23 +119,31 @@ class FakeKraken {
 const fakeAi = (
   verdict: 'BUY' | 'HOLD' | 'SELL',
   sizePct = 20,
-  { stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict, trimFraction = 1, reviewSizePct = 0 }: {
+  {
+    stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict,
+    trimFraction = 1, reviewSizePct = 0, verdictHolds = true,
+  }: {
     stance?: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF'; cashTargetPct?: number; requestedFundsUsd?: number;
     reviewVerdict?: 'HOLD' | 'SELL' | 'BUY'; trimFraction?: number; reviewSizePct?: number;
+    verdictHolds?: boolean;
   } = {},
 ) => ({
   async analyze() {
-    return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null };
+    return {
+      verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct,
+      adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null,
+      salvaged: false, counterCase: 'test counter', verdictHolds,
+    };
   },
   async review() {
     return {
       verdict: reviewVerdict ?? ('HOLD' as const), confidence: 8, reasoning: 'test',
       positionSizePct: reviewSizePct, adjustedStop: null, adjustedTarget: null,
-      trimFraction, alertPrice: null,
+      trimFraction, alertPrice: null, salvaged: false, counterCase: 'test counter', verdictHolds,
     };
   },
   async reviewPortfolio() {
-    return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', cashTargetPct, requestedFundsUsd };
+    return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', counterCase: '', cashTargetPct, requestedFundsUsd };
   },
   async selfTest(samples: number) {
     return { valid: samples, salvaged: 0, total: samples, finishReasons: { stop: samples }, avgLatencyMs: 12, budget: 4000, lastError: '' };
@@ -518,6 +526,37 @@ async function main() {
   assert.ok(Math.abs(added.entryPrice - added.costBasisUsd / added.qty) < 1e-9,
     'the average entry re-bases on total cost');
   assert.equal(added.status, 'open');
+
+  // ── A withdrawn verdict is not traded ─────────────────────────────────────
+  // The self-check has to have teeth: arguing itself out of a trade must stop the
+  // trade, not just print a nice sentence next to it.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 1000, used: 0, total: 1000 } };
+  const withdrawnMem = new Memory();
+  const buysBeforeWithdrawn = fake.orders.filter(o => o.side === 'buy').length;
+  await runCycle(paper, withdrawnMem, fakeAi('BUY', 25, { stance: 'RISK_ON', verdictHolds: false }));
+  assert.equal(withdrawnMem.getOpenPositions().length, 0, 'a withdrawn BUY must not open anything');
+  assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeWithdrawn, 'and places no order');
+
+  // The same decision, kept, does trade — proving it was the withdrawal that stopped it.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const keptMem = new Memory();
+  await runCycle(paper, keptMem, fakeAi('BUY', 25, { stance: 'RISK_ON', verdictHolds: true }));
+  assert.equal(keptMem.getOpenPositions().length, 1, 'the identical decision, kept, opens a position');
+
+  // ── An undersized request is skipped, not rounded up ──────────────────────
+  // Rounding an undersized request up to the exchange minimum manufactured
+  // positions nobody chose — the source of the ~$5 book.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const tinyMem = new Memory();
+  const buysBeforeTiny = fake.orders.filter(o => o.side === 'buy').length;
+  // 0.01% of a $1000 portfolio is $0.10, far under any exchange minimum.
+  await runCycle(paper, tinyMem, fakeAi('BUY', 0.01, { stance: 'RISK_ON' }));
+  assert.equal(tinyMem.getOpenPositions().length, 0, 'a token-sized request is declined outright');
+  assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeTiny);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');

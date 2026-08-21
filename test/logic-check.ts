@@ -537,3 +537,40 @@ const complete = parseAiResponse('{"verdict":"BUY","confidence":8,"reasoning":"o
 assert.equal(complete.decision?.salvaged, false);
 
 console.log('fill-rebase and salvage-guard checks passed');
+
+// ── The model checks itself before committing ────────────────────────────────
+// It states the strongest case against its own decision, then keeps or withdraws
+// the verdict. Withdrawing is meant to have teeth, not be decoration.
+const held = parseAiResponse('{"verdict":"BUY","confidence":8,"reasoning":"oversold at support","position_size_pct":15,"counter_case":"4h trend is rolling over","verdict_holds":true}');
+assert.equal(held.decision?.verdict, 'BUY');
+assert.equal(held.decision?.counterCase, '4h trend is rolling over');
+assert.equal(held.decision?.verdictHolds, true);
+
+const withdrawn = parseAiResponse('{"verdict":"BUY","confidence":7,"reasoning":"looks cheap","position_size_pct":15,"counter_case":"it is cheap because demand collapsed","verdict_holds":false}');
+assert.equal(withdrawn.decision?.verdictHolds, false, 'an explicit false withdraws the trade');
+assert.equal(withdrawn.decision?.verdict, 'BUY', 'the verdict is preserved for the log, but not acted on');
+
+// Silence is not a withdrawal — a model that omits the field is not overruled.
+const quiet = parseAiResponse('{"verdict":"SELL","confidence":9,"reasoning":"thesis broken"}');
+assert.equal(quiet.decision?.verdictHolds, true);
+assert.equal(quiet.decision?.counterCase, '');
+// Nor is a non-boolean value treated as a withdrawal.
+assert.equal(parseAiResponse('{"verdict":"HOLD","confidence":5,"reasoning":"x","verdict_holds":"yes"}').decision?.verdictHolds, true);
+// A fragment never carries a self-check it did not actually make.
+const torn = parseAiResponse('{"verdict":"BUY","confidence":9,"reasoning":"strong","counter_ca');
+assert.equal(torn.decision?.verdictHolds, true);
+assert.equal(torn.decision?.counterCase, '');
+
+// The stance argues with itself too.
+assert.equal(normalizeStance({ stance: 'RISK_ON', counter_case: 'breadth is thinning' }).counterCase, 'breadth is thinning');
+assert.equal(normalizeStance({ stance: 'RISK_ON' }).counterCase, '');
+
+// ── Sizing guidance is advice, not a floor ───────────────────────────────────
+setConfig({ ...loadConfig(), targetPositionCount: 4 });
+const advice = concentrationNote(400, 2);
+assert.match(advice, /full-size position is about \$100\.00/);
+assert.match(advice, /not worth a meaningful position, it is usually not worth taking/);
+assert.match(advice, /Nothing forces your hand here/, 'it must read as guidance, not a rule');
+setConfig(loadConfig());
+
+console.log('self-check and sizing-guidance checks passed');

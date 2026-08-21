@@ -42,6 +42,13 @@ export interface AiDecision {
   alertPrice: number | null;
   /** True when this was recovered from an incomplete reply rather than parsed. */
   salvaged: boolean;
+  /** The strongest argument the model can make against its own decision. */
+  counterCase: string;
+  /**
+   * Whether the decision still stands after the model argued the other side.
+   * False means it talked itself out of it, and the trade is not taken.
+   */
+  verdictHolds: boolean;
 }
 interface BuyContext {
   portfolioValueUsd: number;
@@ -93,6 +100,8 @@ interface PortfolioStance {
   stance: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF';
   confidence: number;
   reasoning: string;
+  /** The strongest argument the model can make against its own stance. */
+  counterCase: string;
   /** Share of the portfolio the model wants held back as dry powder, 0-1. */
   cashTargetPct: number;
   /** Extra capital the model is asking the operator to add, in USD. */
@@ -765,6 +774,10 @@ export function concentrationNote(portfolioValue: number, openCount: number): st
     `The operator prefers a concentrated book — around ${target} positions rather than many small ones.`,
     `You currently hold ${openCount}.`,
     `At that concentration a full-size position is about ${fmt(fullSize)}.`,
+    'A position worth only a few dollars is not worth holding: fees and the exchange minimums',
+    'take a large share of it, and it is too small to matter even when it works. If a setup is',
+    'not worth a meaningful position, it is usually not worth taking at all — prefer skipping it',
+    'to taking a token one. Nothing forces your hand here; size it as you judge fit.',
   ];
   if (openCount > 0)
     lines.push(`Your positions currently average ${fmt(average)}.`);
@@ -2188,10 +2201,20 @@ to 100. Omit it, or use 100, to exit completely. Use a partial trim to take some
 profit while staying in a winner, or to raise cash toward the reserve you asked for
 in your stance without abandoning a thesis you still believe.
 
+CHECK YOURSELF BEFORE YOU COMMIT:
+Before answering, argue the other side. Put the strongest case against your own
+decision in "counter_case" — the thing that would make you wrong, stated as
+plainly as you can. Then decide whether your verdict survives it.
+
+If it does not, set "verdict_holds" to false and the trade is not taken. That is
+not a failure; talking yourself out of a bad trade is the cheapest money you will
+ever make. Only set it to true when you have actually weighed the counter-case,
+not because it is the default.
+
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Think briefly. Emit the JSON object as your very first output token.
-Keep "reasoning" under 12 words. Do not restate the data you were given.
-{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null, "alert_price": number or null}`;
+Keep "reasoning" under 12 words and "counter_case" under 20. Do not restate the data you were given.
+{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null, "alert_price": number or null, "counter_case": "strongest argument against this", "verdict_holds": true or false}`;
 
 type AiParseResult = {
   decision: AiDecision | null;
@@ -2267,6 +2290,11 @@ function normalizeAiDecision(json: any, salvage = false): AiDecision {
       Number.isFinite(Number(json.alert_price)) && Number(json.alert_price) > 0
       ? Number(json.alert_price) : null,
     salvaged: salvage,
+    counterCase: typeof json?.counter_case === 'string' && json.counter_case.trim()
+      ? json.counter_case.trim() : '',
+    // Absent means the model did not disown the decision. Only an explicit false
+    // withdraws it, so a model that omits the field is not silently overruled.
+    verdictHolds: salvage ? true : json?.verdict_holds !== false,
   };
 }
 
@@ -2355,8 +2383,11 @@ ask when it would change what you can actually do.
 You own this call. The bot does not second-guess the stance.
 
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
-Keep "reasoning" under 25 words.
-{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater}`;
+Before answering, argue the other side: put the strongest case against your own
+stance in "counter_case", then keep the stance only if it survives that.
+
+Keep "reasoning" under 25 words and "counter_case" under 20.
+{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this"}`;
 
 export function normalizeStance(json: any): PortfolioStance {
   const raw = String(json?.stance || '').toUpperCase().replace(/[\s-]/g, '_');
@@ -2369,6 +2400,7 @@ export function normalizeStance(json: any): PortfolioStance {
     stance,
     confidence: Number.isFinite(confidenceValue) ? Math.min(10, Math.max(1, Math.round(confidenceValue))) : 5,
     reasoning: typeof json?.reasoning === 'string' && json.reasoning.trim() ? json.reasoning.trim() : 'No reason given',
+    counterCase: typeof json?.counter_case === 'string' && json.counter_case.trim() ? json.counter_case.trim() : '',
     cashTargetPct: Number.isFinite(cashValue) ? Math.min(1, Math.max(0, cashValue / 100)) : 0,
     requestedFundsUsd: Number.isFinite(fundsValue) && fundsValue > 0 ? fundsValue : 0,
   };
@@ -2448,7 +2480,7 @@ BUY or HOLD?`, pair);
 
   async review(pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = '', alertNote = ''): Promise<AiDecision> {
     const p = this.memory.positions[pair];
-    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false };
+    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false, counterCase: '', verdictHolds: true };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
     const percent = p.costBasisUsd > 0 ? (pnl / p.costBasisUsd) * 100 : 0;
     const days = ((Date.now() - new Date(p.openedAt).getTime()) / 86400000).toFixed(1);
@@ -2475,7 +2507,7 @@ HOLD, SELL, or ADJUST?`, pair);
   }
 
   private async call(prompt: string, pair: string): Promise<AiDecision> {
-    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false };
+    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false, counterCase: '', verdictHolds: true };
     const messages: any[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
@@ -2661,7 +2693,7 @@ What is the stance for this cycle?`;
     const json = await this.requestJsonObject(STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
     if (!json) {
       console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
-      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', cashTargetPct: 0, requestedFundsUsd: 0 };
+      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
     }
     // Persisting is the caller's job, so the record is kept no matter which
     // implementation produced the stance.
@@ -2723,6 +2755,9 @@ BUY or HOLD?`,
 
   private logDecision(pair: string, d: AiDecision) {
     console.log(`  [AI] ${pair}: ${d.verdict} (${d.confidence}/10) — ${d.reasoning}`);
+    if (d.counterCase) console.log(`  [AI] ${pair}: against it — ${d.counterCase}`);
+    if (!d.verdictHolds)
+      console.log(`  [AI] ${pair}: withdrew its own ${d.verdict} after weighing that; standing down`);
     this.memory.state.lastAiDecision = `${pair}:${d.verdict}:${d.confidence}`;
     this.memory.saveState();
   }
@@ -3242,7 +3277,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           : '';
         const d = await ai.review(pos.pair, ta, cashNote, concentration, alertNote);
 
-        if (!shutdownRequested && d.verdict === 'SELL' &&
+        if (!shutdownRequested && d.verdict === 'SELL' && d.verdictHolds &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
           const partial = d.trimFraction < 1;
           console.log(`  [AI ${partial ? `TRIM ${(d.trimFraction * 100).toFixed(0)}%` : 'SELL'}] ${pos.pair}: ${d.reasoning}`);
@@ -3256,7 +3291,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         // Adding to an open position: the model's answer to "why is it down" can
         // legitimately be "because it is a better entry now".
         if (!shutdownRequested && current?.status === 'open' && d.verdict === 'BUY' &&
-            CONFIG.allowAddOns && d.positionSizePct > 0 && !d.salvaged) {
+            CONFIG.allowAddOns && d.positionSizePct > 0 && !d.salvaged && d.verdictHolds) {
           const addUsd = portfolioValue * d.positionSizePct / 100;
           const freeCash = exchange.paper ? mem.paperCash() : exchange.getAvailableCash(pos.pair) ?? 0;
           // The dry powder the model asked for last cycle is off limits here too.
@@ -3382,11 +3417,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   // The model's call on the whole book comes first. It can decline to deploy
   // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
-  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', cashTargetPct: 0, requestedFundsUsd: 0 };
+  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
   if (candidates.length > 0 && !shutdownRequested) {
     stance = await ai.reviewPortfolio(account, candidates, concentrationNote(portfolioValue, mem.getOpenPositions().length));
     mem.recordStance(stance);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
+    if (stance.counterCase) console.log(`  [STANCE] against it — ${stance.counterCase}`);
     if (stance.cashTargetPct > 0)
       console.log(`  [STANCE] Holding back ${pct(stance.cashTargetPct)} of the portfolio as dry powder (${fmt(portfolioValue * stance.cashTargetPct)})`);
     if (stance.requestedFundsUsd > 0)
@@ -3457,6 +3493,10 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     if (entry.notes.length) console.log(`  [PLAN] ${c.pair}: ${entry.notes.join('; ')}`);
     const d = decision;
 
+    if (!d.verdictHolds) {
+      console.log(`  [PASS] ${c.pair}: the AI argued itself out of this one`);
+      continue;
+    }
     if (d.salvaged && d.verdict === 'BUY') {
       // Exiting on a fragment is safe; entering on one is not. A salvaged reply
       // carries no position size, so it would open at the bare minimum with no
@@ -3493,13 +3533,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       continue;
     }
 
-    let finalSize = Math.min(aiSize, spendableCash, configuredLimitSize);
-    if (aiSize <= 0) {
-      finalSize = marketMinimum;
-      console.log(`  [MIN SIZE] ${c.pair}: AI requested no position size; using exchange minimum ${fmt(marketMinimum)}`);
-    } else if (aiSize < marketMinimum) {
-      finalSize = marketMinimum;
-      console.log(`  [MIN SIZE] ${c.pair}: raising ${fmt(aiSize)} to exchange minimum ${fmt(marketMinimum)}`);
+    // The size the model asked for is the size it gets, bounded only by cash and
+    // whatever optional caps are switched on. Quietly rounding an undersized
+    // request up to the exchange minimum used to manufacture positions nobody
+    // chose — that is where the book of ~$5 positions came from.
+    const finalSize = Math.min(aiSize, spendableCash, configuredLimitSize);
+    if (finalSize < marketMinimum) {
+      console.log(`  [PASS] ${c.pair}: ${aiSize <= 0 ? 'no size requested' : `requested ${fmt(aiSize)}`}, which is under Kraken's ${fmt(marketMinimum)} minimum for this pair — skipping rather than sizing it for the AI`);
+      continue;
     }
 
     const sw = SECTOR_WEIGHTS[c.sector] || 0.05;
