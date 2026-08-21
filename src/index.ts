@@ -80,6 +80,12 @@ export interface Position {
    * sale. Cleared once it fires; the model may set a new one.
    */
   alertPrice?: number | null;
+  /**
+   * Who opened this. 'operator' means a human bought it deliberately, for
+   * reasons the bot cannot see — which is emphatically not the same as it having
+   * no reason to exist.
+   */
+  origin?: 'bot' | 'operator';
   /** P/L already booked from partial exits on this position. */
   bookedPnlUsd?: number;
   closedAt?: string; exitPrice?: number; exitValueUsd?: number;
@@ -1741,8 +1747,8 @@ class Exchange {
         }
         mem.openPosition(pair, holding.qty, entry.price,
           stopLoss, takeProfit,
-          getSector(pair), reason, 'Imported from Kraken balance; not opened by the bot.',
-          0, plan?.atr ?? null);
+          getSector(pair), reason, 'Bought by the operator, not by the bot.',
+          0, plan?.atr ?? null, null, 'operator');
         console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source}) | stop ${fmt(stopLoss)} target ${fmt(takeProfit)} (${plan ? plan.basis : 'flat percentage fallback'})`);
       }
 
@@ -1919,6 +1925,12 @@ class Memory {
       if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
     }
     this.positions = this.loadJson<Record<string, Position>>(POSITIONS_FILE, {});
+    // Positions saved before origin existed: anything imported from the exchange
+    // balance was, by definition, bought by the operator.
+    for (const position of Object.values(this.positions)) {
+      if (position.origin === undefined)
+        position.origin = /^Imported from Kraken balance/.test(position.reason || '') ? 'operator' : 'bot';
+    }
   }
 
   private loadJson<T>(file: string, fallback: T): T {
@@ -1971,7 +1983,7 @@ class Memory {
   openPosition(
     pair: string, qty: number, price: number, sl: number, tp: number,
     sector: string, reason: string, aiReason: string, feeUsd = 0, atr: number | null = null,
-    alertPrice: number | null = null,
+    alertPrice: number | null = null, origin: 'bot' | 'operator' = 'bot',
   ) {
     const pos: Position = {
       pair, status: 'open', sector, entryPrice: price, qty,
@@ -1981,6 +1993,7 @@ class Memory {
       currentPrice: price, reason, aiReasoning: aiReason, openedAt: new Date().toISOString(),
       initialStopLoss: sl, highWaterMark: price, entryAtr: atr, bookedPnlUsd: 0,
       alertPrice: alertPrice ?? defaultAlertPrice(price, sl),
+      origin,
     };
     this.positions[pair] = pos;
     this.savePositions();
@@ -2254,6 +2267,21 @@ Once a position is open, stops only ever tighten — you can pull one in, never 
 YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
+
+POSITIONS THE OPERATOR BOUGHT THEMSELVES:
+Some positions were bought by the operator, not by you. You will be told which.
+
+Treat those with real care. The operator had a reason for buying — a thesis, a
+timeframe, a conviction — and you cannot see it. That you did not choose it, that
+there is no entry note from you, that it does not fit your current shortlist:
+none of these are reasons to sell. "No thesis on file" means you lack the
+information, not that the position lacks merit.
+
+Sell one only when something has genuinely broken — the trend has rolled over,
+support has failed, the risk has changed materially — and say specifically what
+broke. Being merely overbought, merely flat, or merely not your pick is not
+enough. If you are unsure, hold: it costs the operator nothing for you to look
+again next cycle, and selling someone else's conviction on a hunch is expensive.
 
 PRICE ALERTS — YOU DECIDE, NOT A STOP:
 Set "alert_price" to the level at which you want to be shown a position again.
@@ -2808,6 +2836,61 @@ What is the stance for this cycle?`;
   }
 
   /**
+   * A deliberate second look before selling something the operator bought.
+   *
+   * The first pass is asked whether to sell. This one is asked the opposite
+   * question — to build the strongest case for keeping it — and only then to
+   * confirm. Selling stands only if it survives having been argued against on
+   * purpose, which costs one extra call and can save a position the operator
+   * bought for reasons the model never had access to.
+   */
+  async reconsiderSell(
+    pair: string, ta: TechnicalAnalysis, proposal: AiDecision,
+  ): Promise<{ confirmed: boolean; reasoning: string }> {
+    const position = this.memory.positions[pair];
+    if (!position) return { confirmed: true, reasoning: 'position gone' };
+    const pnl = (position.currentPrice - position.entryPrice) * position.qty;
+    const days = ((Date.now() - new Date(position.openedAt).getTime()) / 86400000).toFixed(1);
+
+    const prompt = `SECOND OPINION — the operator bought this position themselves.
+
+You have just proposed selling it:
+  "${proposal.reasoning}"${proposal.counterCase ? `\n  Your own counter-argument was: "${proposal.counterCase}"` : ''}
+
+${pair} (${position.sector}) | Entry ${fmt(position.entryPrice)} | Now ${fmt(position.currentPrice)}
+P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} | held ${days} days | stop ${fmt(position.stopLoss)}
+RSI ${ta.rsi} | Trend 1h ${ta.trend} / 4h ${ta.htfTrend} | MA ${ta.maScore}/3 | Vol ${ta.volumeRatio}x
+ATR ${ta.atr === null ? 'N/A' : fmt(ta.atr)} | MACD histogram ${ta.macdHistogram === null ? 'N/A' : ta.macdHistogram.toFixed(6)}
+Supports ${ta.supports.join(', ') || 'none'} | Resistances ${ta.resistances.join(', ') || 'none'}
+
+Now argue the other side properly. Build the strongest case for KEEPING it: what
+the operator might have seen, what is still intact, what would be given up by
+selling today, what the position looks like if you are early rather than wrong.
+
+Then decide honestly. Sell only if something has actually broken and you can name
+it. Overbought is not broken. Flat is not broken. Not being your pick is not
+broken. If the case for holding is even close, hold — you can look again next
+cycle, and it is not your conviction to spend.
+
+JSON ONLY:
+{"case_for_holding": "the strongest argument to keep it, under 25 words", "still_sell": true or false, "reasoning": "why, under 15 words"}`;
+
+    const json = await this.requestJsonObject(SYSTEM_PROMPT, prompt, `${pair} second opinion`);
+    if (!json) {
+      // No usable answer means no confirmation. Holding is the reversible choice.
+      return { confirmed: false, reasoning: 'second opinion unavailable; keeping the position' };
+    }
+    const holdingCase = typeof json.case_for_holding === 'string' ? json.case_for_holding.trim() : '';
+    const confirmed = json.still_sell === true;
+    const why = typeof json.reasoning === 'string' && json.reasoning.trim() ? json.reasoning.trim() : '';
+    if (holdingCase) console.log(`  [SECOND LOOK] ${pair}: case for holding — ${holdingCase}`);
+    return {
+      confirmed,
+      reasoning: why || (confirmed ? 'confirmed on review' : 'the case for holding stood up'),
+    };
+  }
+
+  /**
    * Sends real probe requests and reports how many produced a usable decision.
    * This is the check that would have caught production answering HOLD to
    * everything for days because its replies were being truncated.
@@ -3296,7 +3379,7 @@ async function analysePair(exchange: Exchange, pair: string, price: number): Pro
 }
 
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
-  const callsAtCycleStart = { calls: 0, promptTokens: 0, completionTokens: 0, ...(ai.usage ?? {}) };
+  const callsAtCycleStart = { ...{ calls: 0, promptTokens: 0, completionTokens: 0 }, ...(ai.usage ?? {}) };
   exchange.beginCycle();
   // ── RECONCILE LIVE BALANCE ──
   if (!exchange.paper) await exchange.reconcilePositions(mem);
@@ -3358,12 +3441,18 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       : Math.min(CONFIG.aiReviewsPerCycle, rankedReviews.length);
     // A position that reached its alert level is being shown to the model on
     // purpose; it jumps the budget rather than waiting its turn.
+    // Positions the operator opened always get looked at. Skipping one for budget
+    // means it can only ever leave via its stop, with nobody having thought about it.
+    const operatorHeld = stillOpen.filter(pos => pos.origin === 'operator');
     const alerted = stillOpen.filter(pos => alertTriggered(pos, prices[pos.pair] ?? pos.currentPrice));
     for (const pos of alerted)
       console.warn(`  [ALERT] ${pos.pair} reached ${fmt(pos.alertPrice!)} (now ${fmt(prices[pos.pair] ?? pos.currentPrice)}, stop ${fmt(pos.stopLoss)}) — asking the AI what to do`);
-    const budgeted = selectReviews(stillOpen.filter(pos => !alerted.includes(pos)),
-      Math.max(0, reviewLimit - alerted.length));
-    const reviewSet = new Set([...alerted, ...budgeted].map(p => p.pair));
+    const always = [...new Set([...alerted, ...operatorHeld])];
+    const budgeted = selectReviews(stillOpen.filter(pos => !always.includes(pos)),
+      Math.max(0, reviewLimit - always.length));
+    const reviewSet = new Set([...always, ...budgeted].map(p => p.pair));
+    if (operatorHeld.length)
+      console.log(`  [PHASE 1] ${operatorHeld.length} operator-held position(s) reviewed regardless of budget: ${operatorHeld.map(p => p.pair).join(', ')}`);
     console.log(`  [PHASE 1] AI review budget: ${CONFIG.aiReviewsPerCycle === null ? 'all' : `${reviewLimit}/${rankedReviews.length}`}`);
 
     for (const [index, pos] of rankedReviews.entries()) {
@@ -3402,13 +3491,28 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           if (wasAlerted) reviewed.alertPrice = null;
           mem.savePositions();
         }
+        const ownership = pos.origin === 'operator'
+          ? `OWNERSHIP: the operator bought this themselves, for reasons you cannot see. Absence of a thesis from you is not evidence against it. Sell only if something has genuinely broken, and name what.`
+          : '';
         const alertNote = wasAlerted
           ? `ALERT TRIGGERED: this position fell to the level you asked to be woken at. It has NOT been sold. Decide now: sell it, hold it, or add to it if the drawdown improved the setup rather than broke it. The hard stop at ${fmt(pos.stopLoss)} is still below you.`
           : '';
-        const d = await ai.review(pos.pair, ta, cashNote, concentration, alertNote);
+        const d = await ai.review(pos.pair, ta, cashNote, concentration,
+          [alertNote, ownership].filter(Boolean).join('\n\n'));
 
         if (!shutdownRequested && d.verdict === 'SELL' && d.verdictHolds &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
+          // Selling what the operator bought takes a deliberate second pass.
+          if (pos.origin === 'operator') {
+            const second = await ai.reconsiderSell(pos.pair, ta, d);
+            if (!second.confirmed) {
+              console.log(`  [HELD] ${pos.pair}: sell withdrawn after a second look — ${second.reasoning}`);
+              const kept = mem.positions[pos.pair];
+              if (kept) { kept.lastReviewedAt = new Date().toISOString(); mem.savePositions(); }
+              continue;
+            }
+            console.log(`  [SECOND LOOK] ${pos.pair}: sell confirmed — ${second.reasoning}`);
+          }
           const partial = d.trimFraction < 1;
           console.log(`  [AI ${partial ? `TRIM ${(d.trimFraction * 100).toFixed(0)}%` : 'SELL'}] ${pos.pair}: ${d.reasoning}`);
           await executeExit(exchange, mem, pos.pair,

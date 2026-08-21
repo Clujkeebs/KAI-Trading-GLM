@@ -609,3 +609,22 @@ assert.match(guarded, /around 10 positions/);
 setConfig(loadConfig());
 
 console.log('reserved-asset checks passed');
+
+// ── Positions the operator bought are marked as theirs ───────────────────────
+// Production sold one with the reasoning "imported position no thesis" — it read
+// "I did not choose this" as a reason to sell. Origin makes the distinction real.
+const legacyImported = {
+  'AAA/USD': { pair: 'AAA/USD', status: 'open', reason: 'Imported from Kraken balance (Kraken trade history)' },
+  'BBB/USD': { pair: 'BBB/USD', status: 'open', reason: 'RSI=29 bullish R/R=2.1' },
+  'CCC/USD': { pair: 'CCC/USD', status: 'open', reason: 'anything', origin: 'bot' },
+} as any;
+// Records written before origin existed are classified by how they were created.
+for (const position of Object.values<any>(legacyImported)) {
+  if (position.origin === undefined)
+    position.origin = /^Imported from Kraken balance/.test(position.reason || '') ? 'operator' : 'bot';
+}
+assert.equal(legacyImported['AAA/USD'].origin, 'operator', 'an imported holding was bought by the operator');
+assert.equal(legacyImported['BBB/USD'].origin, 'bot', 'a bot entry keeps its own origin');
+assert.equal(legacyImported['CCC/USD'].origin, 'bot', 'an explicit origin is never overwritten');
+
+console.log('position origin checks passed');
