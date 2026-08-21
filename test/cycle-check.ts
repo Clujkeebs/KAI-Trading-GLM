@@ -121,11 +121,11 @@ const fakeAi = (
   sizePct = 20,
   {
     stance, cashTargetPct = 0, requestedFundsUsd = 0, reviewVerdict,
-    trimFraction = 1, reviewSizePct = 0, verdictHolds = true,
+    trimFraction = 1, reviewSizePct = 0, verdictHolds = true, secondLookConfirms = true,
   }: {
     stance?: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF'; cashTargetPct?: number; requestedFundsUsd?: number;
     reviewVerdict?: 'HOLD' | 'SELL' | 'BUY'; trimFraction?: number; reviewSizePct?: number;
-    verdictHolds?: boolean;
+    verdictHolds?: boolean; secondLookConfirms?: boolean;
   } = {},
 ) => ({
   async analyze() {
@@ -146,6 +146,9 @@ const fakeAi = (
     return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', counterCase: '', cashTargetPct, requestedFundsUsd };
   },
   usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
+  async reconsiderSell() {
+    return { confirmed: secondLookConfirms, reasoning: 'test second look' };
+  },
   activeModel: () => 'fake-model',
   async selfTest(samples: number) {
     return { valid: samples, salvaged: 0, total: samples, finishReasons: { stop: samples }, avgLatencyMs: 12, budget: 4000, lastError: '' };
@@ -605,6 +608,48 @@ async function main() {
   assert.equal(await live.sell('SOL/USD', 5), null, 'selling a reserved asset is refused');
   assert.deepEqual(fake.orders.slice(beforeDirect), [], 'neither reached the exchange');
   setConfig(loadConfig());
+
+  // ── What the operator bought is not sold on a whim ────────────────────────
+  // Production sold a position with the reasoning "imported position no thesis":
+  // it treated "I did not choose this" as a reason to sell.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'trades.csv'), { force: true });
+  const ownedPair = 'PENDLE/USD';
+  const ownedPrice = fake.prices[ownedPair];
+  fake.balance = { USD: { free: 300, used: 0, total: 300 }, PENDLE: { free: 6, used: 0, total: 6 } };
+  const ownedMem = new Memory();
+  ownedMem.openPosition(ownedPair, 6, ownedPrice, ownedPrice * 0.8, ownedPrice * 2,
+    'defi', 'operator buy', 'operator buy', 0, null, null, 'operator');
+  const sellsBeforeOwned = fake.orders.filter(o => o.side === 'sell' && o.pair === ownedPair).length;
+
+  // The model wants to sell, but the second look does not confirm.
+  await runCycle(live, ownedMem, fakeAi('HOLD', 0,
+    { stance: 'NEUTRAL', reviewVerdict: 'SELL', secondLookConfirms: false }));
+  assert.equal(ownedMem.positions[ownedPair].status, 'open',
+    "an unconfirmed second look must keep the operator's position");
+  assert.equal(fake.orders.filter(o => o.side === 'sell' && o.pair === ownedPair).length, sellsBeforeOwned,
+    'and place no sell order');
+
+  // The identical decision, confirmed on the second look, does sell — proving it
+  // was the second look that saved it, not an accident.
+  await runCycle(live, ownedMem, fakeAi('HOLD', 0,
+    { stance: 'NEUTRAL', reviewVerdict: 'SELL', secondLookConfirms: true }));
+  assert.equal(ownedMem.positions[ownedPair].status, 'closed',
+    'a confirmed sell still goes through');
+
+  // A position the bot opened itself needs no second look.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 300, used: 0, total: 300 }, PENDLE: { free: 6, used: 0, total: 6 } };
+  const botMem = new Memory();
+  botMem.openPosition(ownedPair, 6, ownedPrice, ownedPrice * 0.8, ownedPrice * 2,
+    'defi', 'bot entry', 'bot entry');
+  assert.equal(botMem.positions[ownedPair].origin, 'bot');
+  await runCycle(live, botMem, fakeAi('HOLD', 0,
+    { stance: 'NEUTRAL', reviewVerdict: 'SELL', secondLookConfirms: false }));
+  assert.equal(botMem.positions[ownedPair].status, 'closed',
+    "the bot's own position sells without needing a second opinion");
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');

@@ -78,6 +78,26 @@ Because that ranking is deterministic, the last slot is reserved for whichever p
 longest without a review. Otherwise the same low-urgency names would be skipped every cycle, and
 a position that is never reviewed can never be trimmed or closed on judgement — only by its stop.
 
+### Positions you bought yourself
+
+The bot distinguishes positions it opened from ones it adopted out of your exchange balance,
+because it was treating the difference backwards. It sold a holding with the reasoning
+*"imported position no thesis"* — reading "I did not choose this" as a reason to sell.
+
+Positions you bought are now handled differently in three ways:
+
+- They are **always reviewed**, regardless of the review budget. A position nobody looks at can
+  only ever leave via its stop.
+- The prompt states plainly that you bought it for reasons the model cannot see, and that the
+  absence of a thesis on file means it lacks information, not that the position lacks merit.
+  Overbought, flat, or "not my pick" are explicitly not grounds to sell.
+- A proposed sell triggers a **second opinion**: a separate call that must first build the
+  strongest case for *keeping* it, and only then confirm. The sell proceeds only if it survives
+  being argued against on purpose. If that call fails or returns nothing usable, the position is
+  kept — holding is the reversible choice.
+
+Stops and alerts still apply to them, so nothing goes unprotected.
+
 ### Reserved assets
 
 `EXCLUDED_ASSETS` names holdings the bot must never touch. Unlike everything else here this is
