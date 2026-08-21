@@ -37,32 +37,20 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
-### 2026-08-22 — Devin — Load the trader's charter into every decision prompt
-**Changed:** Load `SOUL.md` once at startup, prepend it to per-pair, portfolio-stance and
-second-opinion system prompts, and support the `SOUL_FILE` repository-root-relative override.
-Missing or unreadable charters warn and leave the original prompts unchanged.
-**Why:** `SOUL.md` is the operator's standing mandate for GLM, so it must reach the model
-on every call rather than remain documentation-only.
-**Verified:** Pure composition and missing-file checks added; build, tests and mock prompt
-inspection are pending until the implementation verification pass. No live orders.
-**Watch out:** The charter adds its full character count to each decision prompt.
-
-### 2026-08-22 — Devin — Verify charter propagation and fallback
-**Verified:** A paper cycle with a local OpenAI-compatible mock recorded charter header and
-unique charter text in review, second-opinion, portfolio-stance and per-pair prompts. A
-second paper cycle with a nonexistent `SOUL_FILE` logged the warning, used original prompts,
-reached shutdown and exited 0. Build, tests and diff check passed. No live orders.
-
 ### 2026-08-22 — Devin — SOUL.md is the trader's charter, wired into the prompt
 
 **Changed:** Rewrote `SOUL.md` as the mandate for GLM (the trading model), not for us, and
-loaded it into the model's system prompt so it is read every cycle instead of sitting in
-the repo. Added `AGENTS.md` (repo rules for us), `CLAUDE.md` (pointer for Claude Code) and
-this file.
+load it once at startup into the system prompt of every decision call — per-pair, portfolio
+stance, second opinion and the AI self-test — behind a header saying it outranks convenience
+or habit. `SOUL_FILE` overrides the path (relative paths resolve from the repo root); a
+missing or unreadable charter warns once and leaves the existing prompts untouched. Added
+`AGENTS.md` (rules for coding agents), `CLAUDE.md` (Claude Code entry point) and this file.
 **Why:** The operator's split is: GLM trades, Devin and Claude write the code. `SOUL.md`
-had been written for coding agents, which put it in front of the wrong reader.
-**Verified:** Build and the four test suites pass; a paper cycle shows the charter reaching
-the model. Live Kraken order paths remain unverified from the dev environment.
+had been written for coding agents, which put it in front of the wrong reader — and as
+documentation it never reached the model that needed it.
+**Verified:** Build, all suites, and a paper cycle against a local mock provider showing the
+charter present in all four call types; a second run with a nonexistent `SOUL_FILE` warned
+and ran on the original prompts, exit 0. Live Kraken order paths remain unverified here.
 **Watch out:** `SOUL.md` is now prompt input, so its length costs tokens on every call, and
 editing it changes trading behaviour. Treat it as code: keep it tight, and note edits here.
 
