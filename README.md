@@ -38,12 +38,15 @@ All settings live in `.env` (see `.env.example`):
 - `MIN_RR_RATIO` — optional minimum risk/reward filter; disabled by default
 - `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor for buy decisions from 1–10; disabled by default
 - `AI_SELL_CONFIDENCE_THRESHOLD` — optional AI confidence floor for sell decisions from 1–10; disabled by default
+- `SCAN_MAX_RSI` — optional hard scan filter for RSI; disabled by default, valid range `0`–`100`
 - `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
 
 The AI owns position sizing and requests a portfolio percentage. By default, the bot's
 self-imposed risk, exposure, R/R, confidence, and minimum-size guardrails are **off**.
-The only entry constraints then are available free cash and Kraken's market amount,
-cost, and precision rules. Set the optional variables above to re-enable a cap.
+Every watchlist pair with valid technical data is ranked and may reach the AI; weak
+setups should receive HOLD. The only entry constraints then are available free cash
+and Kraken's market amount, cost, and precision rules. Set the optional variables
+above to re-enable a cap or scan filter.
 Stop-loss and take-profit remain active exit logic. This permissive configuration can
 spend most or all of a tiny account if the AI requests it; use `PAPER_MODE=true` first.
 

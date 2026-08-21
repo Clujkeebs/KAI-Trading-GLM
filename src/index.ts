@@ -64,6 +64,7 @@ type TradingConfig = {
   aiConfidenceThreshold: number | null;
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
+  scanMaxRsi: number | null;
   feeReservePct: number;
   loopMode: boolean;
 };
@@ -117,6 +118,7 @@ function loadConfig(): TradingConfig {
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
+    scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     loopMode,
   };
@@ -337,6 +339,30 @@ function applyPositionAdjustments(
 function updateTradeExtremes(state: BotState, pnl: number): void {
   if (pnl > 0 && (state.bestTrade === null || pnl > state.bestTrade)) state.bestTrade = pnl;
   if (pnl < 0 && (state.worstTrade === null || pnl < state.worstTrade)) state.worstTrade = pnl;
+}
+
+function scoreSetup(ta: TechnicalAnalysis): {
+  score: number;
+  rsiComponent: number;
+  supportComponent: number;
+  trendComponent: number;
+  volumeComponent: number;
+  supportDistance: number | null;
+} {
+  const support = ta.supports.filter(s => s < ta.currentPrice).sort((a, b) => b - a)[0];
+  const supportDistance = support === undefined ? null : (ta.currentPrice - support) / ta.currentPrice;
+  const rsiComponent = Math.max(0, Math.min(100, 100 - ta.rsi));
+  const supportComponent = supportDistance === null
+    ? 0
+    : 100 * Math.max(0, 1 - supportDistance / 0.10);
+  const trendComponent = ta.trend === 'bullish' ? 100 : ta.trend === 'neutral' ? 60 : 20;
+  const volumeComponent = Math.max(0, Math.min(ta.volumeRatio, 2) / 2 * 100);
+  const score = rsiComponent * 0.40 + supportComponent * 0.25 +
+    trendComponent * 0.20 + volumeComponent * 0.15;
+  return {
+    score: Math.max(0, Math.min(100, score)),
+    rsiComponent, supportComponent, trendComponent, volumeComponent, supportDistance,
+  };
 }
 
 // ============================================================
@@ -977,11 +1003,12 @@ YOUR IDENTITY & GOALS:
 - You hold 3-7 days typically. NOT a day trader
 
 YOUR DECISION FRAMEWORK:
-1. RSI < 40 + neutral/bullish trend + near support = BUY candidate
-2. RSI > 75 and overbought = DO NOT BUY, wait for pullback
+1. Every watchlist pair with valid technical data may reach you; the shortlist is ranked by a setup score, not pre-filtered as a BUY signal
+2. RSI < 40 + neutral/bullish trend + near support = stronger BUY evidence
 3. Position hits stop loss = SELL immediately, no questions
 4. Position hits take profit = SELL the position
 5. Is the narrative/thesis still intact? If not, sell
+6. A weak or overbought setup should return HOLD rather than forcing a BUY
 
 You own position sizing. Request the percentage of the total portfolio you want to allocate.
 The bot can only spend available free cash and must obey Kraken's amount, cost, and precision rules.
@@ -1043,7 +1070,7 @@ Volume: ${ta.volumeRatio}x avg | StochRSI K=${ta.stochRsiK} D=${ta.stochRsiD}
 Supports: ${ta.supports.join(', ') || 'none'}
 Resistances: ${ta.resistances.join(', ') || 'none'}
 
-BUY, HOLD, or AVOID?`, pair);
+BUY or HOLD?`, pair);
   }
 
   async review(pair: string, ta: TechnicalAnalysis): Promise<AiDecision> {
@@ -1136,7 +1163,7 @@ async function main() {
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
-  console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
+  console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
   const memory = new Memory();
@@ -1271,8 +1298,13 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   if (!canOpen) console.log('  [PHASE 2] Exposure cap reached, skipping scan.');
 
-  let aiBudget = CONFIG.aiDecisionsPerCycle;
-  const candidates: Array<{ pair: string; sector: string; ta: TechnicalAnalysis; vol: number }> = [];
+  const candidates: Array<{
+    pair: string;
+    sector: string;
+    ta: TechnicalAnalysis;
+    vol: number;
+    score: ReturnType<typeof scoreSetup>;
+  }> = [];
 
   const scanPairs = canOpen ? ALL_PAIRS : [];
   const scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
@@ -1286,26 +1318,31 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       const ta = TA.full(candles, price);
       if (!ta) continue;
 
-      const nearSupport = ta.supports.length > 0 && (price - ta.supports[0]) / price < 0.05;
-      if (ta.rsi > 50 && !nearSupport) continue;
+      if (CONFIG.scanMaxRsi !== null && ta.rsi > CONFIG.scanMaxRsi) {
+        console.log(`  [SCAN SKIP] ${pair}: RSI ${ta.rsi} > max ${CONFIG.scanMaxRsi}`);
+        continue;
+      }
 
       const ticker = await exchange.getTicker(pair);
-      candidates.push({ pair, sector: getSector(pair), ta, vol: ticker?.volume24h ?? 0 });
-      console.log(`  [CANDIDATE] ${pair}: RSI=${ta.rsi} | ${ta.trend} | ${ta.volumeRatio}x vol | ${ta.supports.length} supports`);
+      const score = scoreSetup(ta);
+      candidates.push({ pair, sector: getSector(pair), ta, vol: ticker?.volume24h ?? 0, score });
+      const distance = score.supportDistance === null ? 'none' : `${(score.supportDistance * 100).toFixed(2)}%`;
+      console.log(`  [CANDIDATE] ${pair}: score=${score.score.toFixed(2)} | RSI=${ta.rsi} | trend=${ta.trend} | volume=${ta.volumeRatio}x | support distance=${distance}`);
     } catch (e) {
       console.warn(`  [PHASE 2] ${pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
-  candidates.sort((a, b) => a.ta.rsi - b.ta.rsi);
+  candidates.sort((a, b) => b.score.score - a.score.score || a.ta.rsi - b.ta.rsi);
 
   // ── PHASE 3: AI DECISIONS ──
   console.log('\n── PHASE 3: AI analysis ──');
 
-  for (const c of candidates) {
-    if (aiBudget <= 0) break;
+  const aiCandidates = candidates.slice(0, CONFIG.aiDecisionsPerCycle);
+  if (aiCandidates.length > 0)
+    console.log(`  [AI BUDGET] Reached: ${aiCandidates.map(c => `${c.pair} (${c.score.score.toFixed(2)})`).join(', ')}`);
+  for (const c of aiCandidates) {
     const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol);
-    aiBudget--;
 
     if (d.verdict !== 'BUY' ||
         (CONFIG.aiConfidenceThreshold !== null && d.confidence < CONFIG.aiConfidenceThreshold)) {
