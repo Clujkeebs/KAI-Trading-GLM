@@ -232,6 +232,22 @@ AI reviews are budgeted, positions nearest to either exit level are reviewed fir
 lower-urgency positions are logged as skipped. If a Phase 1 sell fills, the bot refreshes
 its settled balance before Phase 2 so the freed quote cash can fund a same-cycle buy.
 
+## Model choice and what it costs
+
+`AI_MODEL` picks the model; `AI_MODEL_FALLBACK` names one to fall back to if the provider
+rejects it as unknown. Set the fallback before experimenting: a mistyped or retired model id
+otherwise fails every call while the bot looks healthy, answering HOLD to everything.
+
+Every cycle reports what it spent, so comparing models is a measurement rather than a guess:
+
+```
+AI cost: 9 calls / 24,318 tokens this cycle | 137 calls / 361,204 tokens since start (z-ai/glm-5.2)
+```
+
+Preflight reports tokens per call for the model actually serving requests. Run a few cycles on
+one model, note the per-cycle tokens, switch, and compare — the token counts are the provider's
+own numbers, not an estimate.
+
 ## Preflight and the doctor
 
 Unit tests prove the maths. They cannot prove the deployment can reach Kraken, parse its own

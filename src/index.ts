@@ -180,6 +180,8 @@ type TradingConfig = {
   feeReservePct: number;
   aiMaxTokens: number;
   aiBaseUrl: string | null;
+  /** Model to fall back to if the configured one is unavailable. */
+  aiModelFallback: string | null;
   loopMode: boolean;
   atrStopMult: number;
   atrTargetMult: number;
@@ -287,6 +289,7 @@ function loadConfig(): TradingConfig {
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     aiMaxTokens: envInteger('AI_MAX_TOKENS', 4000, 1),
     aiBaseUrl: process.env.AI_BASE_URL?.trim() || null,
+    aiModelFallback: process.env.AI_MODEL_FALLBACK?.trim() || null,
     loopMode,
     atrStopMult: envNumber('ATR_STOP_MULT', 2, 0.1, 20),
     atrTargetMult: envNumber('ATR_TARGET_MULT', 4, 0.1, 50),
@@ -2404,6 +2407,22 @@ function isUnsupportedResponseFormat(error: unknown): boolean {
   return status === 400 && /(response[_ -]?format|json[_ -]?object|structured output|unsupported|unrecognized)/i.test(message);
 }
 
+/**
+ * True when the provider says it has never heard of the model.
+ *
+ * A mistyped or retired model id otherwise fails every call, and the bot answers
+ * HOLD to everything while looking healthy — the exact silent failure that left
+ * this account untraded for days.
+ */
+function isUnknownModel(error: unknown): boolean {
+  const value = error as any;
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  if (status !== 400 && status !== 404) return false;
+  return /model/.test(message) &&
+    /(not found|not exist|unknown|invalid|unsupported|no endpoints|not a valid)/.test(message);
+}
+
 function isUnsupportedReasoningParam(error: unknown): boolean {
   const value = error as any;
   const message = String(value?.message || error || '').toLowerCase();
@@ -2486,6 +2505,9 @@ class AiBrain {
   private memory: Memory;
   private responseFormatSupported = true;
   private reasoningParamSupported = true;
+  private modelFellBack = false;
+  /** Token usage since the process started, so credit burn is measurable. */
+  readonly usage = { calls: 0, promptTokens: 0, completionTokens: 0 };
   /** Grows for the rest of the run once a model proves it needs more headroom. */
   private tokenBudget = 0;
 
@@ -2518,7 +2540,7 @@ class AiBrain {
     this.model = model;
     this.tokenBudget = CONFIG.aiMaxTokens;
     this.memory = memory;
-    console.log(`[AI] GLM 5.2 via ${provider} (${model}) | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
+    console.log(`[AI] ${provider} (${model})${CONFIG.aiModelFallback ? ` | fallback ${CONFIG.aiModelFallback}` : ''} | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
   }
 
   async analyze(
@@ -2676,11 +2698,22 @@ HOLD, SELL, or ADJUST?`, pair);
       const structured = this.responseFormatSupported;
       const reasoning = this.reasoningParamSupported;
       try {
-        return await withRetry(`AI request ${pair}`, () => create(structured, reasoning), RETRY_ATTEMPTS,
-          error => isRetryableError(error) &&
+        const response: any = await withRetry(`AI request ${pair}`, () => create(structured, reasoning), RETRY_ATTEMPTS,
+          error => isRetryableError(error) && !isUnknownModel(error) &&
             !(structured && isUnsupportedResponseFormat(error)) &&
             !(reasoning && isUnsupportedReasoningParam(error)));
+        this.recordUsage(response?.usage);
+        return response;
       } catch (e) {
+        // A model the provider does not recognise is fatal to every later call,
+        // so switch to the fallback once rather than failing the whole run.
+        if (isUnknownModel(e) && !this.modelFellBack && CONFIG.aiModelFallback &&
+            CONFIG.aiModelFallback !== this.model) {
+          console.error(`  [AI] Model "${this.model}" was rejected as unknown; falling back to "${CONFIG.aiModelFallback}" for the rest of this run`);
+          this.model = CONFIG.aiModelFallback;
+          this.modelFellBack = true;
+          continue;
+        }
         if (reasoning && isUnsupportedReasoningParam(e)) {
           this.reasoningParamSupported = false;
           console.warn(`  [AI] ${pair}: reasoning control unsupported; retrying without it`);
@@ -2826,6 +2859,17 @@ BUY or HOLD?`,
       budget: this.tokenBudget, lastError,
     };
   }
+
+  private recordUsage(usage: any) {
+    this.usage.calls++;
+    const prompt = Number(usage?.prompt_tokens);
+    const completion = Number(usage?.completion_tokens);
+    if (Number.isFinite(prompt)) this.usage.promptTokens += prompt;
+    if (Number.isFinite(completion)) this.usage.completionTokens += completion;
+  }
+
+  /** Which model is actually serving requests, after any fallback. */
+  activeModel(): string { return this.model; }
 
   private logDecision(pair: string, d: AiDecision) {
     console.log(`  [AI] ${pair}: ${d.verdict} (${d.confidence}/10) — ${d.reasoning}`);
@@ -2979,8 +3023,10 @@ export async function runPreflight(
     const result = await ai.selfTest(aiSamples);
     const usable = result.valid + result.salvaged;
     const reasons = Object.entries(result.finishReasons).map(([k, v]) => `${k}x${v}`).join(', ') || 'none';
+    const perCall = ai.usage.calls > 0
+      ? Math.round((ai.usage.promptTokens + ai.usage.completionTokens) / ai.usage.calls) : 0;
     add('AI decisions', usable === result.total,
-      `${result.valid}/${result.total} clean, ${result.salvaged} salvaged | finish: ${reasons} | ${result.avgLatencyMs}ms avg | budget ${result.budget} tokens${result.lastError ? ` | last error: ${result.lastError}` : ''}`,
+      `${result.valid}/${result.total} clean, ${result.salvaged} salvaged | model ${ai.activeModel()} | ~${perCall.toLocaleString()} tokens/call | finish: ${reasons} | ${result.avgLatencyMs}ms avg${result.lastError ? ` | last error: ${result.lastError}` : ''}`,
       usable === 0);
   }
 
@@ -3250,6 +3296,7 @@ async function analysePair(exchange: Exchange, pair: string, price: number): Pro
 }
 
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
+  const callsAtCycleStart = { calls: 0, promptTokens: 0, completionTokens: 0, ...(ai.usage ?? {}) };
   exchange.beginCycle();
   // ── RECONCILE LIVE BALANCE ──
   if (!exchange.paper) await exchange.reconcilePositions(mem);
@@ -3679,6 +3726,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log(`  Tradable: ${fmt(account.tradableUsd)} | Account total: ${fmt(account.totalUsd)} | Open: ${positions.length}`);
   console.log(`  Open risk to stops: ${fmt(openRisk)}${portfolioValue > 0 ? ` (${pct(openRisk / portfolioValue)} of portfolio)` : ''} | Realised today: ${fmt(mem.realizedPnlToday())}`);
   console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.winRate().toFixed(0)}% over ${mem.state.totalTrades} closes`);
+  const spend = ai.usage ?? { calls: 0, promptTokens: 0, completionTokens: 0 };
+  const cycleCalls = spend.calls - callsAtCycleStart.calls;
+  const cycleTokens = (spend.promptTokens + spend.completionTokens) -
+    (callsAtCycleStart.promptTokens + callsAtCycleStart.completionTokens);
+  console.log(`  AI cost: ${cycleCalls} calls / ${cycleTokens.toLocaleString()} tokens this cycle | ${spend.calls} calls / ${(spend.promptTokens + spend.completionTokens).toLocaleString()} tokens since start (${ai.activeModel?.() ?? 'unknown model'})`);
   const funding = mem.state.fundingRequest;
   if (funding)
     console.log(`  [FUNDING] Outstanding request: ${fmt(funding.usd)} since ${funding.requestedAt} — "${funding.reasoning}"`);
