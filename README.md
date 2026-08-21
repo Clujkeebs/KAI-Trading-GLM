@@ -109,10 +109,24 @@ which breakeven and the trail are measured in — keeps meaning what it says.
 
 ### Position size
 
-`MIN_TRADE_USD` is the floor for opening a new position. Without it the bot falls back to the
-exchange minimum, which produced a book of roughly $5 positions where fees and minimums took a
-disproportionate share. Existing holdings below the floor are still imported and managed —
-applying it to imports would orphan real money with no stop and no review.
+The size the model asks for is the size it gets, bounded only by available cash and whatever
+optional caps are switched on. The bot used to round an undersized request up to the exchange
+minimum, which manufactured positions nobody chose — that is where a book of roughly $5
+positions came from. An undersized request is now declined outright and the model is told why.
+
+Size is steered by telling rather than fencing: the concentration guidance says what a full-size
+position works out to and that tiny positions are not worth holding, and the model decides.
+`MIN_TRADE_USD` exists if you want a hard gate instead, but it is unset by default.
+
+### Checking itself
+
+Every decision — each entry, each review, and the portfolio stance — asks the model to argue the
+other side first. It states the strongest case against its own call in `counter_case`, then
+either keeps the verdict or sets `verdict_holds` to false and withdraws it. A withdrawn verdict
+is not traded.
+
+Silence is not a withdrawal: a reply that omits the field stands, so the model is never overruled
+by an accident of formatting, and a salvaged fragment never carries a self-check it did not make.
 
 ### Keeping exits possible
 
