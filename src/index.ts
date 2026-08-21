@@ -268,9 +268,10 @@ const TA = {
   },
 
   volRatio(volumes: number[]): number {
-    if (volumes.length < 21) return 1;
-    const avg = volumes.slice(-21, -1).reduce((a, b) => a + b, 0) / 20;
-    return avg === 0 ? 1 : +(volumes[volumes.length - 1] / avg).toFixed(2);
+    if (volumes.length < 22) return 1;
+    const lastClosed = volumes[volumes.length - 2];
+    const avg = volumes.slice(-22, -2).reduce((a, b) => a + b, 0) / 20;
+    return avg === 0 ? 1 : +(lastClosed / avg).toFixed(2);
   },
 
   stochRsi(closes: number[], rsiP = 14, stochP = 14): [number, number] {

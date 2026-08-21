@@ -7,6 +7,7 @@ const closes = [
   45.89, 46.03, 45.61, 46.28, 46.28, 46.00, 46.03, 46.41, 46.22, 45.64, 46.21,
 ];
 assert.equal(TA.rsi(closes), 62.88);
+assert.equal(TA.volRatio([...Array(20).fill(100), 200, 0.001]), 2);
 
 const position = {
   pair: 'TEST/USD', status: 'open', sector: 'test', entryPrice: 100, qty: 1,
