@@ -5,7 +5,7 @@ import {
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
-  concentrationNote,
+  concentrationNote, selectReviews,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -415,3 +415,49 @@ assert.ok(!/average/.test(empty), 'no positions means no average to quote');
 
 setConfig(loadConfig());
 console.log('concentration checks passed');
+
+// ── Review selection must not starve the same positions forever ──────────────
+// Urgency ranking is deterministic, so with more positions than budget the same
+// low-urgency names are skipped every cycle — and a position that is never
+// reviewed can never be trimmed or closed on judgement, only by its stop.
+const reviewPos = (pair: string, urgencyPct: number, reviewedAgoMs?: number) => ({
+  pair, status: 'open', sector: 'test', entryPrice: 100, qty: 1, costBasisUsd: 100,
+  currentPrice: 100, stopLoss: 100 - urgencyPct, takeProfit: 500,
+  reason: '', aiReasoning: '', openedAt: new Date().toISOString(),
+  ...(reviewedAgoMs === undefined ? {} : { lastReviewedAt: new Date(Date.now() - reviewedAgoMs).toISOString() }),
+}) as any;
+
+const reviewNow = Date.now();
+const book = [
+  reviewPos('URGENT/USD', 1, 1_000),
+  reviewPos('CLOSE/USD', 2, 1_000),
+  reviewPos('MID/USD', 5, 1_000),
+  reviewPos('CALM/USD', 20, 60 * 60_000),   // ignored for an hour
+];
+assert.deepEqual(rankReviewPositions(book).map(p => p.pair),
+  ['URGENT/USD', 'CLOSE/USD', 'MID/USD', 'CALM/USD'], 'nearest to its stop first');
+
+// Budget of 3: the two most urgent are kept, and the long-ignored position takes
+// the last slot ahead of the least urgent of the selected.
+const picked = selectReviews(book, 3, reviewNow).map(p => p.pair);
+assert.equal(picked.length, 3);
+assert.ok(picked.includes('URGENT/USD') && picked.includes('CLOSE/USD'), 'urgency still leads');
+assert.ok(picked.includes('CALM/USD'), 'the longest-waiting position gets a turn');
+assert.ok(!picked.includes('MID/USD'), 'it displaces the least urgent selection');
+
+// A position never reviewed counts as waiting longest.
+const withNewcomer = [...book.slice(0, 3), reviewPos('NEW/USD', 30)];
+assert.ok(selectReviews(withNewcomer, 3, reviewNow).map(p => p.pair).includes('NEW/USD'));
+
+// When everything has been reviewed equally recently, pure urgency decides.
+const evenBook = [
+  reviewPos('A/USD', 1, 1_000), reviewPos('B/USD', 2, 1_000),
+  reviewPos('C/USD', 3, 1_000), reviewPos('D/USD', 4, 1_000),
+];
+assert.deepEqual(selectReviews(evenBook, 2, reviewNow).map(p => p.pair), ['A/USD', 'B/USD']);
+
+// Budget at or above the book size reviews everything; zero reviews nothing.
+assert.equal(selectReviews(book, 9, reviewNow).length, 4);
+assert.deepEqual(selectReviews(book, 0, reviewNow), []);
+
+console.log('review selection checks passed');
