@@ -15,16 +15,25 @@ dotenv.config();
 
 // --- TYPES ---
 
-interface OhlcvCandle { timestamp: number; open: number; high: number; low: number; close: number; volume: number }
-interface TechnicalAnalysis {
+export interface OhlcvCandle { timestamp: number; open: number; high: number; low: number; close: number; volume: number }
+type Trend = 'bullish' | 'bearish' | 'neutral';
+export interface TechnicalAnalysis {
   currentPrice: number; rsi: number;
   sma5: number | null; sma20: number | null; sma50: number | null;
   bollinger: { upper: number | null; middle: number | null; lower: number | null };
   supports: number[]; resistances: number[];
   volumeRatio: number; stochRsiK: number; stochRsiD: number;
-  trend: 'bullish' | 'bearish' | 'neutral'; maScore: number;
+  trend: Trend; maScore: number;
+  /** Wilder ATR(14) on the analysed timeframe; null when history is too short. */
+  atr: number | null;
+  /** ATR as a fraction of price, the volatility unit used for stops and targets. */
+  atrPct: number | null;
+  /** Trend of the 4x-aggregated timeframe, used as a higher-timeframe filter. */
+  htfTrend: Trend;
+  /** MACD(12,26,9) histogram; positive means momentum is turning up. */
+  macdHistogram: number | null;
 }
-interface AiDecision {
+export interface AiDecision {
   verdict: 'BUY' | 'HOLD' | 'SELL'; confidence: number; reasoning: string;
   positionSizePct: number; adjustedStop: number | null; adjustedTarget: number | null;
 }
@@ -32,15 +41,48 @@ interface BuyContext {
   portfolioValueUsd: number;
   spendableCashUsd: number;
   marketMinimumUsd: number | null;
+  openPositions: number;
+  exposureUsd: number;
+  sectorExposureUsd: number;
+  sectorTargetPct: number;
 }
-interface Position {
+export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
   entryPrice: number; qty: number; costBasisUsd: number;
   stopLoss: number; takeProfit: number; currentPrice: number;
   reason: string; aiReasoning: string; openedAt: string;
+  /** Stop at entry, kept so realised risk (1R) stays measurable after trailing. */
+  initialStopLoss?: number;
+  /** Highest price seen while open; the anchor for the ATR trailing stop. */
+  highWaterMark?: number;
+  /** ATR at entry, so the trail keeps a consistent volatility distance. */
+  entryAtr?: number | null;
+  /** P/L already booked from partial exits on this position. */
+  bookedPnlUsd?: number;
   closedAt?: string; exitPrice?: number; exitValueUsd?: number;
   pnlUsd?: number; pnlPct?: number; closeReason?: string;
 }
+interface ClosedTradeSummary {
+  pair: string; sector: string; pnlUsd: number; pnlPct: number;
+  closedAt: string; closeReason: string; holdDays: number;
+}
+interface SectorStat { trades: number; wins: number; pnlUsd: number }
+/**
+ * The model's call on the whole book, made once per cycle before any individual
+ * entry is considered. Without this the AI could only answer BUY/HOLD/SELL on one
+ * pair at a time and had no way to say "this market is toppy, sit in cash and wait
+ * for lower prices" — or to ask for more capital.
+ */
+interface PortfolioStance {
+  stance: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF';
+  confidence: number;
+  reasoning: string;
+  /** Share of the portfolio the model wants held back as dry powder, 0-1. */
+  cashTargetPct: number;
+  /** Extra capital the model is asking the operator to add, in USD. */
+  requestedFundsUsd: number;
+}
+interface FundingRequest { usd: number; reasoning: string; requestedAt: string }
 interface TradeRecord {
   timestamp: string; pair: string; side: 'BUY' | 'SELL';
   price: number; qty: number; costBasisUsd: number;
@@ -49,10 +91,39 @@ interface TradeRecord {
   sector: string; reason: string; aiVerdict: string; aiConfidence: number;
 }
 interface OrderFill { qty: number; price: number; feeUsd: number }
+/**
+ * Honest breakdown of the account. Reporting "portfolio value minus tracked
+ * positions" as cash counted staked and untracked holdings as spendable money —
+ * production logs showed $70.96 of "cash" against a real free balance of $0.05.
+ */
+interface PortfolioSnapshot {
+  /** Everything the account holds, including balances that cannot be traded. */
+  totalUsd: number;
+  /** Free cash and cash equivalents — what a buy can actually spend. */
+  cashUsd: number;
+  /** Cash plus freely tradable crypto. The base for position sizing. */
+  tradableUsd: number;
+  /** Staked or otherwise locked value, held but unusable. */
+  stakedUsd: number;
+}
 interface BotState {
   startedAt: string; totalTrades: number; wins: number; losses: number;
   totalPnl: number; bestTrade: number | null; worstTrade: number | null;
   lastScan: string; lastAiDecision: string; cycleCount: number;
+  /** Most recent closes, so the AI's "I remember my trades" is actually true. */
+  recentTrades: ClosedTradeSummary[];
+  /** Per-sector realised performance, used to steer allocation over time. */
+  sectorStats: Record<string, SectorStat>;
+  /** UTC day the realised-loss ledger below belongs to. */
+  riskDay: string;
+  /** Realised P/L booked during `riskDay`, for the daily-loss circuit breaker. */
+  riskDayPnl: number;
+  /** Simulated cash in paper mode, so paper results actually compound. */
+  paperCash: number | null;
+  /** The model's most recent read on the market, for continuity across cycles. */
+  lastStance: PortfolioStance | null;
+  /** Standing request for more capital, surfaced until the operator acts on it. */
+  fundingRequest: FundingRequest | null;
 }
 
 // --- CONFIG ---
@@ -74,8 +145,26 @@ type TradingConfig = {
   aiMaxTokens: number;
   aiBaseUrl: string | null;
   loopMode: boolean;
+  atrStopMult: number;
+  atrTargetMult: number;
+  trailingStopAtrMult: number;
+  breakevenAtR: number;
+  maxDailyLossPct: number | null;
+  maxOpenPositions: number | null;
+  maxSectorExposurePct: number | null;
+  ohlcvConcurrency: number;
+  maxStopDistancePct: number;
+  aiReasoningEffort: 'off' | 'low' | 'medium' | 'high';
+  preflight: boolean;
+  preflightAiSamples: number;
 };
 let CONFIG: TradingConfig;
+
+/** Installs the active configuration. `main()` calls this; tests use it to set up. */
+export function setConfig(config: TradingConfig): TradingConfig {
+  CONFIG = config;
+  return CONFIG;
+}
 
 function envNumber(name: string, fallback: number, min: number, max?: number): number {
   const raw = process.env[name];
@@ -98,6 +187,15 @@ function optionalEnvNumber(name: string, min: number, max?: number): number | nu
   const value = Number(raw);
   if (!Number.isFinite(value) || value < min || (max !== undefined && value > max))
     throw new Error(`${name} must be a number${max === undefined ? ` >= ${min}` : ` between ${min} and ${max}`}; got "${raw}"`);
+  return value;
+}
+
+function envEnum<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim().toLowerCase() as T;
+  if (!allowed.includes(value))
+    throw new Error(`${name} must be one of ${allowed.join(', ')}; got "${raw}"`);
   return value;
 }
 
@@ -127,9 +225,21 @@ function loadConfig(): TradingConfig {
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
-    aiMaxTokens: envInteger('AI_MAX_TOKENS', 1500, 1),
+    aiMaxTokens: envInteger('AI_MAX_TOKENS', 4000, 1),
     aiBaseUrl: process.env.AI_BASE_URL?.trim() || null,
     loopMode,
+    atrStopMult: envNumber('ATR_STOP_MULT', 2, 0.1, 20),
+    atrTargetMult: envNumber('ATR_TARGET_MULT', 4, 0.1, 50),
+    trailingStopAtrMult: envNumber('TRAILING_STOP_ATR_MULT', 2.5, 0, 20),
+    breakevenAtR: envNumber('BREAKEVEN_AT_R', 1, 0, 10),
+    maxDailyLossPct: optionalEnvNumber('MAX_DAILY_LOSS_PCT', 0, 1),
+    maxOpenPositions: optionalEnvNumber('MAX_OPEN_POSITIONS', 1),
+    maxSectorExposurePct: optionalEnvNumber('MAX_SECTOR_EXPOSURE_PCT', 0, 1),
+    ohlcvConcurrency: envInteger('OHLCV_CONCURRENCY', 4, 1),
+    maxStopDistancePct: envNumber('MAX_STOP_DISTANCE_PCT', 0.15, 0.01, 0.9),
+    aiReasoningEffort: envEnum('AI_REASONING_EFFORT', ['off', 'low', 'medium', 'high'], 'low'),
+    preflight: envBoolean('PREFLIGHT', true),
+    preflightAiSamples: envInteger('PREFLIGHT_AI_SAMPLES', 2, 0),
   };
 }
 
@@ -138,6 +248,16 @@ const POSITION_QTY_TOLERANCE_PCT = 0.01;
 const IMPORTED_POSITION_STOP_PCT = 0.05;
 const IMPORTED_POSITION_TARGET_PCT = 0.10;
 const REQUEST_TIMEOUT_MS = 20_000;
+const RECENT_TRADE_MEMORY = 25;
+const MAX_AI_TOKEN_BUDGET = 16_000;
+const ORDER_POLL_ATTEMPTS = 5;
+const ORDER_POLL_DELAY_MS = 1_000;
+/** A residual worth less than this after a partial exit is dust, not a position. */
+const PARTIAL_EXIT_DUST_PCT = 0.10;
+const TIMEFRAME_MS: Record<string, number> = {
+  '1m': 60_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000,
+  '1h': 3_600_000, '4h': 14_400_000, '1d': 86_400_000,
+};
 
 const WATCHLIST: Record<string, string[]> = {
   ai: ['VIRTUAL/USD', 'RENDER/USD', 'FET/USD', 'TAO/USD'],
@@ -155,7 +275,9 @@ const SECTOR_WEIGHTS: Record<string, number> = {
   perp_dex: 0.10, momentum: 0.05, depin: 0.03, privacy: 0.02,
 };
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+// Railway-style hosts wipe the working directory on redeploy; point DATA_DIR at a
+// mounted volume to keep positions and trade history across restarts.
+const DATA_DIR = path.resolve(process.env.DATA_DIR?.trim() || path.join(process.cwd(), 'data'));
 const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
 const TRADES_FILE = path.join(DATA_DIR, 'trades.csv');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
@@ -165,7 +287,16 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const RETRY_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 500;
-const fmt = (n: number) => n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
+const fmt = (n: number) => {
+  if (!Number.isFinite(n)) return '$n/a';
+  const abs = Math.abs(n);
+  if (abs >= 1) return `$${n.toFixed(2)}`;
+  if (abs === 0) return '$0.00';
+  if (abs >= 0.01) return `$${n.toFixed(4)}`;
+  // Sub-cent assets (BONK, PUMP) need enough decimals to stay distinguishable.
+  return `$${n.toFixed(Math.min(12, Math.ceil(-Math.log10(abs)) + 3))}`;
+};
+const pct = (fraction: number) => `${(fraction * 100).toFixed(2)}%`;
 const ASSET_ALIASES: Record<string, string> = {
   XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD', ETH2: 'ETH',
 };
@@ -175,13 +306,31 @@ const CASH_EQUIVALENTS = new Set([
   'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
 ]);
 
+/**
+ * Kraken names staking balances `<ASSET><DURATION>.<SUFFIX>` — SOL03.S, DOT28.S,
+ * ATOM21.S. Keeping the duration digits meant `SOL03` matched no market, so a
+ * staked SOL position was invisible to the bot: it appeared in neither the
+ * portfolio total nor the unmapped-holding warnings.
+ */
 function normalizeAsset(asset: string): string {
   const base = asset.toUpperCase().split('.')[0];
-  return ASSET_ALIASES[base] || base;
+  if (ASSET_ALIASES[base]) return ASSET_ALIASES[base];
+  const withoutDuration = base.replace(/\d+$/, '');
+  if (withoutDuration && withoutDuration !== base)
+    return ASSET_ALIASES[withoutDuration] || withoutDuration;
+  return base;
 }
 
 function isStakedBalance(asset: string): boolean {
   return asset.toUpperCase().split('.').slice(1).some(suffix => STAKED_BALANCE_SUFFIXES.has(suffix));
+}
+
+const utcDay = () => new Date().toISOString().slice(0, 10);
+
+/** RFC 4180 quoting. AI reasoning is free text and routinely contains commas. */
+function csvField(value: unknown): string {
+  const text = value === null || value === undefined ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function getSector(pair: string): string {
@@ -191,11 +340,32 @@ function getSector(pair: string): string {
   return 'unlisted';
 }
 
+// Retrying an authentication failure, a rejected order, or an unknown symbol can
+// never succeed; it only delays the cycle and hammers the exchange's rate limit.
+const NON_RETRYABLE_ERRORS = new Set([
+  'AuthenticationError', 'PermissionDenied', 'AccountSuspended', 'AccountNotEnabled',
+  'InsufficientFunds', 'InvalidOrder', 'OrderNotFound', 'BadSymbol', 'BadRequest',
+  'ArgumentsRequired', 'NotSupported', 'InvalidAddress',
+]);
+
+export function isRetryableError(error: unknown): boolean {
+  const value = error as any;
+  for (const name of [value?.constructor?.name, value?.name]) {
+    if (typeof name === 'string' && NON_RETRYABLE_ERRORS.has(name)) return false;
+  }
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  // 4xx means the request itself is wrong; 408 (timeout) and 429 (rate limit) are the
+  // two that a later attempt can still satisfy.
+  if (Number.isFinite(status) && status >= 400 && status < 500 && status !== 408 && status !== 429)
+    return false;
+  return true;
+}
+
 async function withRetry<T>(
   label: string,
   operation: () => Promise<T>,
   attempts = RETRY_ATTEMPTS,
-  shouldRetry: (error: unknown) => boolean = () => true,
+  shouldRetry: (error: unknown) => boolean = isRetryableError,
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -212,24 +382,77 @@ async function withRetry<T>(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+/**
+ * Drops any candle that has not closed yet. Exchanges return the in-progress bar as
+ * the last element, so every average built on it repaints between cycles.
+ */
+export function closedCandles(candles: OhlcvCandle[], timeframe: string, now = Date.now()): OhlcvCandle[] {
+  const span = TIMEFRAME_MS[timeframe];
+  if (!span || candles.length === 0) return candles;
+  let end = candles.length;
+  while (end > 0 && candles[end - 1].timestamp + span > now) end--;
+  return candles.slice(0, end);
+}
+
+/** Runs `worker` over `items` with at most `limit` in flight, preserving input order. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 // ============================================================
 // TECHNICAL ANALYZER — Pure math, no side effects
 // ============================================================
 
 const TA = {
-  rsi(closes: number[], period = 14): number {
-    if (closes.length < period + 1) return 50;
+  /**
+   * Wilder RSI for every close from index `period` onward, in one pass.
+   * The previous implementation recomputed RSI from scratch per bar, which was
+   * quadratic and seeded the series with a placeholder 50.
+   */
+  rsiSeries(closes: number[], period = 14): number[] {
+    if (closes.length < period + 1) return [];
     const deltas = closes.slice(1).map((close, i) => close - closes[i]);
-    let avgGain = deltas.slice(0, period).filter(d => d > 0).reduce((a, b) => a + b, 0) / period;
-    let avgLoss = deltas.slice(0, period).filter(d => d < 0).reduce((a, b) => a + Math.abs(b), 0) / period;
-    for (const delta of deltas.slice(period)) {
-      avgGain = (avgGain * (period - 1) + Math.max(delta, 0)) / period;
-      avgLoss = (avgLoss * (period - 1) + Math.max(-delta, 0)) / period;
+    const value = (gain: number, loss: number) => {
+      if (gain === 0 && loss === 0) return 50;
+      if (loss === 0) return 100;
+      if (gain === 0) return 0;
+      return 100 - 100 / (1 + gain / loss);
+    };
+    let avgGain = 0;
+    let avgLoss = 0;
+    for (let i = 0; i < period; i++) {
+      avgGain += Math.max(deltas[i], 0);
+      avgLoss += Math.max(-deltas[i], 0);
     }
-    if (avgGain === 0 && avgLoss === 0) return 50;
-    if (avgLoss === 0) return 100;
-    if (avgGain === 0) return 0;
-    return parseFloat((100 - 100 / (1 + avgGain / avgLoss)).toFixed(2));
+    avgGain /= period;
+    avgLoss /= period;
+    const series = [value(avgGain, avgLoss)];
+    for (let i = period; i < deltas.length; i++) {
+      avgGain = (avgGain * (period - 1) + Math.max(deltas[i], 0)) / period;
+      avgLoss = (avgLoss * (period - 1) + Math.max(-deltas[i], 0)) / period;
+      series.push(value(avgGain, avgLoss));
+    }
+    return series;
+  },
+
+  rsi(closes: number[], period = 14): number {
+    const series = this.rsiSeries(closes, period);
+    if (!series.length) return 50;
+    return parseFloat(series[series.length - 1].toFixed(2));
   },
 
   sma(closes: number[], period: number): number | null {
@@ -260,8 +483,10 @@ const TA = {
       if (lows[i] < lows[i - 1] && lows[i] < lows[i + 1] && lows[i] < lows[i - 2] && lows[i] < lows[i + 2] && lows[i] < price)
         hits.push(+lows[i].toFixed(6));
     }
+    // Nearest support first: callers place stops just under supports[0], and sorting
+    // ascending handed them the *lowest* swing low in ~8 days of history instead.
     const out: number[] = [];
-    for (const s of [...new Set(hits)].sort((a, b) => a - b)) {
+    for (const s of [...new Set(hits)].sort((a, b) => b - a)) {
       if (!out.length || Math.abs(s - out[out.length - 1]) / out[out.length - 1] > 0.01) out.push(s);
     }
     return out.slice(0, count);
@@ -281,36 +506,112 @@ const TA = {
     return out.slice(0, count);
   },
 
+  /** Expects closed candles only; the caller drops any still-forming bar first. */
   volRatio(volumes: number[]): number {
-    if (volumes.length < 22) return 1;
-    const lastClosed = volumes[volumes.length - 2];
-    const avg = volumes.slice(-22, -2).reduce((a, b) => a + b, 0) / 20;
-    return avg === 0 ? 1 : +(lastClosed / avg).toFixed(2);
+    if (volumes.length < 21) return 1;
+    const last = volumes[volumes.length - 1];
+    const avg = volumes.slice(-21, -1).reduce((a, b) => a + b, 0) / 20;
+    return avg === 0 ? 1 : +(last / avg).toFixed(2);
+  },
+
+  /** Wilder ATR — the volatility unit used for stops, targets and sizing. */
+  atr(candles: OhlcvCandle[], period = 14): number | null {
+    if (candles.length < period + 1) return null;
+    const trs: number[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const { high, low } = candles[i];
+      const previousClose = candles[i - 1].close;
+      trs.push(Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose)));
+    }
+    let value = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    for (let i = period; i < trs.length; i++) value = (value * (period - 1) + trs[i]) / period;
+    return Number.isFinite(value) && value > 0 ? value : null;
+  },
+
+  /** MACD histogram (12/26/9). Positive and rising means momentum is turning up. */
+  macdHistogram(closes: number[], fast = 12, slow = 26, signal = 9): number | null {
+    if (closes.length < slow + signal) return null;
+    const emaSeries = (values: number[], period: number): number[] => {
+      const multiplier = 2 / (period + 1);
+      let current = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+      const out = [current];
+      for (let i = period; i < values.length; i++) {
+        current = (values[i] - current) * multiplier + current;
+        out.push(current);
+      }
+      return out;
+    };
+    const fastSeries = emaSeries(closes, fast);
+    const slowSeries = emaSeries(closes, slow);
+    // Align on the shorter (slow) series, which starts `slow - fast` bars later.
+    const offset = fastSeries.length - slowSeries.length;
+    const macd = slowSeries.map((value, i) => fastSeries[i + offset] - value);
+    if (macd.length < signal) return null;
+    const signalSeries = emaSeries(macd, signal);
+    const histogram = macd[macd.length - 1] - signalSeries[signalSeries.length - 1];
+    return Number.isFinite(histogram) ? histogram : null;
+  },
+
+  /** Aggregates candles into `factor`-times-longer bars for a higher-timeframe read. */
+  aggregate(candles: OhlcvCandle[], factor: number): OhlcvCandle[] {
+    if (factor <= 1) return candles;
+    const out: OhlcvCandle[] = [];
+    // Anchor to the end so the most recent bucket is complete rather than partial.
+    const start = candles.length % factor;
+    for (let i = start; i + factor <= candles.length; i += factor) {
+      const bucket = candles.slice(i, i + factor);
+      out.push({
+        timestamp: bucket[0].timestamp,
+        open: bucket[0].open,
+        high: Math.max(...bucket.map(c => c.high)),
+        low: Math.min(...bucket.map(c => c.low)),
+        close: bucket[bucket.length - 1].close,
+        volume: bucket.reduce((sum, c) => sum + c.volume, 0),
+      });
+    }
+    return out;
   },
 
   stochRsi(closes: number[], rsiP = 14, stochP = 14): [number, number] {
-    if (closes.length < rsiP + stochP) return [50, 50];
-    const vals: number[] = [];
-    for (let i = rsiP; i <= closes.length; i++) vals.push(this.rsi(closes.slice(0, i), rsiP));
-    const recent = vals.slice(-stochP);
-    const min = Math.min(...recent), max = Math.max(...recent);
-    const k = max === min ? 50 : ((vals[vals.length - 1] - min) / (max - min)) * 100;
-    const d3 = recent.slice(-3);
-    return [+k.toFixed(2), +(d3.length >= 3 ? d3.reduce((a, b) => a + b, 0) / 3 : k).toFixed(2)];
+    const rsis = this.rsiSeries(closes, rsiP);
+    if (rsis.length < stochP) return [50, 50];
+    const kSeries: number[] = [];
+    for (let i = stochP - 1; i < rsis.length; i++) {
+      const window = rsis.slice(i - stochP + 1, i + 1);
+      const min = Math.min(...window);
+      const max = Math.max(...window);
+      kSeries.push(max === min ? 50 : ((rsis[i] - min) / (max - min)) * 100);
+    }
+    const k = kSeries[kSeries.length - 1];
+    // %D is the 3-period average of %K. It previously averaged raw RSI values,
+    // which produced a "D" on a completely different scale from K.
+    const recentK = kSeries.slice(-3);
+    const d = recentK.reduce((a, b) => a + b, 0) / recentK.length;
+    return [+k.toFixed(2), +d.toFixed(2)];
   },
 
-  trend(closes: number[]): 'bullish' | 'bearish' | 'neutral' {
-    if (closes.length < 50) return 'neutral';
-    const s5 = this.sma(closes, 5), s20 = this.sma(closes, 20), s50 = this.sma(closes, 50);
-    if (s5 && s20 && s50) {
-      if (s5 > s20 && s20 > s50) return 'bullish';
-      if (s5 < s20 && s20 < s50) return 'bearish';
+  /** Stacked-average trend read: fast above medium above slow is an uptrend. */
+  trendFrom(closes: number[], periods: [number, number, number]): Trend {
+    const [fast, medium, slow] = periods;
+    if (closes.length < slow) return 'neutral';
+    const a = this.sma(closes, fast), b = this.sma(closes, medium), c = this.sma(closes, slow);
+    if (a !== null && b !== null && c !== null) {
+      if (a > b && b > c) return 'bullish';
+      if (a < b && b < c) return 'bearish';
     }
     return 'neutral';
   },
 
+  trend(closes: number[]): Trend {
+    return this.trendFrom(closes, [5, 20, 50]);
+  },
+
+  /**
+   * Full snapshot. `candles` must contain closed candles only — a still-forming bar
+   * makes every average repaint between cycles. Use `closedCandles()` first.
+   */
   full(candles: OhlcvCandle[], price: number): TechnicalAnalysis | null {
-    if (candles.length < 50) return null;
+    if (candles.length < 50 || !Number.isFinite(price) || price <= 0) return null;
     const c = candles.map(x => x.close), h = candles.map(x => x.high);
     const l = candles.map(x => x.low), v = candles.map(x => x.volume);
     const s5 = this.sma(c, 5), s20 = this.sma(c, 20), s50 = this.sma(c, 50);
@@ -319,11 +620,19 @@ const TA = {
     if (s20 !== null) maScore += price > s20 ? 1 : -1;
     if (s50 !== null) maScore += price > s50 ? 1 : -1;
     const [stochK, stochD] = this.stochRsi(c);
+    const atr = this.atr(candles);
+    // A 4x aggregate of the same candles gives a higher-timeframe trend filter for
+    // free, without spending another rate-limited request per pair.
+    const higher = this.aggregate(candles, 4);
     return {
       currentPrice: price, rsi: this.rsi(c), sma5: s5, sma20: s20, sma50: s50,
       bollinger: this.bollinger(c), supports: this.supports(l, price),
       resistances: this.resistances(h, price), volumeRatio: this.volRatio(v),
       stochRsiK: stochK, stochRsiD: stochD, trend: this.trend(c), maScore,
+      atr,
+      atrPct: atr === null ? null : atr / price,
+      htfTrend: this.trendFrom(higher.map(x => x.close), [5, 10, 20]),
+      macdHistogram: this.macdHistogram(c),
     };
   },
 };
@@ -351,20 +660,147 @@ function applyPositionAdjustments(
   return { stop, target, rejected };
 }
 
+interface TradePlan { stop: number; target: number; rr: number; riskPct: number; basis: string }
+
+/**
+ * Builds the stop and target for a new entry.
+ *
+ * The previous model put the stop a flat 3% under a swing low and the target at a
+ * flat +20%, which ignored volatility entirely: the same distance is noise on a
+ * meme coin and a thesis-breaking move on a blue chip. Stops are placed below
+ * structure *and* outside normal volatility, then capped so a single trade cannot
+ * risk an unbounded share of the entry.
+ */
+export function planTrade(ta: TechnicalAnalysis): TradePlan | null {
+  const price = ta.currentPrice;
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const atr = ta.atr && ta.atr > 0 ? ta.atr : null;
+  const support = ta.supports.find(s => s < price);
+  const resistance = ta.resistances.find(r => r > price);
+
+  const candidates: number[] = [];
+  if (support !== undefined) candidates.push(support * 0.99);
+  if (atr !== null) candidates.push(price - CONFIG.atrStopMult * atr);
+  if (!candidates.length) candidates.push(price * (1 - CONFIG.maxStopDistancePct));
+  // Take the safer (lower) of structure and volatility, then cap the risk.
+  const floor = price * (1 - CONFIG.maxStopDistancePct);
+  const stop = Math.max(floor, Math.min(...candidates));
+  if (!(stop > 0) || stop >= price) return null;
+
+  const risk = price - stop;
+  const atrTarget = atr !== null ? price + CONFIG.atrTargetMult * atr : price * 1.20;
+  // Resistance is a realistic exit, but only when it is far enough away to pay for
+  // the risk taken; otherwise aim past it at the volatility target.
+  const target = resistance !== undefined && resistance - price >= risk * 1.5
+    ? resistance
+    : Math.max(atrTarget, price + risk * 1.5);
+  const basis = atr === null ? 'structure only (ATR unavailable)' : `${CONFIG.atrStopMult}x ATR ${fmt(atr)}`;
+  return { stop, target, rr: (target - price) / risk, riskPct: risk / price, basis };
+}
+
+/**
+ * Applies the model's own stop and target for a new entry, falling back to the
+ * bot's ATR plan for anything it does not specify.
+ *
+ * At entry the model owns the trade plan — it can run a wider stop for a volatile
+ * name or a tighter one for a tight base. The single rule the bot keeps is the
+ * hard risk cap: a stop further from entry than MAX_STOP_DISTANCE_PCT is clamped,
+ * because one trade should not be able to cost an unbounded share of the account.
+ * Once the position is open the ratchet-only rule takes over and stops never widen.
+ */
+export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecision): TradePlan & { notes: string[] } {
+  const notes: string[] = [];
+  let stop = plan.stop;
+  let target = plan.target;
+
+  if (decision.adjustedStop !== null && Number.isFinite(decision.adjustedStop)) {
+    const floor = price * (1 - CONFIG.maxStopDistancePct);
+    if (decision.adjustedStop >= price) {
+      notes.push(`ignored AI stop ${fmt(decision.adjustedStop)}: not below entry ${fmt(price)}`);
+    } else if (decision.adjustedStop < floor) {
+      stop = floor;
+      notes.push(`AI stop ${fmt(decision.adjustedStop)} clamped to the ${pct(CONFIG.maxStopDistancePct)} risk cap at ${fmt(floor)}`);
+    } else {
+      stop = decision.adjustedStop;
+      notes.push(`using the AI stop ${fmt(stop)} instead of ${fmt(plan.stop)}`);
+    }
+  }
+
+  if (decision.adjustedTarget !== null && Number.isFinite(decision.adjustedTarget)) {
+    if (decision.adjustedTarget <= price)
+      notes.push(`ignored AI target ${fmt(decision.adjustedTarget)}: not above entry ${fmt(price)}`);
+    else {
+      target = decision.adjustedTarget;
+      notes.push(`using the AI target ${fmt(target)} instead of ${fmt(plan.target)}`);
+    }
+  }
+
+  const risk = price - stop;
+  if (!(risk > 0)) return { ...plan, notes };
+  return { stop, target, rr: (target - price) / risk, riskPct: risk / price, basis: plan.basis, notes };
+}
+
+/**
+ * Ratchets a stop upward as a trade works: to breakeven once it clears
+ * `BREAKEVEN_AT_R`, then trailing `TRAILING_STOP_ATR_MULT` ATR below the highest
+ * price seen. Returns null when nothing should move — the stop never widens.
+ */
+export function trailingStop(
+  position: Position, price: number, atr: number | null,
+): { stop: number; reason: string } | null {
+  const entry = position.entryPrice;
+  const initialStop = position.initialStopLoss ?? position.stopLoss;
+  const risk = entry - initialStop;
+  const high = Math.max(position.highWaterMark ?? entry, price);
+  let candidate = position.stopLoss;
+  let reason = '';
+
+  // The trail stays parked until the trade has actually earned its keep. Engaging
+  // it from the first bar would override the entry stop, which was placed at
+  // structure on purpose, and choke positions before they can work.
+  const activation = risk > 0 && CONFIG.breakevenAtR > 0 ? entry + CONFIG.breakevenAtR * risk : entry;
+  if (high < activation) return null;
+
+  if (CONFIG.breakevenAtR > 0 && risk > 0 && candidate < entry) {
+    candidate = entry;
+    reason = `locked in breakeven after +${CONFIG.breakevenAtR}R`;
+  }
+  const trailAtr = atr && atr > 0 ? atr : position.entryAtr && position.entryAtr > 0 ? position.entryAtr : null;
+  if (CONFIG.trailingStopAtrMult > 0 && trailAtr !== null) {
+    const trail = high - CONFIG.trailingStopAtrMult * trailAtr;
+    if (trail > candidate) {
+      candidate = trail;
+      reason = `trailing ${CONFIG.trailingStopAtrMult}x ATR below high ${fmt(high)}`;
+    }
+  }
+  // Never place a stop at or above the market: that is an instant, unintended exit.
+  if (candidate <= position.stopLoss || candidate >= price) return null;
+  return { stop: candidate, reason };
+}
+
 function updateTradeExtremes(state: BotState, pnl: number): void {
   if (pnl > 0 && (state.bestTrade === null || pnl > state.bestTrade)) state.bestTrade = pnl;
   if (pnl < 0 && (state.worstTrade === null || pnl < state.worstTrade)) state.worstTrade = pnl;
 }
 
-function scoreSetup(ta: TechnicalAnalysis): {
+interface SetupScore {
   score: number;
   rsiComponent: number;
   supportComponent: number;
   trendComponent: number;
   volumeComponent: number;
+  htfComponent: number;
+  momentumComponent: number;
   supportDistance: number | null;
-} {
-  const support = ta.supports.filter(s => s < ta.currentPrice).sort((a, b) => b - a)[0];
+}
+
+/**
+ * Ranks which setups are worth an AI call. Buying an oversold coin inside a
+ * higher-timeframe downtrend is the classic way to catch a falling knife, so the
+ * 4x trend and momentum turn now carry real weight alongside RSI and structure.
+ */
+export function scoreSetup(ta: TechnicalAnalysis): SetupScore {
+  const support = ta.supports.find(s => s < ta.currentPrice);
   const supportDistance = support === undefined ? null : (ta.currentPrice - support) / ta.currentPrice;
   const rsiComponent = Math.max(0, Math.min(100, 100 - ta.rsi));
   const supportComponent = supportDistance === null
@@ -372,11 +808,19 @@ function scoreSetup(ta: TechnicalAnalysis): {
     : 100 * Math.max(0, 1 - supportDistance / 0.10);
   const trendComponent = ta.trend === 'bullish' ? 100 : ta.trend === 'neutral' ? 60 : 20;
   const volumeComponent = Math.max(0, Math.min(ta.volumeRatio, 2) / 2 * 100);
-  const score = rsiComponent * 0.40 + supportComponent * 0.25 +
-    trendComponent * 0.20 + volumeComponent * 0.15;
+  const htfComponent = ta.htfTrend === 'bullish' ? 100 : ta.htfTrend === 'neutral' ? 55 : 10;
+  // StochRSI %K crossing up through %D from oversold is the actual bounce trigger;
+  // a positive MACD histogram confirms it.
+  const crossUp = ta.stochRsiK > ta.stochRsiD ? 60 : 25;
+  const oversoldBonus = ta.stochRsiK < 20 ? 40 : ta.stochRsiK < 50 ? 20 : 0;
+  const macdBonus = ta.macdHistogram !== null && ta.macdHistogram > 0 ? 10 : 0;
+  const momentumComponent = Math.max(0, Math.min(100, crossUp + oversoldBonus + macdBonus));
+  const score = rsiComponent * 0.30 + supportComponent * 0.20 + trendComponent * 0.15 +
+    volumeComponent * 0.10 + htfComponent * 0.15 + momentumComponent * 0.10;
   return {
     score: Math.max(0, Math.min(100, score)),
-    rsiComponent, supportComponent, trendComponent, volumeComponent, supportDistance,
+    rsiComponent, supportComponent, trendComponent, volumeComponent,
+    htfComponent, momentumComponent, supportDistance,
   };
 }
 
@@ -389,7 +833,7 @@ class Exchange {
   readonly paper: boolean;
   private cycleBalance: any = null;
   private balanceLoaded = false;
-  private marketsLoaded = false;
+  private marketsPromise: Promise<void> | null = null;
   private cyclePrices: Record<string, number> = {};
   private cycleTickers: Record<string, { price: number; volume24h: number }> = {};
 
@@ -407,8 +851,13 @@ class Exchange {
       : '[EXCHANGE] *** LIVE MODE — REAL MONEY ***');
   }
 
-  async getPrice(pair: string): Promise<number | null> {
-    if (this.cyclePrices[pair] !== undefined) return this.cyclePrices[pair];
+  /**
+   * Cached per cycle so a scan does not re-request the same ticker. Pass
+   * `fresh` when the price is about to size a real order — a cached quote can be
+   * half an hour stale by the time phase 3 runs.
+   */
+  async getPrice(pair: string, fresh = false): Promise<number | null> {
+    if (!fresh && this.cyclePrices[pair] !== undefined) return this.cyclePrices[pair];
     try {
       const t = await withRetry<any>(`ticker ${pair}`, () => this.ex.fetchTicker(pair));
       const price = t.last ?? t.close ?? null;
@@ -440,7 +889,10 @@ class Exchange {
   async getOhlcv(pair: string, tf = '1h', limit = 200): Promise<OhlcvCandle[]> {
     try {
       const raw = await withRetry<any[]>(`OHLCV ${pair}`, () => this.ex.fetchOHLCV(pair, tf, undefined, limit));
-      return raw.map((c: any) => ({ timestamp: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] }));
+      const candles = raw
+        .map((c: any) => ({ timestamp: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] }))
+        .filter((c: OhlcvCandle) => [c.open, c.high, c.low, c.close].every(v => Number.isFinite(v) && v > 0));
+      return closedCandles(candles, tf);
     } catch (e) {
       console.warn(`[EXCHANGE] OHLCV unavailable for ${pair}: ${e instanceof Error ? e.message : String(e)}`);
       return [];
@@ -490,13 +942,20 @@ class Exchange {
   beginCycle() {
     this.cyclePrices = {};
     this.cycleTickers = {};
+    // The balance snapshot is cycle-scoped too. Leaving it behind let a later
+    // cycle size orders against a previous cycle's cash.
+    this.cycleBalance = null;
+    this.balanceLoaded = false;
   }
 
   private async ensureMarkets(): Promise<void> {
-    if (!this.marketsLoaded) {
-      await withRetry('market loading', () => this.ex.loadMarkets());
-      this.marketsLoaded = true;
+    // Memoised: parallel scanners would otherwise each kick off their own load.
+    if (!this.marketsPromise) {
+      this.marketsPromise = withRetry('market loading', () => this.ex.loadMarkets())
+        .then(() => undefined)
+        .catch(e => { this.marketsPromise = null; throw e; });
     }
+    return this.marketsPromise;
   }
 
   private usdMarketForAsset(asset: string): any | null {
@@ -647,8 +1106,11 @@ class Exchange {
     const price = Number.isFinite(average) && average > 0
       ? average : Number.isFinite(orderPrice) && orderPrice > 0
         ? orderPrice : Number.isFinite(cost) && cost > 0 && qty > 0 ? cost / qty : fallbackPrice;
-    const market = this.ex.market(pair);
-    const fees = order?.fees?.length ? order.fees : order?.fee ? [order.fee] : [];
+    let market: any = null;
+    // Anything thrown from here on would discard the record of an order the
+    // exchange has already executed, so failures degrade instead of propagating.
+    try { market = this.ex.market(pair); } catch {}
+    const fees = Array.isArray(order?.fees) && order.fees.length ? order.fees : order?.fee ? [order.fee] : [];
     const feeUsd = fees.reduce((sum: number, fee: any) => {
       const feeCost = Number(fee?.cost);
       if (!Number.isFinite(feeCost) || feeCost <= 0) return sum;
@@ -660,6 +1122,38 @@ class Exchange {
       return sum;
     }, 0);
     return { qty, price, feeUsd };
+  }
+
+  /**
+   * Kraken's create-order response usually carries only a transaction id, so cost
+   * basis was previously guessed from the requested quantity and a cached ticker.
+   * Poll until the order reports a terminal state and use the real numbers.
+   */
+  private async resolveOrder(order: any, pair: string): Promise<any> {
+    const id = order?.id;
+    if (!id || typeof this.ex.fetchOrder !== 'function') return order;
+    let latest = order;
+    for (let attempt = 0; attempt < ORDER_POLL_ATTEMPTS; attempt++) {
+      const filled = Number(latest?.filled);
+      const settled = latest?.status === 'closed' && Number.isFinite(filled) && filled > 0;
+      if (settled || latest?.status === 'canceled' || latest?.status === 'rejected') return latest;
+      await sleep(ORDER_POLL_DELAY_MS);
+      try {
+        latest = await withRetry(`order status ${pair}`, () => this.ex.fetchOrder(id, pair));
+      } catch (e) {
+        console.warn(`  [ORDER] ${pair}: could not confirm order ${id} (${e instanceof Error ? e.message : String(e)}); using the create response`);
+        return latest;
+      }
+    }
+    console.warn(`  [ORDER] ${pair}: order ${id} still ${latest?.status ?? 'unresolved'} after polling; recording the fill seen so far`);
+    return latest;
+  }
+
+  /** True when the exchange reports the order ended without trading anything. */
+  private isUnfilled(order: any): boolean {
+    const filled = Number(order?.filled);
+    return (order?.status === 'canceled' || order?.status === 'rejected') &&
+      (!Number.isFinite(filled) || filled <= 0);
   }
 
   // ccxt's amountToPrecision truncates, so an order never exceeds the requested quantity.
@@ -715,9 +1209,14 @@ class Exchange {
 
   getAvailableCash(pair: string): number | null {
     if (!this.balanceLoaded || !this.cycleBalance) return null;
-    const market = this.ex.market(pair);
-    if (!market?.quote) return null;
-    return this.getAssetField(this.cycleBalance, market.quote, 'free');
+    try {
+      const market = this.ex.market(pair);
+      if (!market?.quote) return null;
+      return this.getAssetField(this.cycleBalance, market.quote, 'free');
+    } catch {
+      // An unknown symbol here used to throw straight out of the trading loop.
+      return null;
+    }
   }
 
   getQuoteAsset(pair: string): string | null {
@@ -731,9 +1230,13 @@ class Exchange {
 
   getAvailableBase(pair: string): number | null {
     if (!this.balanceLoaded || !this.cycleBalance) return null;
-    const market = this.ex.market(pair);
-    if (!market?.base) return null;
-    return this.getAssetField(this.cycleBalance, market.base, 'free');
+    try {
+      const market = this.ex.market(pair);
+      if (!market?.base) return null;
+      return this.getAssetField(this.cycleBalance, market.base, 'free');
+    } catch {
+      return null;
+    }
   }
 
   private syncPositionQuantity(mem: Memory, pair: string, qty: number, currentPrice?: number) {
@@ -750,7 +1253,9 @@ class Exchange {
 
   async buy(pair: string, usd: number): Promise<OrderFill | null> {
     try {
-      const price = await this.getPrice(pair);
+      // Sized off a fresh quote: the cycle cache can be an entire scan interval old,
+      // which turns a "spend exactly this much cash" order into a rejected one.
+      const price = await this.getPrice(pair, !this.paper);
       if (!price) return null;
       const qty = usd / price;
       if (this.paper) {
@@ -759,16 +1264,21 @@ class Exchange {
       }
       const orderQty = await this.normalizeOrderAmount(pair, qty, price);
       if (orderQty === null) return null;
-      const order = await this.ex.createMarketBuyOrder(pair, orderQty);
+      const placed = await this.ex.createMarketBuyOrder(pair, orderQty);
+      const order = await this.resolveOrder(placed, pair);
+      if (this.isUnfilled(order)) {
+        console.warn(`  [BUY SKIP] ${pair}: order ${order?.status ?? 'ended'} without a fill`);
+        return null;
+      }
       const fill = this.orderFill(order, orderQty, price, pair);
-      console.log(`  [LIVE BUY] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
+      console.log(`  [LIVE BUY] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)} (fee ${fmt(fill.feeUsd)})`);
       return fill;
     } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return null; }
   }
 
   async sell(pair: string, qty: number): Promise<OrderFill | null> {
     try {
-      const price = await this.getPrice(pair);
+      const price = await this.getPrice(pair, !this.paper);
       if (!price) return null;
       if (this.paper) {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
@@ -783,12 +1293,68 @@ class Exchange {
       }
       const sellQty = availableBase === null ? qty : Math.min(qty, availableBase);
       const orderQty = await this.normalizeOrderAmount(pair, sellQty, price);
-      if (orderQty === null) return null;
-      const order = await this.ex.createMarketSellOrder(pair, orderQty);
+      if (orderQty === null) {
+        // Worth shouting about: an exit blocked by exchange minimums means the stop
+        // loss on this position can never actually fire.
+        console.error(`  [EXIT BLOCKED] ${pair}: ${fmt(sellQty * price)} cannot be sold under Kraken's minimums; the stop on this position cannot execute until it is topped up or sold manually`);
+        return null;
+      }
+      const placed = await this.ex.createMarketSellOrder(pair, orderQty);
+      const order = await this.resolveOrder(placed, pair);
+      if (this.isUnfilled(order)) {
+        console.warn(`  [SELL SKIP] ${pair}: order ${order?.status ?? 'ended'} without a fill`);
+        return null;
+      }
       const fill = this.orderFill(order, orderQty, price, pair);
-      console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
+      console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)} (fee ${fmt(fill.feeUsd)})`);
       return fill;
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
+  }
+
+  /** ATR-priced stop and target for a holding the bot did not open itself. */
+  private async importedPlan(pair: string, price: number): Promise<(TradePlan & { atr: number | null }) | null> {
+    try {
+      const candles = await this.getOhlcv(pair, '1h', 200);
+      if (candles.length < 50) return null;
+      const ta = TA.full(candles, price);
+      if (!ta) return null;
+      const plan = planTrade(ta);
+      return plan ? { ...plan, atr: ta.atr } : null;
+    } catch (e) {
+      console.warn(`  [RECONCILE] ${pair}: could not price risk from history (${e instanceof Error ? e.message : String(e)})`);
+      return null;
+    }
+  }
+
+  /** Watchlist pairs Kraken does not list, so the scan can never reach them. */
+  async listMissingMarkets(pairs: string[]): Promise<string[]> {
+    await this.ensureMarkets();
+    return pairs.filter(pair => {
+      try { return !this.ex.market(pair); } catch { return true; }
+    });
+  }
+
+  /**
+   * Whether a full exit of `qty` would clear Kraken's amount, cost and precision
+   * rules. A position that fails this has a stop loss that can never execute.
+   */
+  async checkSellable(pair: string, qty: number, price: number): Promise<{ ok: boolean; detail: string }> {
+    try {
+      await this.ensureMarkets();
+      const market = this.ex.market(pair);
+      const amount = Number(this.ex.amountToPrecision(pair, qty));
+      const minAmount = Number(market?.limits?.amount?.min || 0);
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      if (!Number.isFinite(amount) || amount <= 0)
+        return { ok: false, detail: 'rounds to zero at exchange precision' };
+      if (minAmount > 0 && amount < minAmount)
+        return { ok: false, detail: `${amount} below minimum amount ${minAmount}` };
+      if (minCost > 0 && amount * price < minCost)
+        return { ok: false, detail: `${fmt(amount * price)} below minimum cost ${fmt(minCost)}` };
+      return { ok: true, detail: `${fmt(amount * price)} clears minimums` };
+    } catch (e: any) {
+      return { ok: false, detail: `market metadata unavailable (${e.message})` };
+    }
   }
 
   async reconcilePositions(mem: Memory): Promise<void> {
@@ -822,16 +1388,29 @@ class Exchange {
         if (CONFIG.minTradeUsd !== null && holding.value < CONFIG.minTradeUsd) continue;
         const entry = await this.getEntryPrice(pair, holding.qty, holding.price);
         const reason = `Imported from Kraken balance (${entry.source})`;
-        const entryStop = entry.price * (1 - IMPORTED_POSITION_STOP_PCT);
-        const entryTarget = entry.price * (1 + IMPORTED_POSITION_TARGET_PCT);
-        const currentStop = holding.price * (1 - IMPORTED_POSITION_STOP_PCT);
-        const currentTarget = holding.price * (1 + IMPORTED_POSITION_TARGET_PCT);
-        const stopLoss = entryStop < holding.price ? Math.max(entryStop, currentStop) : currentStop;
-        const takeProfit = entryTarget > holding.price ? Math.min(entryTarget, currentTarget) : currentTarget;
+        // Flat ±5%/±10% bands anchored on the import price meant a holding already
+        // far in profit carried a target it could not reach without another 10%,
+        // and a stop tight enough for ordinary noise to trigger. Price the levels
+        // off this pair's actual volatility instead.
+        const plan = await this.importedPlan(pair, holding.price);
+        let stopLoss: number;
+        let takeProfit: number;
+        if (plan) {
+          stopLoss = plan.stop;
+          takeProfit = plan.target;
+        } else {
+          const currentStop = holding.price * (1 - IMPORTED_POSITION_STOP_PCT);
+          const currentTarget = holding.price * (1 + IMPORTED_POSITION_TARGET_PCT);
+          const entryStop = entry.price * (1 - IMPORTED_POSITION_STOP_PCT);
+          const entryTarget = entry.price * (1 + IMPORTED_POSITION_TARGET_PCT);
+          stopLoss = entryStop < holding.price ? Math.max(entryStop, currentStop) : currentStop;
+          takeProfit = entryTarget > holding.price ? Math.min(entryTarget, currentTarget) : currentTarget;
+        }
         mem.openPosition(pair, holding.qty, entry.price,
           stopLoss, takeProfit,
-          getSector(pair), reason, 'Imported from Kraken balance; not opened by the bot.');
-        console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source}) | stop ${fmt(stopLoss)} target ${fmt(takeProfit)}`);
+          getSector(pair), reason, 'Imported from Kraken balance; not opened by the bot.',
+          0, plan?.atr ?? null);
+        console.log(`  [RECONCILE] Imported ${pair}: ${holding.qty.toFixed(6)} @ ${fmt(entry.price)} (${entry.source}) | stop ${fmt(stopLoss)} target ${fmt(takeProfit)} (${plan ? plan.basis : 'flat percentage fallback'})`);
       }
 
       for (const pos of mem.getOpenPositions()) {
@@ -862,11 +1441,10 @@ class Exchange {
   }
 
   /**
-   * Get total portfolio value in USD.
-   * LIVE: fetches real USD + ZUSD balance from Kraken API.
-   * PAPER: calculates from memory (invested + remaining cash).
+   * Values the account, separating what can be traded from what is merely held.
+   * LIVE: from the Kraken balance. PAPER: from simulated cash plus positions.
    */
-  async getPortfolioValue(mem: Memory): Promise<number> {
+  async getPortfolioValue(mem: Memory): Promise<PortfolioSnapshot> {
     try {
       if (!this.paper) {
         await this.ensureMarkets();
@@ -874,24 +1452,53 @@ class Exchange {
         this.cycleBalance = balance;
         this.balanceLoaded = true;
         if (!balance) throw new Error('balance unavailable');
-        const usd = this.getCashValue(balance);
-        let cryptoValue = 0;
-        for (const [pair, holding] of Object.entries(this.mapHoldings(balance, false, true))) {
-          const price = await this.getCyclePrice(pair);
-          if (price !== null) cryptoValue += holding.qty * price;
-        }
-        const total = usd + cryptoValue;
-        console.log(`  [BALANCE] API: ${fmt(usd)} cash + ${fmt(cryptoValue)} crypto = ${fmt(total)}`);
-        return total > 0 ? total : CONFIG.fallbackPortfolioValue;
+        const cashUsd = this.getCashValue(balance);
+        const valueOf = async (holdings: Record<string, { asset: string; qty: number }>) => {
+          let total = 0;
+          for (const [pair, holding] of Object.entries(holdings)) {
+            const price = await this.getCyclePrice(pair);
+            if (price !== null) total += holding.qty * price;
+          }
+          return total;
+        };
+        const tradableCrypto = await valueOf(this.mapHoldings(balance, false, false));
+        const allCrypto = await valueOf(this.mapHoldings(balance, false, true));
+        const stakedUsd = Math.max(0, allCrypto - tradableCrypto);
+        const snapshot: PortfolioSnapshot = {
+          totalUsd: cashUsd + allCrypto,
+          cashUsd,
+          tradableUsd: cashUsd + tradableCrypto,
+          stakedUsd,
+        };
+        console.log(`  [BALANCE] API: ${fmt(cashUsd)} cash + ${fmt(tradableCrypto)} tradable crypto${stakedUsd > 0 ? ` + ${fmt(stakedUsd)} staked (locked)` : ''} = ${fmt(snapshot.totalUsd)}`);
+        if (snapshot.totalUsd > 0) return snapshot;
+        throw new Error('balance totals zero');
       }
     } catch (e: any) {
       console.warn(`  [BALANCE] API call failed (${e.message}), using PORTFOLIO_VALUE fallback`);
     }
-    // Paper mode (or API fallback): calculate from memory
-    const invested = mem.getOpenPositions().reduce((s, p) => s + p.costBasisUsd, 0);
-    const cash = CONFIG.fallbackPortfolioValue - invested;
-    console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(invested)} invested = ${fmt(CONFIG.fallbackPortfolioValue)}`);
-    return CONFIG.fallbackPortfolioValue;
+    let marketValue = 0;
+    for (const position of mem.getOpenPositions()) {
+      const price = await this.getCyclePrice(position.pair) ?? position.currentPrice;
+      marketValue += position.qty * price;
+    }
+    if (!this.paper) {
+      // Live, but the balance call failed. Paper cash tracks nothing here, so fall
+      // back to the configured size floored by what is demonstrably invested.
+      const total = Math.max(CONFIG.fallbackPortfolioValue, marketValue);
+      console.warn(`  [BALANCE] Falling back to PORTFOLIO_VALUE: ${fmt(total)} (${fmt(marketValue)} in tracked positions)`);
+      // Free cash is unknown here, so claim none: an over-optimistic guess would
+      // size orders the exchange is going to reject anyway.
+      return { totalUsd: total, cashUsd: 0, tradableUsd: total, stakedUsd: 0 };
+    }
+    // Paper: simulated cash plus positions marked to market. This used to return the
+    // configured starting value forever, so paper results never compounded and every
+    // size was computed against a fixed, fictional balance.
+    const cash = mem.paperCash();
+    const total = cash + marketValue;
+    console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(marketValue)} positions = ${fmt(total)}`);
+    const value = total > 0 ? total : CONFIG.fallbackPortfolioValue;
+    return { totalUsd: value, cashUsd: cash, tradableUsd: value, stakedUsd: 0 };
   }
 }
 
@@ -910,61 +1517,227 @@ class Memory {
       startedAt: new Date().toISOString(), totalTrades: 0, wins: 0, losses: 0,
       totalPnl: 0, bestTrade: null, worstTrade: null,
       lastScan: '', lastAiDecision: '', cycleCount: 0,
+      recentTrades: [], sectorStats: {}, riskDay: utcDay(), riskDayPnl: 0, paperCash: null,
+      lastStance: null, fundingRequest: null,
       ...saved,
     };
+    // A hand-edited or partially written state file must not leave the bot with
+    // undefined counters that poison every later arithmetic operation.
     this.state.bestTrade = typeof saved.bestTrade === 'number' ? saved.bestTrade : null;
     this.state.worstTrade = typeof saved.worstTrade === 'number' ? saved.worstTrade : null;
+    this.state.recentTrades = Array.isArray(saved.recentTrades) ? saved.recentTrades.slice(-RECENT_TRADE_MEMORY) : [];
+    this.state.sectorStats = saved.sectorStats && typeof saved.sectorStats === 'object' ? saved.sectorStats : {};
+    this.state.riskDay = typeof saved.riskDay === 'string' && saved.riskDay ? saved.riskDay : utcDay();
+    this.state.riskDayPnl = Number.isFinite(saved.riskDayPnl as number) ? Number(saved.riskDayPnl) : 0;
+    this.state.paperCash = typeof saved.paperCash === 'number' && Number.isFinite(saved.paperCash) ? saved.paperCash : null;
+    this.state.lastStance = saved.lastStance && typeof saved.lastStance === 'object' ? saved.lastStance : null;
+    this.state.fundingRequest = saved.fundingRequest && typeof saved.fundingRequest === 'object' ? saved.fundingRequest : null;
+    for (const key of ['totalTrades', 'wins', 'losses', 'totalPnl', 'cycleCount'] as const) {
+      if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
+    }
     this.positions = this.loadJson<Record<string, Position>>(POSITIONS_FILE, {});
   }
 
   private loadJson<T>(file: string, fallback: T): T {
-    try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch {}
-    return fallback;
+    if (!fs.existsSync(file)) return fallback;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, 'utf-8');
+    } catch (e: any) {
+      console.error(`[STATE] Could not read ${path.basename(file)} (${e.message}); starting from defaults`);
+      return fallback;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed as T;
+      throw new Error('expected a JSON object');
+    } catch (e: any) {
+      // Silently discarding this file used to wipe live positions on a single bad
+      // byte. Keep the evidence so the holdings can be recovered by hand.
+      const backup = `${file}.corrupt-${Date.now()}`;
+      try {
+        fs.writeFileSync(backup, raw);
+        console.error(`[STATE] ${path.basename(file)} is unreadable (${e.message}); saved a copy to ${path.basename(backup)}`);
+      } catch {
+        console.error(`[STATE] ${path.basename(file)} is unreadable (${e.message}) and could not be backed up`);
+      }
+      return fallback;
+    }
   }
 
   private saveAtomic(file: string, value: unknown) {
     const temporary = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(temporary, JSON.stringify(value, null, 2));
-    fs.renameSync(temporary, file);
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(value, null, 2));
+      fs.renameSync(temporary, file);
+    } catch (e: any) {
+      console.error(`[STATE] Failed to persist ${path.basename(file)}: ${e.message}`);
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+    }
   }
 
   savePositions() { this.saveAtomic(POSITIONS_FILE, this.positions); }
   saveState() { this.saveAtomic(STATE_FILE, this.state); }
 
-  openPosition(pair: string, qty: number, price: number, sl: number, tp: number, sector: string, reason: string, aiReason: string, feeUsd = 0) {
+  /** Wins over decided trades; break-even closes are neither a win nor a loss. */
+  winRate(): number {
+    const decided = this.state.wins + this.state.losses;
+    return decided > 0 ? (this.state.wins / decided) * 100 : 0;
+  }
+
+  openPosition(
+    pair: string, qty: number, price: number, sl: number, tp: number,
+    sector: string, reason: string, aiReason: string, feeUsd = 0, atr: number | null = null,
+  ) {
     const pos: Position = {
       pair, status: 'open', sector, entryPrice: price, qty,
-      costBasisUsd: +(qty * price + feeUsd).toFixed(2), stopLoss: sl, takeProfit: tp,
+      // Full precision: rounding to cents zeroed out sub-cent cost bases and made
+      // every downstream percentage NaN or Infinity.
+      costBasisUsd: qty * price + feeUsd, stopLoss: sl, takeProfit: tp,
       currentPrice: price, reason, aiReasoning: aiReason, openedAt: new Date().toISOString(),
+      initialStopLoss: sl, highWaterMark: price, entryAtr: atr, bookedPnlUsd: 0,
     };
     this.positions[pair] = pos;
     this.savePositions();
   }
 
-  closePosition(pair: string, exitPrice: number, reason: string, feeUsd = 0): Position | null {
+  /**
+   * Books a partial exit: the sold share's P/L is realised now and the position
+   * stays open with the residual quantity and a proportionally reduced cost basis.
+   * Carrying the proceeds forward instead would double-count them against a basis
+   * that had already shrunk.
+   */
+  reducePosition(pair: string, qty: number, exitPrice: number, feeUsd = 0): number | null {
+    const p = this.positions[pair];
+    if (!p || p.status !== 'open' || qty <= 0 || qty >= p.qty) return null;
+    const soldCost = p.costBasisUsd * (qty / p.qty);
+    const pnlUsd = +(qty * exitPrice - feeUsd - soldCost).toFixed(6);
+    p.costBasisUsd -= soldCost;
+    p.qty -= qty;
+    p.bookedPnlUsd = +((p.bookedPnlUsd ?? 0) + pnlUsd).toFixed(6);
+    // Realised, so it counts toward total and daily P/L — but a partial is not a
+    // separate trade, so the trade and win/loss counters stay untouched.
+    this.state.totalPnl = +(this.state.totalPnl + pnlUsd).toFixed(6);
+    this.addToRiskDay(pnlUsd);
+    const stat = this.state.sectorStats[p.sector] ?? { trades: 0, wins: 0, pnlUsd: 0 };
+    stat.pnlUsd = +(stat.pnlUsd + pnlUsd).toFixed(6);
+    this.state.sectorStats[p.sector] = stat;
+    this.savePositions(); this.saveState();
+    return pnlUsd;
+  }
+
+  /**
+   * Closes a position. `exitQty` defaults to the full position, but a partial fill
+   * must pass the quantity that actually sold — valuing the untraded remainder at
+   * the exit price silently invented P/L that never existed.
+   */
+  closePosition(pair: string, exitPrice: number, reason: string, feeUsd = 0, exitQty?: number): Position | null {
     const p = this.positions[pair];
     if (!p || p.status !== 'open') return null;
+    const soldQty = exitQty === undefined ? p.qty : Math.min(exitQty, p.qty);
     p.exitPrice = exitPrice;
-    p.exitValueUsd = +(p.qty * exitPrice - feeUsd).toFixed(2);
-    p.pnlUsd = +(p.exitValueUsd - p.costBasisUsd).toFixed(2);
-    p.pnlPct = +((p.pnlUsd / p.costBasisUsd) * 100).toFixed(2);
+    p.exitValueUsd = +(soldQty * exitPrice - feeUsd).toFixed(6);
+    p.pnlUsd = +(p.exitValueUsd - p.costBasisUsd).toFixed(6);
+    p.pnlPct = p.costBasisUsd > 0 ? +((p.pnlUsd / p.costBasisUsd) * 100).toFixed(2) : 0;
     p.status = 'closed';
     p.closedAt = new Date().toISOString();
     p.closeReason = reason;
     this.state.totalTrades++;
-    this.state.totalPnl += p.pnlUsd;
-    if (p.pnlUsd > 0) {
-      this.state.wins++;
-    } else {
-      this.state.losses++;
-    }
+    this.state.totalPnl = +(this.state.totalPnl + p.pnlUsd).toFixed(6);
+    if (p.pnlUsd > 0) this.state.wins++;
+    else if (p.pnlUsd < 0) this.state.losses++;
     updateTradeExtremes(this.state, p.pnlUsd);
+    this.recordClosedTrade(p);
     this.savePositions(); this.saveState();
     return p;
   }
 
-  updatePrice(pair: string, price: number) {
-    if (this.positions[pair]?.status === 'open') { this.positions[pair].currentPrice = price; this.savePositions(); }
+  private recordClosedTrade(p: Position) {
+    const holdDays = (Date.now() - new Date(p.openedAt).getTime()) / 86400000;
+    this.state.recentTrades.push({
+      pair: p.pair, sector: p.sector, pnlUsd: p.pnlUsd ?? 0, pnlPct: p.pnlPct ?? 0,
+      closedAt: p.closedAt ?? new Date().toISOString(),
+      closeReason: p.closeReason ?? '', holdDays: +Math.max(0, holdDays).toFixed(2),
+    });
+    if (this.state.recentTrades.length > RECENT_TRADE_MEMORY)
+      this.state.recentTrades = this.state.recentTrades.slice(-RECENT_TRADE_MEMORY);
+
+    const stat = this.state.sectorStats[p.sector] ?? { trades: 0, wins: 0, pnlUsd: 0 };
+    stat.trades++;
+    if ((p.pnlUsd ?? 0) > 0) stat.wins++;
+    stat.pnlUsd = +(stat.pnlUsd + (p.pnlUsd ?? 0)).toFixed(6);
+    this.state.sectorStats[p.sector] = stat;
+
+    this.addToRiskDay(p.pnlUsd ?? 0);
+  }
+
+  private addToRiskDay(pnlUsd: number) {
+    const today = utcDay();
+    if (this.state.riskDay !== today) {
+      this.state.riskDay = today;
+      this.state.riskDayPnl = 0;
+    }
+    this.state.riskDayPnl = +(this.state.riskDayPnl + pnlUsd).toFixed(6);
+  }
+
+  /**
+   * Persists the model's market call. A funding request is kept standing until the
+   * operator actually adds capital, so it survives restarts and stays visible.
+   */
+  recordStance(stance: PortfolioStance) {
+    this.state.lastStance = stance;
+    if (stance.requestedFundsUsd > 0) {
+      this.state.fundingRequest = {
+        usd: stance.requestedFundsUsd,
+        reasoning: stance.reasoning,
+        requestedAt: new Date().toISOString(),
+      };
+    }
+    this.saveState();
+  }
+
+  /** Clears a standing funding request once that much new cash has arrived. */
+  clearFundingRequestIfFunded(cashUsd: number) {
+    const request = this.state.fundingRequest;
+    if (request && cashUsd >= request.usd) {
+      console.log(`  [FUNDING] Request for ${fmt(request.usd)} is covered by ${fmt(cashUsd)} of free cash; clearing it.`);
+      this.state.fundingRequest = null;
+      this.saveState();
+    }
+  }
+
+  /** Simulated cash for paper mode, seeded from PORTFOLIO_VALUE on first use. */
+  paperCash(): number {
+    if (this.state.paperCash === null) {
+      const invested = this.getOpenPositions().reduce((sum, p) => sum + p.costBasisUsd, 0);
+      this.state.paperCash = Math.max(0, CONFIG.fallbackPortfolioValue - invested);
+      this.saveState();
+    }
+    return this.state.paperCash;
+  }
+
+  adjustPaperCash(delta: number) {
+    this.state.paperCash = Math.max(0, this.paperCash() + delta);
+    this.saveState();
+  }
+
+  /** Realised P/L booked today (UTC), used by the daily-loss circuit breaker. */
+  realizedPnlToday(): number {
+    return this.state.riskDay === utcDay() ? this.state.riskDayPnl : 0;
+  }
+
+  updatePrice(pair: string, price: number, persist = true) {
+    const pos = this.positions[pair];
+    if (pos?.status !== 'open' || !Number.isFinite(price) || price <= 0) return;
+    pos.currentPrice = price;
+    if (price > (pos.highWaterMark ?? pos.entryPrice)) pos.highWaterMark = price;
+    if (persist) this.savePositions();
+  }
+
+  /** Batch price refresh — one disk write instead of one per pair. */
+  updatePrices(prices: Record<string, number>) {
+    for (const [pair, price] of Object.entries(prices)) this.updatePrice(pair, price, false);
+    this.savePositions();
   }
 
   getOpenPositions() { return Object.values(this.positions).filter(p => p.status === 'open'); }
@@ -983,19 +1756,40 @@ class Memory {
   logTrade(t: TradeRecord) {
     const header = !fs.existsSync(TRADES_FILE);
     const line = [t.timestamp, t.pair, t.side, t.price, t.qty, t.costBasisUsd, t.stopLoss, t.takeProfit,
-      t.pnlUsd, t.pnlPct, t.status, t.sector, t.reason, t.aiVerdict, t.aiConfidence].join(',');
-    fs.appendFileSync(TRADES_FILE,
-      (header ? 'timestamp,pair,side,price,qty,cost,stop,target,pnl,pct,status,sector,reason,ai_verdict,ai_confidence\n' : '') + line + '\n');
+      t.pnlUsd, t.pnlPct, t.status, t.sector, t.reason, t.aiVerdict, t.aiConfidence].map(csvField).join(',');
+    try {
+      fs.appendFileSync(TRADES_FILE,
+        (header ? 'timestamp,pair,side,price,qty,cost,stop,target,pnl,pct,status,sector,reason,ai_verdict,ai_confidence\n' : '') + line + '\n');
+    } catch (e: any) {
+      console.error(`[STATE] Could not append to trades.csv: ${e.message}`);
+    }
+  }
+
+  private performanceLines(): string[] {
+    const lines: string[] = [];
+    const sectors = Object.entries(this.state.sectorStats)
+      .sort((a, b) => b[1].pnlUsd - a[1].pnlUsd);
+    if (sectors.length) {
+      lines.push('', '=== SECTOR PERFORMANCE (realised) ===');
+      for (const [sector, stat] of sectors)
+        lines.push(`${sector}: ${stat.trades} trades | ${stat.wins} wins | P/L ${fmt(stat.pnlUsd)}`);
+    }
+    const recent = this.state.recentTrades.slice(-10).reverse();
+    if (recent.length) {
+      lines.push('', `=== LAST ${recent.length} CLOSED TRADES (newest first) ===`);
+      for (const t of recent)
+        lines.push(`${t.pair} (${t.sector}): ${t.pnlUsd >= 0 ? '+' : ''}${fmt(t.pnlUsd)} (${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct}%) after ${t.holdDays}d — ${t.closeReason}`);
+    }
+    return lines;
   }
 
   getContextSummary(): string {
     const open = this.getOpenPositions();
-    const wr = this.state.totalTrades > 0 ? ((this.state.wins / this.state.totalTrades) * 100).toFixed(0) : '0';
     const lines = [
       '=== BOT IDENTITY ===',
       `I am an AI crypto trading bot. Running since ${this.state.startedAt}.`,
       `Total trades: ${this.state.totalTrades} | Wins: ${this.state.wins} | Losses: ${this.state.losses}`,
-      `Total P/L: ${fmt(this.state.totalPnl)} | Win rate: ${wr}%`,
+      `Total P/L: ${fmt(this.state.totalPnl)} | Win rate: ${this.winRate().toFixed(0)}%`,
       this.state.bestTrade !== null ? `Best trade: ${fmt(this.state.bestTrade)}` : '',
       this.state.worstTrade !== null ? `Worst trade: ${fmt(this.state.worstTrade)}` : '',
       `Cycles completed: ${this.state.cycleCount}`, '',
@@ -1004,11 +1798,12 @@ class Memory {
       lines.push(`=== CURRENT POSITIONS (${open.length}) ===`);
       for (const p of open) {
         const pnl = (p.currentPrice - p.entryPrice) * p.qty;
-        const pct = ((pnl / p.costBasisUsd) * 100).toFixed(1);
-        lines.push(`${p.pair}: Entry ${fmt(p.entryPrice)} | Now ${fmt(p.currentPrice)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pct}%) | Stop ${fmt(p.stopLoss)} | Target ${fmt(p.takeProfit)} | ${p.sector}`);
+        const percent = p.costBasisUsd > 0 ? ((pnl / p.costBasisUsd) * 100).toFixed(1) : '0.0';
+        lines.push(`${p.pair}: Entry ${fmt(p.entryPrice)} | Now ${fmt(p.currentPrice)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${percent}%) | Stop ${fmt(p.stopLoss)} | Target ${fmt(p.takeProfit)} | ${p.sector}`);
         lines.push(`  Why: ${p.reason} | AI said: ${p.aiReasoning}`);
       }
     } else { lines.push('No open positions.'); }
+    lines.push(...this.performanceLines());
     return lines.filter(Boolean).join('\n');
   }
 }
@@ -1033,17 +1828,30 @@ YOUR DECISION FRAMEWORK:
 4. Position hits take profit = SELL the position
 5. Is the narrative/thesis still intact? If not, sell
 6. A weak or overbought setup should return HOLD rather than forcing a BUY
+7. A bearish higher-timeframe (4h) trend turns an oversold reading into a falling
+   knife. Demand a momentum turn (StochRSI K above D, MACD histogram improving)
+   before buying against it
+8. Size against volatility, not conviction alone: ATR% tells you how far this pair
+   routinely moves. A wide-ATR pair deserves a smaller share of the portfolio
+9. Your sector and recent-trade records below are real. If a sector keeps losing,
+   size it down or skip it
 
 You own position sizing. Request the percentage of the total portfolio you want to allocate.
 The bot can only spend available free cash and must obey Kraken's amount, cost, and precision rules.
 Any additional limits shown by the bot are optional configuration, not strategy rules.
+
+You also own the trade plan on a NEW entry. The stop and target shown below are the
+bot's ATR-based default; set "adjusted_stop" and "adjusted_target" to override them
+with your own levels. A stop further than the risk cap from entry is clamped to it.
+Once a position is open, stops only ever tighten — you can pull one in, never widen it.
 
 YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
 
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
-Keep "reasoning" under 20 words. Do not restate the data you were given.
+Think briefly. Emit the JSON object as your very first output token.
+Keep "reasoning" under 12 words. Do not restate the data you were given.
 {"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null}`;
 
 type AiParseResult = {
@@ -1141,6 +1949,19 @@ function isUnsupportedResponseFormat(error: unknown): boolean {
   return status === 400 && /(response[_ -]?format|json[_ -]?object|structured output|unsupported|unrecognized)/i.test(message);
 }
 
+function isUnsupportedReasoningParam(error: unknown): boolean {
+  const value = error as any;
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  return status === 400 && /reasoning|thinking|effort/.test(message);
+}
+
+/** True when the provider stopped generating because the token budget ran out. */
+export function isTruncated(finishReason: unknown): boolean {
+  const reason = String(finishReason ?? '').toLowerCase();
+  return reason === 'length' || reason === 'max_tokens' || reason === 'max_output_tokens';
+}
+
 function salvageAiResponse(text: string): AiDecision | null {
   const verdictMatch = text.match(/["']verdict["']\s*:\s*["'](BUY|HOLD|SELL)["']/i);
   if (!verdictMatch) return null;
@@ -1153,11 +1974,61 @@ function salvageAiResponse(text: string): AiDecision | null {
   }, true);
 }
 
+const STANCE_SYSTEM_PROMPT = `You are the portfolio manager of a live crypto trading account.
+
+Once per cycle you set the stance for the whole book, before any individual trade is
+considered. You are not being asked about one coin. You are being asked: given this
+market and this account, should we be deploying capital right now at all?
+
+STANCE:
+- RISK_ON — conditions favour putting money to work; take the setups you are offered
+- NEUTRAL — trade selectively, nothing forced
+- RISK_OFF — do not open new positions. Sit in cash and wait for lower prices.
+  Choose this when the market looks extended, breadth is deteriorating, or you expect
+  a drawdown you would rather buy into than hold through. Existing stops and exits
+  keep running regardless; this only governs NEW entries.
+
+CASH TARGET:
+"cash_target_pct" is the share of the portfolio you want held back as dry powder,
+from 0 to 100. The bot will not spend below it. Raise it when you want ammunition
+for a dip; drop it to 0 when you want to be fully invested.
+
+REQUESTING CAPITAL:
+If the opportunity in front of you is larger than the account can fund, set
+"requested_funds_usd" to the amount you want added. The operator reads these and
+funds them manually. Ask for 0 when the account is adequate. Do not ask every cycle;
+ask when it would change what you can actually do.
+
+You own this call. The bot does not second-guess the stance.
+
+RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
+Keep "reasoning" under 25 words.
+{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater}`;
+
+export function normalizeStance(json: any): PortfolioStance {
+  const raw = String(json?.stance || '').toUpperCase().replace(/[\s-]/g, '_');
+  const stance: PortfolioStance['stance'] =
+    raw === 'RISK_ON' || raw === 'RISK_OFF' || raw === 'NEUTRAL' ? raw : 'NEUTRAL';
+  const confidenceValue = Number(json?.confidence);
+  const cashValue = Number(json?.cash_target_pct);
+  const fundsValue = Number(json?.requested_funds_usd);
+  return {
+    stance,
+    confidence: Number.isFinite(confidenceValue) ? Math.min(10, Math.max(1, Math.round(confidenceValue))) : 5,
+    reasoning: typeof json?.reasoning === 'string' && json.reasoning.trim() ? json.reasoning.trim() : 'No reason given',
+    cashTargetPct: Number.isFinite(cashValue) ? Math.min(1, Math.max(0, cashValue / 100)) : 0,
+    requestedFundsUsd: Number.isFinite(fundsValue) && fundsValue > 0 ? fundsValue : 0,
+  };
+}
+
 class AiBrain {
   private client: OpenAI;
   private model: string;
   private memory: Memory;
   private responseFormatSupported = true;
+  private reasoningParamSupported = true;
+  /** Grows for the rest of the run once a model proves it needs more headroom. */
+  private tokenBudget = 0;
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -1186,25 +2057,35 @@ class AiBrain {
       maxRetries: 0,
     });
     this.model = model;
+    this.tokenBudget = CONFIG.aiMaxTokens;
     this.memory = memory;
-    console.log(`[AI] GLM 5.2 via ${provider} (${model})`);
+    console.log(`[AI] GLM 5.2 via ${provider} (${model}) | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
   }
 
-  async analyze(pair: string, sector: string, ta: TechnicalAnalysis, vol24h: number, context?: BuyContext): Promise<AiDecision> {
+  async analyze(
+    pair: string, sector: string, ta: TechnicalAnalysis, vol24h: number,
+    context?: BuyContext, plan?: TradePlan | null,
+  ): Promise<AiDecision> {
     return this.call(`NEW OPPORTUNITY:
 ${pair} (Sector: ${sector}) | Price: ${fmt(ta.currentPrice)}
 24h Volume: ${fmt(vol24h)}
 
 RSI: ${ta.rsi} (oversold<35, overbought>70)
-Trend: ${ta.trend} | MA Score: ${ta.maScore}/3
+Trend (1h): ${ta.trend} | Trend (4h): ${ta.htfTrend} | MA Score: ${ta.maScore}/3
 SMA 5/20/50: ${ta.sma5?.toFixed(4) || 'N/A'} / ${ta.sma20?.toFixed(4) || 'N/A'} / ${ta.sma50?.toFixed(4) || 'N/A'}
 Bollinger: ${fmt(ta.bollinger.upper || 0)} / ${fmt(ta.bollinger.middle || 0)} / ${fmt(ta.bollinger.lower || 0)}
 Volume: ${ta.volumeRatio}x avg | StochRSI K=${ta.stochRsiK} D=${ta.stochRsiD}
-Supports: ${ta.supports.join(', ') || 'none'}
-Resistances: ${ta.resistances.join(', ') || 'none'}
+ATR(14): ${ta.atr === null ? 'N/A' : fmt(ta.atr)}${ta.atrPct === null ? '' : ` (${pct(ta.atrPct)} of price)`} | MACD histogram: ${ta.macdHistogram === null ? 'N/A' : ta.macdHistogram.toFixed(6)}
+Supports (nearest first): ${ta.supports.join(', ') || 'none'}
+Resistances (nearest first): ${ta.resistances.join(', ') || 'none'}
+
+PLANNED RISK (set by the bot, ATR-based):
+${plan ? `Stop ${fmt(plan.stop)} (${pct(plan.riskPct)} below entry, ${plan.basis}) | Target ${fmt(plan.target)} | R/R ${plan.rr.toFixed(2)}:1` : 'unavailable'}
 
 ACCOUNT & ORDER CONTEXT:
 Total portfolio value: ${fmt(context?.portfolioValueUsd ?? 0)}
+Currently invested: ${fmt(context?.exposureUsd ?? 0)} across ${context?.openPositions ?? 0} positions
+This sector: ${fmt(context?.sectorExposureUsd ?? 0)} held vs a ${((context?.sectorTargetPct ?? 0) * 100).toFixed(0)}% target allocation
 Free cash available for this pair after fee reserve: ${fmt(context?.spendableCashUsd ?? 0)}
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
@@ -1216,15 +2097,20 @@ BUY or HOLD?`, pair);
     const p = this.memory.positions[pair];
     if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
-    const pct = (pnl / p.costBasisUsd) * 100;
+    const percent = p.costBasisUsd > 0 ? (pnl / p.costBasisUsd) * 100 : 0;
     const days = ((Date.now() - new Date(p.openedAt).getTime()) / 86400000).toFixed(1);
     return this.call(`REVIEW POSITION:
 ${p.pair} (${p.sector}) | Entry ${fmt(p.entryPrice)} | Now ${fmt(ta.currentPrice)}
-P/L: ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) | ${days} days held
-Stop: ${fmt(p.stopLoss)} | Target: ${fmt(p.takeProfit)}
+P/L: ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${percent >= 0 ? '+' : ''}${percent.toFixed(1)}%) | ${days} days held
+Stop: ${fmt(p.stopLoss)}${p.initialStopLoss !== undefined && p.initialStopLoss !== p.stopLoss ? ` (trailed up from ${fmt(p.initialStopLoss)})` : ''} | Target: ${fmt(p.takeProfit)}
+High since entry: ${fmt(p.highWaterMark ?? p.entryPrice)} | Open risk: ${fmt(Math.max(0, ta.currentPrice - p.stopLoss) * p.qty)}
 
-RSI: ${ta.rsi} | Trend: ${ta.trend} | MA: ${ta.maScore}/3 | Vol: ${ta.volumeRatio}x
+RSI: ${ta.rsi} | Trend (1h): ${ta.trend} | Trend (4h): ${ta.htfTrend} | MA: ${ta.maScore}/3 | Vol: ${ta.volumeRatio}x
+ATR(14): ${ta.atr === null ? 'N/A' : fmt(ta.atr)}${ta.atrPct === null ? '' : ` (${pct(ta.atrPct)})`} | MACD histogram: ${ta.macdHistogram === null ? 'N/A' : ta.macdHistogram.toFixed(6)}
 Supports: ${ta.supports.join(', ') || 'none'} | Resistances: ${ta.resistances.join(', ') || 'none'}
+
+The bot already trails the stop upward on its own; only propose adjusted_stop if you
+want it tighter than the value above. Stops are never widened.
 
 Buy reason: ${p.reason}
 AI reasoning at entry: ${p.aiReasoning}
@@ -1238,54 +2124,246 @@ HOLD, SELL, or ADJUST?`, pair);
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
     ];
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // A salvaged decision is a last resort, not an answer: it carries no position
+    // size and no stop, so accepting it ends the trade's sizing judgement. Hold on
+    // to it while there is still a chance of getting a complete reply.
+    let salvagedFallback: AiDecision | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
       const requestMessages = attempt === 0 ? messages : [
         ...messages,
         { role: 'user', content: 'Your previous reply was not valid JSON. Reply with the JSON object only, nothing else.' },
       ];
       try {
         const res = await this.request(requestMessages, pair);
-        const message = res.choices?.[0]?.message;
+        const choice = res.choices?.[0];
+        const finishReason = choice?.finish_reason ?? 'unknown';
+        const message = choice?.message;
         const content = textContent(message?.content);
-        const reasoning = textContent(message?.reasoning);
+        const reasoning = textContent(message?.reasoning ?? message?.reasoning_content);
         if (!content.trim() && reasoning.trim())
-          console.warn(`  [AI] Empty content for ${pair}; trying message.reasoning (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'})`);
+          console.warn(`  [AI] Empty content for ${pair}; trying reasoning text (finish_reason=${finishReason})`);
         const parsed = parseAiResponse(content, reasoning);
-        if (parsed.decision) {
-          if (parsed.kind === 'salvaged')
-            console.warn(`  [AI] Salvaged decision for ${pair} (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'}); adjusted stop/target discarded`);
+        if (parsed.decision && parsed.kind === 'parsed') {
           this.logDecision(pair, parsed.decision);
           return parsed.decision;
         }
-        console.warn(`  [AI] ${parsed.kind === 'empty' ? 'Empty response' : 'Unparseable response'} for ${pair} (finish_reason=${res.choices?.[0]?.finish_reason || 'unknown'}${parsed.error ? `; ${parsed.error}` : ''})`);
+        // A reply cut off mid-JSON is not a formatting mistake the model can correct
+        // by being asked again — it ran out of room. Reasoning models spend the
+        // completion budget before emitting any content, which is exactly how this
+        // bot ended up answering HOLD to everything in production.
+        const truncated = isTruncated(finishReason);
+        if (parsed.decision) {
+          salvagedFallback ??= parsed.decision;
+          console.warn(`  [AI] Partial decision for ${pair} (finish_reason=${finishReason}); no size or stop until a complete reply arrives`);
+        } else {
+          console.warn(`  [AI] ${parsed.kind === 'empty' ? 'Empty response' : 'Unparseable response'} for ${pair} (finish_reason=${finishReason}, budget=${this.tokenBudget}${parsed.error ? `; ${parsed.error}` : ''})`);
+        }
+        if (truncated && this.growTokenBudget(pair)) continue;
+        if (parsed.decision) {
+          console.warn(`  [AI] Falling back to the salvaged decision for ${pair}; adjusted stop/target discarded`);
+          this.logDecision(pair, parsed.decision);
+          return parsed.decision;
+        }
       } catch (e: any) {
         console.error(`  [AI] Error ${pair}: ${e.message}`);
       }
       if (attempt === 0)
         console.warn(`  [AI] Retrying ${pair} with corrective JSON instruction`);
     }
+    if (salvagedFallback) {
+      console.warn(`  [AI] Using the salvaged decision for ${pair} after exhausting retries`);
+      this.logDecision(pair, salvagedFallback);
+      return salvagedFallback;
+    }
     console.warn(`  [AI] Falling back to HOLD for ${pair}`);
     return fallback;
   }
 
+  /** Doubles the completion budget, once, up to a ceiling. */
+  private growTokenBudget(pair: string): boolean {
+    if (this.tokenBudget >= MAX_AI_TOKEN_BUDGET) return false;
+    const previous = this.tokenBudget;
+    this.tokenBudget = Math.min(MAX_AI_TOKEN_BUDGET, this.tokenBudget * 2);
+    console.warn(`  [AI] ${pair}: response was truncated; raising the token budget ${previous} → ${this.tokenBudget} for the rest of this run`);
+    return true;
+  }
+
+  /**
+   * OpenRouter-style reasoning control. Capping reasoning effort leaves the
+   * completion budget for the JSON that actually carries the decision.
+   */
+  private reasoningParam(): Record<string, unknown> {
+    if (!this.reasoningParamSupported) return {};
+    return CONFIG.aiReasoningEffort === 'off'
+      ? { reasoning: { enabled: false } }
+      : { reasoning: { effort: CONFIG.aiReasoningEffort } };
+  }
+
   private async request(messages: any[], pair: string): Promise<any> {
-    const useStructuredOutput = this.responseFormatSupported;
-    const create = (structured: boolean) => this.client.chat.completions.create({
+    const create = (structured: boolean, reasoning: boolean) => this.client.chat.completions.create({
       model: this.model,
       messages,
       temperature: 0.2,
-      max_tokens: CONFIG.aiMaxTokens,
+      max_tokens: this.tokenBudget,
       ...(structured ? { response_format: { type: 'json_object' } } : {}),
-    });
-    try {
-      return await withRetry(`AI request ${pair}`, () => create(useStructuredOutput), RETRY_ATTEMPTS,
-        useStructuredOutput ? (error => !isUnsupportedResponseFormat(error)) : undefined);
-    } catch (e) {
-      if (!useStructuredOutput || !isUnsupportedResponseFormat(e)) throw e;
-      this.responseFormatSupported = false;
-      console.warn(`  [AI] ${pair}: response_format unsupported; retrying without structured output`);
-      return withRetry(`AI request ${pair} without response_format`, () => create(false));
+      ...(reasoning ? this.reasoningParam() : {}),
+    } as any);
+
+    // Both extras are best-effort: a provider that rejects either is retried
+    // without it, and the capability is remembered so the run stops paying for
+    // the discovery.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const structured = this.responseFormatSupported;
+      const reasoning = this.reasoningParamSupported;
+      try {
+        return await withRetry(`AI request ${pair}`, () => create(structured, reasoning), RETRY_ATTEMPTS,
+          error => isRetryableError(error) &&
+            !(structured && isUnsupportedResponseFormat(error)) &&
+            !(reasoning && isUnsupportedReasoningParam(error)));
+      } catch (e) {
+        if (reasoning && isUnsupportedReasoningParam(e)) {
+          this.reasoningParamSupported = false;
+          console.warn(`  [AI] ${pair}: reasoning control unsupported; retrying without it`);
+          continue;
+        }
+        if (structured && isUnsupportedResponseFormat(e)) {
+          this.responseFormatSupported = false;
+          console.warn(`  [AI] ${pair}: response_format unsupported; retrying without structured output`);
+          continue;
+        }
+        throw e;
+      }
     }
+    return create(this.responseFormatSupported, this.reasoningParamSupported);
+  }
+
+  /**
+   * One JSON object from the model, with the same truncation handling as a trade
+   * decision. Returns null when nothing parseable comes back.
+   */
+  private async requestJsonObject(system: string, prompt: string, label: string): Promise<any | null> {
+    const messages = [
+      { role: 'system', content: system },
+      { role: 'user', content: prompt },
+    ];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await this.request(messages, label);
+        const choice = res.choices?.[0];
+        const text = textContent(choice?.message?.content).trim() ||
+          textContent(choice?.message?.reasoning ?? choice?.message?.reasoning_content);
+        const objectText = extractJsonObject(text);
+        if (objectText) {
+          try { return JSON.parse(objectText); } catch { /* fall through to retry */ }
+        }
+        if (isTruncated(choice?.finish_reason) && this.growTokenBudget(label)) continue;
+      } catch (e: any) {
+        console.error(`  [AI] Error ${label}: ${e.message}`);
+        if (!isRetryableError(e)) break;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Asks the model for its call on the whole book. Falling back to NEUTRAL keeps
+   * the bot behaving exactly as it did before this existed when the model is
+   * unreachable — it neither forces trades nor freezes the account.
+   */
+  async reviewPortfolio(
+    account: PortfolioSnapshot,
+    candidates: Array<{ pair: string; ta: TechnicalAnalysis; score: { score: number } }>,
+  ): Promise<PortfolioStance> {
+    const breadth = candidates.length;
+    const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
+    const bearish = candidates.filter(c => c.ta.htfTrend === 'bearish').length;
+    const avgRsi = breadth > 0
+      ? (candidates.reduce((sum, c) => sum + c.ta.rsi, 0) / breadth).toFixed(1) : 'n/a';
+    const overbought = candidates.filter(c => c.ta.rsi > 70).length;
+    const oversold = candidates.filter(c => c.ta.rsi < 35).length;
+    const best = candidates.slice(0, 5)
+      .map(c => `${c.pair} (score ${c.score.score.toFixed(0)}, RSI ${c.ta.rsi}, 4h ${c.ta.htfTrend})`)
+      .join('; ') || 'none';
+    const standing = this.memory.state.fundingRequest;
+
+    const prompt = `${this.memory.getContextSummary()}
+
+ACCOUNT:
+Free cash: ${fmt(account.cashUsd)}
+Tradable value (cash + sellable crypto): ${fmt(account.tradableUsd)}
+Staked / locked (cannot be traded or sold by the bot): ${fmt(account.stakedUsd)}
+Account total: ${fmt(account.totalUsd)}
+Cash as a share of tradable value: ${account.tradableUsd > 0 ? pct(account.cashUsd / account.tradableUsd) : 'n/a'}
+${standing ? `You already asked for ${fmt(standing.usd)} on ${standing.requestedAt} and it has not been funded yet.` : 'No outstanding funding request.'}
+
+MARKET BREADTH (${breadth} watchlist pairs with usable data):
+4h trend: ${bullish} bullish, ${bearish} bearish, ${breadth - bullish - bearish} neutral
+Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (<35)
+Best-ranked setups: ${best}
+
+What is the stance for this cycle?`;
+
+    const json = await this.requestJsonObject(STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
+    if (!json) {
+      console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
+      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', cashTargetPct: 0, requestedFundsUsd: 0 };
+    }
+    // Persisting is the caller's job, so the record is kept no matter which
+    // implementation produced the stance.
+    return normalizeStance(json);
+  }
+
+  /**
+   * Sends real probe requests and reports how many produced a usable decision.
+   * This is the check that would have caught production answering HOLD to
+   * everything for days because its replies were being truncated.
+   */
+  async selfTest(samples: number): Promise<{ valid: number; salvaged: number; total: number; finishReasons: Record<string, number>; avgLatencyMs: number; budget: number; lastError: string }> {
+    const finishReasons: Record<string, number> = {};
+    let valid = 0;
+    let salvaged = 0;
+    let latencyTotal = 0;
+    let lastError = '';
+    const probe = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `NEW OPPORTUNITY:
+PROBE/USD (Sector: ai) | Price: $1.00
+RSI: 28 | Trend (1h): neutral | Trend (4h): bullish | Volume: 1.4x avg
+ATR(14): $0.03 (3.00% of price) | Supports: 0.95 | Resistances: 1.20
+
+This is a connectivity probe. Answer with the JSON object only.
+BUY or HOLD?`,
+      },
+    ];
+    for (let i = 0; i < samples; i++) {
+      const started = Date.now();
+      try {
+        const res = await this.request(probe, 'PROBE/USD');
+        latencyTotal += Date.now() - started;
+        const choice = res.choices?.[0];
+        const reason = String(choice?.finish_reason ?? 'unknown');
+        finishReasons[reason] = (finishReasons[reason] ?? 0) + 1;
+        const parsed = parseAiResponse(
+          textContent(choice?.message?.content),
+          textContent(choice?.message?.reasoning ?? choice?.message?.reasoning_content),
+        );
+        if (parsed.kind === 'parsed') valid++;
+        else if (parsed.kind === 'salvaged') salvaged++;
+        else lastError = parsed.error ?? parsed.kind;
+        if (isTruncated(reason)) this.growTokenBudget('PROBE/USD');
+      } catch (e: any) {
+        latencyTotal += Date.now() - started;
+        finishReasons.error = (finishReasons.error ?? 0) + 1;
+        lastError = e.message;
+      }
+    }
+    return {
+      valid, salvaged, total: samples, finishReasons,
+      avgLatencyMs: samples > 0 ? Math.round(latencyTotal / samples) : 0,
+      budget: this.tokenBudget, lastError,
+    };
   }
 
   private logDecision(pair: string, d: AiDecision) {
@@ -1296,6 +2374,135 @@ HOLD, SELL, or ADJUST?`, pair);
 }
 
 // ============================================================
+// PREFLIGHT — Verify the bot against the real world before trading
+// ============================================================
+
+interface CheckResult { name: string; ok: boolean; detail: string; critical: boolean }
+
+/**
+ * Exercises the live exchange and AI, not stubs. Unit tests prove the maths;
+ * this proves the deployment can actually reach Kraken, parse its own balance,
+ * exit the positions it holds, and get usable JSON out of the model.
+ */
+export async function runPreflight(
+  exchange: Exchange, mem: Memory, ai: AiBrain, aiSamples: number,
+): Promise<CheckResult[]> {
+  const checks: CheckResult[] = [];
+  const add = (name: string, ok: boolean, detail: string, critical = false) =>
+    checks.push({ name, ok, detail, critical });
+  // Always measure against fresh data, never a previous cycle's snapshot.
+  exchange.beginCycle();
+
+  // 1. Market coverage — a watchlist pair Kraken does not list is dead weight.
+  try {
+    const missing = await exchange.listMissingMarkets(ALL_PAIRS);
+    add('Kraken markets', missing.length === 0,
+      missing.length === 0
+        ? `all ${ALL_PAIRS.length} watchlist pairs are listed`
+        : `${missing.length} unlisted and permanently unreachable: ${missing.join(', ')}`,
+      true);
+  } catch (e: any) {
+    add('Kraken markets', false, `market load failed: ${e.message}`, true);
+  }
+
+  // 2. Market data — enough closed history, on every pair, to compute risk.
+  const dataProblems: string[] = [];
+  let analysed = 0;
+  let freshestAgeMinutes = Number.POSITIVE_INFINITY;
+  const prices = await exchange.getPricesBatch(ALL_PAIRS);
+  await mapWithConcurrency(ALL_PAIRS, CONFIG.ohlcvConcurrency, async pair => {
+    const price = prices[pair];
+    if (price === undefined) { dataProblems.push(`${pair}: no price`); return; }
+    const candles = await exchange.getOhlcv(pair, '1h', 200);
+    if (candles.length < 50) { dataProblems.push(`${pair}: ${candles.length} closed candles`); return; }
+    const age = (Date.now() - candles[candles.length - 1].timestamp) / 60_000;
+    freshestAgeMinutes = Math.min(freshestAgeMinutes, age);
+    // A closed 1h candle is at most ~2h old; older means the feed is stale.
+    if (age > 180) { dataProblems.push(`${pair}: newest closed candle is ${Math.round(age)}min old`); return; }
+    const ta = TA.full(candles, price);
+    if (!ta) { dataProblems.push(`${pair}: analysis returned nothing`); return; }
+    if (ta.atr === null) { dataProblems.push(`${pair}: no ATR, risk cannot be priced`); return; }
+    if (planTrade(ta) === null) { dataProblems.push(`${pair}: no valid stop/target`); return; }
+    analysed++;
+  });
+  add('Market data', dataProblems.length === 0,
+    dataProblems.length === 0
+      ? `${analysed}/${ALL_PAIRS.length} pairs analysable, newest closed candle ${Math.round(freshestAgeMinutes)}min old`
+      : `${analysed}/${ALL_PAIRS.length} usable; ${dataProblems.join('; ')}`,
+    analysed === 0);
+
+  // 3. Account — the numbers the bot sizes and reports against.
+  let account: PortfolioSnapshot | null = null;
+  try {
+    account = await exchange.getPortfolioValue(mem);
+    add('Account balance', account.tradableUsd > 0,
+      `${fmt(account.cashUsd)} free cash | ${fmt(account.tradableUsd)} tradable | ${fmt(account.stakedUsd)} staked | ${fmt(account.totalUsd)} total`,
+      true);
+  } catch (e: any) {
+    add('Account balance', false, `balance fetch failed: ${e.message}`, true);
+  }
+
+  // 4. Can the bot buy anything at all? Free cash below every minimum means the
+  //    scan and every AI call it funds are pure cost.
+  if (account) {
+    const spendable = account.cashUsd * (1 - CONFIG.feeReservePct);
+    const minimums: number[] = [];
+    for (const pair of ALL_PAIRS.slice(0, 5)) {
+      const price = prices[pair];
+      if (price === undefined) continue;
+      const minimum = await exchange.getMinimumTradeUsd(pair, price);
+      if (minimum !== null) minimums.push(minimum);
+    }
+    const cheapest = minimums.length ? Math.min(...minimums) : null;
+    add('Buying power', cheapest !== null && spendable >= cheapest,
+      cheapest === null
+        ? 'could not determine any exchange minimum'
+        : `${fmt(spendable)} spendable vs ${fmt(cheapest)} cheapest minimum — ${spendable >= cheapest ? 'entries are possible' : 'no new entry can be funded'}`);
+  }
+
+  // 5. Exit reachability — a position that cannot be sold has an unenforceable stop.
+  const open = mem.getOpenPositions();
+  if (open.length > 0) {
+    const blocked: string[] = [];
+    for (const position of open) {
+      const price = prices[position.pair] ?? position.currentPrice;
+      const sellable = await exchange.checkSellable(position.pair, position.qty, price);
+      if (!sellable.ok) blocked.push(`${position.pair} (${sellable.detail})`);
+    }
+    add('Exit reachability', blocked.length === 0,
+      blocked.length === 0
+        ? `all ${open.length} positions can be fully exited`
+        : `stops cannot execute on: ${blocked.join(', ')}`,
+      blocked.length > 0);
+  } else {
+    add('Exit reachability', true, 'no open positions');
+  }
+
+  // 6. AI — the check that matters most, because a model that cannot return
+  //    parseable JSON silently turns every decision into HOLD.
+  if (aiSamples > 0) {
+    const result = await ai.selfTest(aiSamples);
+    const usable = result.valid + result.salvaged;
+    const reasons = Object.entries(result.finishReasons).map(([k, v]) => `${k}x${v}`).join(', ') || 'none';
+    add('AI decisions', usable === result.total,
+      `${result.valid}/${result.total} clean, ${result.salvaged} salvaged | finish: ${reasons} | ${result.avgLatencyMs}ms avg | budget ${result.budget} tokens${result.lastError ? ` | last error: ${result.lastError}` : ''}`,
+      usable === 0);
+  }
+
+  return checks;
+}
+
+function reportPreflight(checks: CheckResult[]): boolean {
+  console.log('\n── PREFLIGHT ──');
+  for (const check of checks)
+    console.log(`  [${check.ok ? 'PASS' : check.critical ? 'FAIL' : 'WARN'}] ${check.name}: ${check.detail}`);
+  const failures = checks.filter(c => !c.ok);
+  const critical = failures.filter(c => c.critical);
+  console.log(`  ${checks.length - failures.length}/${checks.length} checks passed${critical.length ? ` — ${critical.length} CRITICAL` : failures.length ? ` — ${failures.length} warning(s)` : ''}`);
+  return critical.length === 0;
+}
+
+// ============================================================
 // MAIN — The 4-phase loop
 // ============================================================
 
@@ -1303,7 +2510,7 @@ let shutdownRequested = false;
 const shutdownWaiters: Array<() => void> = [];
 
 async function main() {
-  CONFIG = loadConfig();
+  setConfig(loadConfig());
   const loopMode = CONFIG.loopMode;
   const fastMode = process.argv.includes('--fast');
 
@@ -1325,18 +2532,40 @@ async function main() {
 │  AI: GLM 5.2 via OpenRouter                  │
 │  Exchange: Kraken (${CONFIG.paperMode ? 'PAPER' : 'LIVE'})              │
 │  Strategy: AI-Powered Oversold Bounce        │
-│  Limits: optional; exchange rules + cash     │
+│  Risk: ATR stops + trailing exits            │
 └──────────────────────────────────────────────┘`);
   console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
-  console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'}`);
+  console.log(`[CONFIG] State directory: ${DATA_DIR}`);
+  console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
+  console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
+  console.log(`[CONFIG] Daily loss breaker: ${limit(CONFIG.maxDailyLossPct)} | Max positions: ${limit(CONFIG.maxOpenPositions)} | Max sector exposure: ${limit(CONFIG.maxSectorExposurePct)}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
   const memory = new Memory();
   const ai = new AiBrain(memory);
+
+  // Verify against the real exchange and the real model before risking anything.
+  // Trading still proceeds on a non-critical failure: deterministic stop and
+  // trailing logic protects open positions even when the AI is unreachable.
+  const doctorOnly = process.argv.includes('--doctor');
+  if (doctorOnly || CONFIG.preflight) {
+    try {
+      const checks = await runPreflight(exchange, memory, ai, CONFIG.preflightAiSamples);
+      const healthy = reportPreflight(checks);
+      if (doctorOnly) {
+        console.log(healthy ? '[DOCTOR] Healthy.' : '[DOCTOR] Critical checks failed.');
+        process.exit(healthy ? 0 : 1);
+      }
+      if (!healthy) console.error('[PREFLIGHT] Critical checks failed; managing existing positions only where possible.');
+    } catch (e: any) {
+      console.error(`[PREFLIGHT] Could not complete: ${e.message}`);
+      if (doctorOnly) process.exit(1);
+    }
+  }
   const requestShutdown = () => {
     if (shutdownRequested) return;
     shutdownRequested = true;
@@ -1375,13 +2604,77 @@ async function main() {
   console.log('[SHUTDOWN] State saved; exiting.');
 }
 
+/**
+ * Sells a position and books the result.
+ *
+ * Exits used to assume the whole position sold at the fill price: a partial fill
+ * left real coins on the exchange while memory recorded a full, profitable close.
+ * A meaningful residual now keeps the position open with a reduced cost basis.
+ * Returns true when the position is fully closed.
+ */
+async function executeExit(
+  exchange: Exchange, mem: Memory, pair: string,
+  reason: string, aiVerdict: string, aiConfidence: number,
+): Promise<boolean> {
+  const pos = mem.positions[pair];
+  if (!pos || pos.status !== 'open') return false;
+  const requestedQty = pos.qty;
+  const { stopLoss, takeProfit, costBasisUsd, sector } = pos;
+
+  const fill = await exchange.sell(pair, requestedQty);
+  if (!fill) return false;
+
+  const soldQty = Math.min(fill.qty, requestedQty);
+  const residualQty = requestedQty - soldQty;
+  const residualValue = residualQty * fill.price;
+  if (exchange.paper) mem.adjustPaperCash(soldQty * fill.price - fill.feeUsd);
+
+  const dustThreshold = Math.max(BALANCE_DUST_USD, costBasisUsd * PARTIAL_EXIT_DUST_PCT);
+  if (residualQty > 0 && residualValue > dustThreshold) {
+    const bookedPnl = mem.reducePosition(pair, soldQty, fill.price, fill.feeUsd);
+    if (bookedPnl !== null) {
+      console.warn(`  [PARTIAL EXIT] ${pair}: sold ${soldQty.toFixed(6)} of ${requestedQty.toFixed(6)} for ${bookedPnl >= 0 ? '+' : ''}${fmt(bookedPnl)}; ${fmt(residualValue)} still open and will be retried next cycle`);
+      mem.logTrade({
+        timestamp: new Date().toISOString(), pair, side: 'SELL',
+        price: fill.price, qty: soldQty, costBasisUsd,
+        stopLoss, takeProfit, pnlUsd: bookedPnl, pnlPct: 0, status: 'partial',
+        sector, reason: `Partial exit: ${reason}`, aiVerdict, aiConfidence,
+      });
+      return false;
+    }
+  }
+
+  const closed = mem.closePosition(pair, fill.price, reason, fill.feeUsd, soldQty);
+  if (!closed) return false;
+  mem.logTrade({
+    timestamp: new Date().toISOString(), pair, side: 'SELL',
+    price: fill.price, qty: soldQty, costBasisUsd,
+    stopLoss, takeProfit,
+    pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
+    sector, reason, aiVerdict, aiConfidence,
+  });
+  console.log(`  [CLOSED] ${pair}: ${(closed.pnlUsd ?? 0) >= 0 ? '+' : ''}${fmt(closed.pnlUsd ?? 0)} (${closed.pnlPct ?? 0}%) — ${reason}`);
+  return true;
+}
+
+/** Technicals for one pair, or null when history or pricing is insufficient. */
+async function analysePair(exchange: Exchange, pair: string, price: number): Promise<TechnicalAnalysis | null> {
+  const candles = await exchange.getOhlcv(pair, '1h', 200);
+  if (candles.length < 50) return null;
+  return TA.full(candles, price);
+}
+
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   exchange.beginCycle();
   // ── RECONCILE LIVE BALANCE ──
   if (!exchange.paper) await exchange.reconcilePositions(mem);
 
   // ── FETCH REAL BALANCE ──
-  const portfolioValue = await exchange.getPortfolioValue(mem);
+  const account = await exchange.getPortfolioValue(mem);
+  mem.clearFundingRequestIfFunded(account.cashUsd);
+  // Sizing runs off tradable value: staked balances are real money the bot cannot
+  // spend, and counting them inflated every position size the AI was asked for.
+  const portfolioValue = account.tradableUsd;
 
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
@@ -1389,69 +2682,65 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   if (open.length > 0) {
     const prices = await exchange.getPricesBatch(open.map(p => p.pair));
-    for (const [pair, price] of Object.entries(prices)) mem.updatePrice(pair, price);
+    mem.updatePrices(prices);
 
     // Stop loss / take profit (non-negotiable)
     for (const alert of mem.checkStops(prices)) {
-      const pos = mem.positions[alert.pair];
-      if (!pos || shutdownRequested) continue;
+      if (shutdownRequested) break;
+      if (mem.positions[alert.pair]?.status !== 'open') continue;
       console.warn(`  [ALERT] ${alert.action}: ${alert.pair} — ${alert.reason}`);
-      const fill = await exchange.sell(alert.pair, pos.qty);
-      if (fill) {
-        const closed = mem.closePosition(alert.pair, fill.price, alert.reason, fill.feeUsd);
-        if (closed) mem.logTrade({
-          timestamp: new Date().toISOString(), pair: alert.pair, side: 'SELL',
-          price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
-          stopLoss: pos.stopLoss, takeProfit: pos.takeProfit,
-          pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
-          sector: pos.sector, reason: alert.reason, aiVerdict: 'STOP/TARGET', aiConfidence: 10,
-        });
-      }
+      await executeExit(exchange, mem, alert.pair, alert.reason, 'STOP/TARGET', 10);
     }
 
-    // AI reviews remaining positions
+    // Technicals for everything still open, fetched in parallel.
     const stillOpen = mem.getOpenPositions();
-    for (const pos of stillOpen) {
+    const analyses = await mapWithConcurrency(stillOpen, CONFIG.ohlcvConcurrency, async pos => {
       try {
-        const candles = await exchange.getOhlcv(pos.pair, '1h', 200);
-        if (candles.length < 50) continue;
-        const ta = TA.full(candles, pos.currentPrice);
-        if (!ta) continue;
+        return await analysePair(exchange, pos.pair, pos.currentPrice);
+      } catch (e) {
+        console.warn(`  [PHASE 1] ${pos.pair} analysis failed: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
+      }
+    });
+
+    for (const [index, pos] of stillOpen.entries()) {
+      const ta = analyses[index];
+      if (!ta) continue;
+      try {
+        // Deterministic risk management runs before the AI gets a say: the trail
+        // only ever tightens, so it cannot be argued out of protecting a winner.
+        const live = mem.positions[pos.pair];
+        if (live?.status === 'open') {
+          const trail = trailingStop(live, live.currentPrice, ta.atr);
+          if (trail) {
+            live.stopLoss = trail.stop;
+            mem.savePositions();
+            console.log(`  [TRAIL] ${pos.pair} stop → ${fmt(trail.stop)} (${trail.reason})`);
+          }
+        }
+
         const d = await ai.review(pos.pair, ta);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
           console.log(`  [AI SELL] ${pos.pair}: ${d.reasoning}`);
-          const price = await exchange.getPrice(pos.pair);
-          if (price) {
-            const fill = await exchange.sell(pos.pair, pos.qty);
-            if (fill) {
-              const reason = `AI: ${d.reasoning}`;
-              const closed = mem.closePosition(pos.pair, fill.price, reason, fill.feeUsd);
-              if (closed) mem.logTrade({
-                timestamp: new Date().toISOString(), pair: pos.pair, side: 'SELL',
-                price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
-                stopLoss: pos.stopLoss, takeProfit: pos.takeProfit,
-                pnlUsd: closed.pnlUsd ?? 0, pnlPct: closed.pnlPct ?? 0, status: 'closed',
-                sector: pos.sector, reason, aiVerdict: d.verdict, aiConfidence: d.confidence,
-              });
-            }
-          }
+          await executeExit(exchange, mem, pos.pair, `AI: ${d.reasoning}`, d.verdict, d.confidence);
         }
-        if (mem.positions[pos.pair]?.status === 'open') {
-          const adjustments = applyPositionAdjustments(pos, d.adjustedStop, d.adjustedTarget);
+
+        const current = mem.positions[pos.pair];
+        if (current?.status === 'open') {
+          const adjustments = applyPositionAdjustments(current, d.adjustedStop, d.adjustedTarget);
           for (const rejection of adjustments.rejected)
             console.warn(`  [ADJUST REJECT] ${pos.pair}: ${rejection}`);
           if (adjustments.stop !== null) {
-            pos.stopLoss = adjustments.stop;
-            mem.savePositions();
+            current.stopLoss = adjustments.stop;
             console.log(`  [ADJUST] ${pos.pair} stop → ${fmt(adjustments.stop)}`);
           }
           if (adjustments.target !== null) {
-            pos.takeProfit = adjustments.target;
-            mem.savePositions();
+            current.takeProfit = adjustments.target;
             console.log(`  [ADJUST] ${pos.pair} target → ${fmt(adjustments.target)}`);
           }
+          if (adjustments.stop !== null || adjustments.target !== null) mem.savePositions();
         }
       } catch (e) {
         console.warn(`  [PHASE 1] ${pos.pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -1463,63 +2752,89 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PHASE 2: Scan market ──');
   const holding = new Set(mem.getOpenPositions().map(p => p.pair));
   let exposure = mem.getOpenPositions().reduce((s, p) => s + p.currentPrice * p.qty, 0);
+  const sectorExposure: Record<string, number> = {};
+  for (const p of mem.getOpenPositions())
+    sectorExposure[p.sector] = (sectorExposure[p.sector] ?? 0) + p.currentPrice * p.qty;
   const cycleCashSpent: Record<string, number> = {};
-  const paperStartingCash = Math.max(0, portfolioValue - exposure);
-  const canOpen = CONFIG.maxExposurePct === null || exposure < portfolioValue * CONFIG.maxExposurePct;
 
-  if (!canOpen) console.log('  [PHASE 2] Exposure cap reached, skipping scan.');
+  const blockers: string[] = [];
+  if (CONFIG.maxExposurePct !== null && exposure >= portfolioValue * CONFIG.maxExposurePct)
+    blockers.push(`exposure ${fmt(exposure)} at the ${pct(CONFIG.maxExposurePct)} cap`);
+  if (CONFIG.maxOpenPositions !== null && holding.size >= CONFIG.maxOpenPositions)
+    blockers.push(`${holding.size} open positions at the MAX_OPEN_POSITIONS limit`);
+  // Circuit breaker: stop opening risk on a day that has already gone badly.
+  const realizedToday = mem.realizedPnlToday();
+  if (CONFIG.maxDailyLossPct !== null && realizedToday < 0 &&
+      Math.abs(realizedToday) >= portfolioValue * CONFIG.maxDailyLossPct)
+    blockers.push(`daily realised loss ${fmt(realizedToday)} hit the ${pct(CONFIG.maxDailyLossPct)} circuit breaker`);
 
-  const candidates: Array<{
-    pair: string;
-    sector: string;
-    ta: TechnicalAnalysis;
-    vol: number;
-    score: ReturnType<typeof scoreSetup>;
-  }> = [];
+  const canOpen = blockers.length === 0;
+  if (!canOpen) console.log(`  [PHASE 2] No new entries: ${blockers.join('; ')}.`);
 
-  const scanPairs = canOpen ? ALL_PAIRS : [];
+  const scanPairs = canOpen ? ALL_PAIRS.filter(pair => !holding.has(pair)) : [];
   const scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
-  for (const pair of scanPairs) {
-    try {
-      if (holding.has(pair)) continue;
-      const price = scanPrices[pair];
-      if (price === undefined) continue;
-      const candles = await exchange.getOhlcv(pair, '1h', 200);
-      if (candles.length < 50) continue;
-      const ta = TA.full(candles, price);
-      if (!ta) continue;
 
+  const scanned = await mapWithConcurrency(scanPairs, CONFIG.ohlcvConcurrency, async pair => {
+    try {
+      const price = scanPrices[pair];
+      if (price === undefined) return null;
+      const ta = await analysePair(exchange, pair, price);
+      if (!ta) return null;
       if (CONFIG.scanMaxRsi !== null && ta.rsi > CONFIG.scanMaxRsi) {
         console.log(`  [SCAN SKIP] ${pair}: RSI ${ta.rsi} > max ${CONFIG.scanMaxRsi}`);
-        continue;
+        return null;
       }
-
       const ticker = await exchange.getTicker(pair);
-      const score = scoreSetup(ta);
-      candidates.push({ pair, sector: getSector(pair), ta, vol: ticker?.volume24h ?? 0, score });
-      const distance = score.supportDistance === null ? 'none' : `${(score.supportDistance * 100).toFixed(2)}%`;
-      console.log(`  [CANDIDATE] ${pair}: score=${score.score.toFixed(2)} | RSI=${ta.rsi} | trend=${ta.trend} | volume=${ta.volumeRatio}x | support distance=${distance}`);
+      return {
+        pair, sector: getSector(pair), ta,
+        vol: ticker?.volume24h ?? 0, score: scoreSetup(ta), plan: planTrade(ta),
+      };
     } catch (e) {
       console.warn(`  [PHASE 2] ${pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
     }
-  }
+  });
 
+  const candidates = scanned.filter((c): c is NonNullable<typeof c> => c !== null);
   candidates.sort((a, b) => b.score.score - a.score.score || a.ta.rsi - b.ta.rsi);
+  for (const c of candidates) {
+    const distance = c.score.supportDistance === null ? 'none' : pct(c.score.supportDistance);
+    console.log(`  [CANDIDATE] ${c.pair}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
+  }
 
   // ── PHASE 3: AI DECISIONS ──
   console.log('\n── PHASE 3: AI analysis ──');
 
-  const aiCandidates = candidates.slice(0, CONFIG.aiDecisionsPerCycle);
+  // The model's call on the whole book comes first. It can decline to deploy
+  // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
+  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', cashTargetPct: 0, requestedFundsUsd: 0 };
+  if (candidates.length > 0 && !shutdownRequested) {
+    stance = await ai.reviewPortfolio(account, candidates);
+    mem.recordStance(stance);
+    console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
+    if (stance.cashTargetPct > 0)
+      console.log(`  [STANCE] Holding back ${pct(stance.cashTargetPct)} of the portfolio as dry powder (${fmt(portfolioValue * stance.cashTargetPct)})`);
+    if (stance.requestedFundsUsd > 0)
+      console.log(`\n  *** FUNDING REQUEST: the model is asking for ${fmt(stance.requestedFundsUsd)} ***\n  Reason: ${stance.reasoning}\n`);
+  }
+  const cashReserveUsd = portfolioValue * stance.cashTargetPct;
+  if (stance.stance === 'RISK_OFF')
+    console.log('  [STANCE] RISK_OFF — no new entries this cycle; exits and stops continue as normal.');
+
+  const aiCandidates = stance.stance === 'RISK_OFF' ? [] : candidates.slice(0, CONFIG.aiDecisionsPerCycle);
   if (aiCandidates.length > 0)
     console.log(`  [AI BUDGET] Reached: ${aiCandidates.map(c => `${c.pair} (${c.score.score.toFixed(2)})`).join(', ')}`);
   for (const c of aiCandidates) {
-    const support = c.ta.supports[0] || c.ta.bollinger.lower || c.ta.currentPrice * 0.95;
-    const sl = support * 0.97;
-    const tp = c.ta.resistances[0] || c.ta.currentPrice * 1.20;
-    const risk = c.ta.currentPrice - sl;
-    const reward = tp - c.ta.currentPrice;
-    const rr = risk > 0 ? reward / risk : 0;
-    const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
+    if (shutdownRequested) break;
+    if (CONFIG.maxOpenPositions !== null && mem.getOpenPositions().length >= CONFIG.maxOpenPositions) {
+      console.log('  [PASS] MAX_OPEN_POSITIONS reached mid-cycle; stopping new entries.');
+      break;
+    }
+    if (!c.plan) {
+      console.log(`  [PASS] ${c.pair}: could not build a valid stop/target from the data`);
+      continue;
+    }
+    const plan = c.plan;
     const quoteAsset = exchange.getQuoteAsset(c.pair);
     const quoteKey = quoteAsset || c.pair;
     const spentThisCycle = cycleCashSpent[quoteKey] || 0;
@@ -1529,17 +2844,30 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const availableCash = availableCashSnapshot !== null
       ? Math.max(0, availableCashSnapshot - spentThisCycle)
       : exchange.paper
-        ? Math.max(0, paperStartingCash - spentThisCycle)
+        ? Math.max(0, mem.paperCash() - spentThisCycle)
         : 0;
-    const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
+    // Dry powder the model asked to keep is off limits to new buys.
+    const spendableCash = Math.max(0, availableCash - cashReserveUsd) * (1 - CONFIG.feeReservePct);
     const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
     console.log(`  [BUY CASH] ${c.pair}: ${quoteAsset || 'quote'} available ${fmt(availableCash)} | spendable ${fmt(spendableCash)} | cycle spent ${fmt(spentThisCycle)}`);
 
-    const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
+    const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
       spendableCashUsd: spendableCash,
       marketMinimumUsd: marketMinimum,
-    });
+      openPositions: mem.getOpenPositions().length,
+      exposureUsd: exposure,
+      sectorExposureUsd: sectorExposure[c.sector] ?? 0,
+      sectorTargetPct: SECTOR_WEIGHTS[c.sector] ?? 0.05,
+    }, c.plan);
+
+    // The model may set its own entry stop and target. The only rule the bot
+    // keeps is the hard risk cap: a stop further than MAX_STOP_DISTANCE_PCT from
+    // entry is clamped, never widened past it.
+    const entry = applyEntryPlan(plan, c.ta.currentPrice, decision);
+    const { stop: sl, target: tp, rr, riskPct } = entry;
+    if (entry.notes.length) console.log(`  [PLAN] ${c.pair}: ${entry.notes.join('; ')}`);
+    const d = decision;
 
     if (d.verdict !== 'BUY' ||
         (CONFIG.aiConfidenceThreshold !== null && d.confidence < CONFIG.aiConfidenceThreshold)) {
@@ -1565,9 +2893,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxRiskPerTradePct / riskPct);
     if (CONFIG.maxPortfolioRiskPct !== null && riskPct > 0)
       configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxPortfolioRiskPct / riskPct);
+    if (CONFIG.maxSectorExposurePct !== null)
+      configuredLimitSize = Math.min(configuredLimitSize,
+        Math.max(0, portfolioValue * CONFIG.maxSectorExposurePct - (sectorExposure[c.sector] ?? 0)));
 
     if (spendableCash < marketMinimum) {
-      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve (free ${fmt(availableCash)})`);
+      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve${cashReserveUsd > 0 ? ` and ${fmt(cashReserveUsd)} dry powder` : ''} (free ${fmt(availableCash)})`);
       continue;
     }
     if (configuredLimitSize < marketMinimum) {
@@ -1588,24 +2919,25 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     console.log(`
   *** BUY: ${c.pair} ***
   Confidence: ${d.confidence}/10 | ${d.reasoning}
-  Entry: ${fmt(c.ta.currentPrice)} | Stop: ${fmt(sl)} | Target: ${fmt(tp)}
-  R/R: ${rr.toFixed(1)}:1 | Size: ${fmt(finalSize)} | Sector: ${c.sector} (${(sw * 100).toFixed(0)}%)
+  Entry: ${fmt(c.ta.currentPrice)} | Stop: ${fmt(sl)} (${pct(riskPct)}, ${c.plan.basis}) | Target: ${fmt(tp)}
+  R/R: ${rr.toFixed(1)}:1 | Size: ${fmt(finalSize)} | Risk: ${fmt(finalSize * riskPct)} | Sector: ${c.sector} (${(sw * 100).toFixed(0)}%)
   `);
 
     if (shutdownRequested) break;
     const fill = await exchange.buy(c.pair, finalSize);
     if (fill) {
-      const costBasisUsd = +(fill.qty * fill.price + fill.feeUsd).toFixed(2);
+      const filledCost = fill.qty * fill.price + fill.feeUsd;
       mem.openPosition(c.pair, fill.qty, fill.price, sl, tp, c.sector,
-        `RSI=${c.ta.rsi} ${c.ta.trend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd);
+        `RSI=${c.ta.rsi} ${c.ta.trend}/${c.ta.htfTrend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd, c.ta.atr);
+      if (exchange.paper) mem.adjustPaperCash(-filledCost);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: c.pair, side: 'BUY',
-        price: fill.price, qty: fill.qty, costBasisUsd, stopLoss: sl, takeProfit: tp,
+        price: fill.price, qty: fill.qty, costBasisUsd: filledCost, stopLoss: sl, takeProfit: tp,
         pnlUsd: 0, pnlPct: 0, status: 'open', sector: c.sector,
         reason: `RSI=${c.ta.rsi} R/R=${rr.toFixed(1)}`, aiVerdict: d.verdict, aiConfidence: d.confidence,
       });
       exposure += fill.qty * fill.price;
-      const filledCost = fill.qty * fill.price + fill.feeUsd;
+      sectorExposure[c.sector] = (sectorExposure[c.sector] ?? 0) + fill.qty * fill.price;
       cycleCashSpent[quoteKey] = (cycleCashSpent[quoteKey] || 0) + filledCost;
       console.log(`  [BUY CASH] ${c.pair}: spent ${fmt(filledCost)} ${quoteAsset || 'quote'} including fees | remaining ${fmt(Math.max(0, availableCash - filledCost))}`);
       holding.add(c.pair);
@@ -1616,18 +2948,26 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PORTFOLIO ──');
   const positions = mem.getOpenPositions();
   let totalVal = 0;
+  let openRisk = 0;
   for (const p of positions) {
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
-    const pct = (pnl / p.costBasisUsd) * 100;
-    console.log(`  ${p.pair}: ${fmt(p.costBasisUsd)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`);
+    const percent = p.costBasisUsd > 0 ? (pnl / p.costBasisUsd) * 100 : 0;
+    console.log(`  ${p.pair}: ${fmt(p.costBasisUsd)} | P/L ${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${percent >= 0 ? '+' : ''}${percent.toFixed(1)}%) | stop ${fmt(p.stopLoss)}`);
     totalVal += p.currentPrice * p.qty;
+    openRisk += Math.max(0, p.currentPrice - p.stopLoss) * p.qty;
   }
-  const cash = portfolioValue - totalVal;
-  console.log(`  Cash: ${fmt(cash)} | Invested: ${fmt(totalVal)} | Total: ${fmt(portfolioValue)} | Open: ${positions.length}`);
-  console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.state.totalTrades > 0 ? ((mem.state.wins / mem.state.totalTrades) * 100).toFixed(0) : 0}%`);
+  const untracked = Math.max(0, account.tradableUsd - account.cashUsd - totalVal);
+  console.log(`  Cash: ${fmt(account.cashUsd)} | Tracked positions: ${fmt(totalVal)}${untracked > 0.01 ? ` | Untracked holdings: ${fmt(untracked)}` : ''}${account.stakedUsd > 0.01 ? ` | Staked (locked): ${fmt(account.stakedUsd)}` : ''}`);
+  console.log(`  Tradable: ${fmt(account.tradableUsd)} | Account total: ${fmt(account.totalUsd)} | Open: ${positions.length}`);
+  console.log(`  Open risk to stops: ${fmt(openRisk)}${portfolioValue > 0 ? ` (${pct(openRisk / portfolioValue)} of portfolio)` : ''} | Realised today: ${fmt(mem.realizedPnlToday())}`);
+  console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.winRate().toFixed(0)}% over ${mem.state.totalTrades} closes`);
+  const funding = mem.state.fundingRequest;
+  if (funding)
+    console.log(`  [FUNDING] Outstanding request: ${fmt(funding.usd)} since ${funding.requestedAt} — "${funding.reasoning}"`);
 }
 
-export { TA, applyPositionAdjustments, updateTradeExtremes };
+export { TA, applyPositionAdjustments, updateTradeExtremes, loadConfig, csvField, Memory, fmt, Exchange, runCycle, AiBrain, reportPreflight, normalizeAsset, isStakedBalance };
+export type { TradingConfig };
 
 if (require.main === module)
   main().catch(e => { console.error('FATAL:', e); process.exit(1); });
