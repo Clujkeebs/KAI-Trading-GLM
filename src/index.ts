@@ -711,6 +711,15 @@ class Exchange {
     return this.getAssetField(this.cycleBalance, market.quote, 'free');
   }
 
+  getQuoteAsset(pair: string): string | null {
+    try {
+      const quote = this.ex.market(pair)?.quote;
+      return quote ? normalizeAsset(String(quote)) : null;
+    } catch {
+      return null;
+    }
+  }
+
   getAvailableBase(pair: string): number | null {
     if (!this.balanceLoaded || !this.cycleBalance) return null;
     const market = this.ex.market(pair);
@@ -1306,6 +1315,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PHASE 2: Scan market ──');
   const holding = new Set(mem.getOpenPositions().map(p => p.pair));
   let exposure = mem.getOpenPositions().reduce((s, p) => s + p.currentPrice * p.qty, 0);
+  const cycleCashSpent: Record<string, number> = {};
+  const paperStartingCash = Math.max(0, portfolioValue - exposure);
   const canOpen = CONFIG.maxExposurePct === null || exposure < portfolioValue * CONFIG.maxExposurePct;
 
   if (!canOpen) console.log('  [PHASE 2] Exposure cap reached, skipping scan.');
@@ -1361,12 +1372,20 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const reward = tp - c.ta.currentPrice;
     const rr = risk > 0 ? reward / risk : 0;
     const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
+    const quoteAsset = exchange.getQuoteAsset(c.pair);
+    const quoteKey = quoteAsset || c.pair;
+    const spentThisCycle = cycleCashSpent[quoteKey] || 0;
     const availableCashSnapshot = exchange.getAvailableCash(c.pair);
     if (availableCashSnapshot === null && !exchange.paper)
       console.warn(`  [BUY CASH] ${c.pair}: free quote balance unavailable; buy size will be treated as $0`);
-    const availableCash = availableCashSnapshot ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
+    const availableCash = availableCashSnapshot !== null
+      ? Math.max(0, availableCashSnapshot - spentThisCycle)
+      : exchange.paper
+        ? Math.max(0, paperStartingCash - spentThisCycle)
+        : 0;
     const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
     const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
+    console.log(`  [BUY CASH] ${c.pair}: ${quoteAsset || 'quote'} available ${fmt(availableCash)} | spendable ${fmt(spendableCash)} | cycle spent ${fmt(spentThisCycle)}`);
 
     const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
@@ -1438,6 +1457,9 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         reason: `RSI=${c.ta.rsi} R/R=${rr.toFixed(1)}`, aiVerdict: d.verdict, aiConfidence: d.confidence,
       });
       exposure += fill.qty * fill.price;
+      const filledCost = fill.qty * fill.price + fill.feeUsd;
+      cycleCashSpent[quoteKey] = (cycleCashSpent[quoteKey] || 0) + filledCost;
+      console.log(`  [BUY CASH] ${c.pair}: spent ${fmt(filledCost)} ${quoteAsset || 'quote'} including fees | remaining ${fmt(Math.max(0, availableCash - filledCost))}`);
       holding.add(c.pair);
     }
   }

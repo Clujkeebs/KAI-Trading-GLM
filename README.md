@@ -45,8 +45,12 @@ The AI owns position sizing and requests a portfolio percentage. By default, the
 self-imposed risk, exposure, R/R, confidence, and minimum-size guardrails are **off**.
 Every watchlist pair with valid technical data is ranked and may reach the AI; weak
 setups should receive HOLD. The only entry constraints then are available free cash
-and Kraken's market amount, cost, and precision rules. Set the optional variables
-above to re-enable a cap or scan filter.
+and Kraken's market amount, cost, and precision rules. If the AI requests an undersized
+or zero position percentage, the bot raises it to Kraken's minimum order value when
+free cash covers that minimum; on a tiny account, this can make one order a large
+share of the portfolio. Actual filled quote cost, including fees, is deducted from
+buying power for later buys in the same cycle. Set the optional variables above to
+re-enable a cap or scan filter.
 Stop-loss and take-profit remain active exit logic. This permissive configuration can
 spend most or all of a tiny account if the AI requests it; use `PAPER_MODE=true` first.
 
