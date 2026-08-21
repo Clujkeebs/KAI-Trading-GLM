@@ -85,12 +85,23 @@ class FakeKraken {
       .map(c => [c.timestamp + offset, c.open, c.high, c.low, c.close, c.volume]);
   }
   balanceFetches = 0;
-  async fetchBalance() { this.balanceFetches++; return this.balance; }
+  // A snapshot, not a live reference — otherwise a cached balance would silently
+  // track later fills and stale-snapshot bugs would be invisible to these tests.
+  async fetchBalance() {
+    this.balanceFetches++;
+    return JSON.parse(JSON.stringify(this.balance));
+  }
   async fetchOrder(id: string) { return this.placed.get(id); }
 
   private placed = new Map<string, FakeOrder>();
   private record(side: 'buy' | 'sell', pair: string, amount: number): FakeOrder {
     this.orders.push({ side, pair, amount });
+    // Fills move the real balance, exactly as Kraken would.
+    const base = pair.split('/')[0];
+    const held = this.balance[base]?.total ?? 0;
+    const delta = side === 'buy' ? amount : -amount;
+    if (this.balance[base] || side === 'buy')
+      this.balance[base] = { free: held + delta, used: 0, total: held + delta };
     const filled = side === 'sell' ? amount * this.sellFillRatio : amount;
     const price = this.prices[pair];
     const order: FakeOrder = {
@@ -410,6 +421,23 @@ async function main() {
   // A Phase 1 top-up spends cash, so the balance must be refetched before Phase 3
   // sizes anything against it.
   assert.ok(fake.balanceFetches > 1, 'the balance is refreshed after a Phase 1 buy');
+
+  // A stop firing in the same cycle as the repair must sell the *restored* size.
+  // Production topped MORPHO up to 4.26 units, then tried to sell 1.7602 — the
+  // pre-repair quantity from a stale balance snapshot — and Kraken rejected it.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 20000, used: 0, total: 20000 }, ONDO: { free: 1.7602, used: 0, total: 1.7602 } };
+  const stopAfterTopUp = new Memory();
+  // Stop sits above the market, so it triggers the moment the repair completes.
+  stopAfterTopUp.openPosition(strandPair, 1.7602, strandPrice, strandPrice * 1.05, strandPrice * 2, 'rwa', 'seed', 'seed');
+  const sellsBefore = fake.orders.filter(o => o.side === 'sell' && o.pair === strandPair).length;
+  await runCycle(live, stopAfterTopUp, fakeAi('HOLD', 0, { stance: 'NEUTRAL' }));
+  const exitSells = fake.orders.filter(o => o.side === 'sell' && o.pair === strandPair);
+  assert.ok(exitSells.length > sellsBefore, 'the stop must actually place a sell');
+  assert.ok(exitSells[exitSells.length - 1].amount >= 2.5,
+    `the sell must use the restored size, got ${exitSells[exitSells.length - 1].amount}`);
+  assert.equal(stopAfterTopUp.positions[strandPair].status, 'closed', 'and the position actually exits');
 
   // A repair that would dominate the account is refused: restoring an exit is
   // defensive, buying a much larger position is not.

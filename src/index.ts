@@ -1610,6 +1610,27 @@ class Exchange {
     return { totalUsd: value, cashUsd: cash, tradableUsd: value, stakedUsd: 0 };
   }
 
+  /**
+   * Refetches the balance snapshot when a fill has invalidated it.
+   *
+   * Sells clamp to the free base balance, which is read from this snapshot. After
+   * a top-up buy the snapshot still shows the pre-purchase quantity, so a stop
+   * firing in the same cycle was clamped back to the size that could not be sold
+   * in the first place — the exact situation the top-up had just repaired.
+   */
+  async refreshBalanceSnapshot(): Promise<boolean> {
+    if (this.paper || !this.balanceDirty) return false;
+    try {
+      this.cycleBalance = await withRetry('balance refresh', () => this.ex.fetchBalance());
+      this.balanceLoaded = true;
+      this.balanceDirty = false;
+      return true;
+    } catch (e: any) {
+      console.warn(`  [BALANCE] Could not refresh after fill (${e.message}); later sizing this cycle may be stale`);
+      return false;
+    }
+  }
+
   async refreshAfterPhase1Sales(mem: Memory): Promise<PortfolioSnapshot | null> {
     if (!this.balanceDirty) return null;
     console.log(`  [BALANCE] Refreshing after Phase 1 trades; using settled ${this.paper ? 'paper' : 'Kraken'} balance for Phase 2`);
@@ -2884,6 +2905,10 @@ async function topUpStrandedPositions(
     if (exchange.paper) mem.adjustPaperCash(-(fill.qty * fill.price + fill.feeUsd));
     if (mem.addToPosition(position.pair, fill.qty, fill.price, fill.feeUsd)) {
       const updated = mem.positions[position.pair];
+      // The new coins must be visible to a sell placed later in this same cycle,
+      // otherwise a stop firing right after the repair is clamped back to the
+      // unsellable size the repair just fixed.
+      await exchange.refreshBalanceSnapshot();
       console.log(`  [TOPUP] ${position.pair}: now ${updated.qty.toFixed(6)} units at an average ${fmt(updated.entryPrice)}; exit restored`);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: position.pair, side: 'BUY',
