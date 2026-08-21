@@ -145,6 +145,8 @@ const fakeAi = (
   async reviewPortfolio() {
     return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', counterCase: '', cashTargetPct, requestedFundsUsd };
   },
+  usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
+  activeModel: () => 'fake-model',
   async selfTest(samples: number) {
     return { valid: samples, salvaged: 0, total: samples, finishReasons: { stop: samples }, avgLatencyMs: 12, budget: 4000, lastError: '' };
   },

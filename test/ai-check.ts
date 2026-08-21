@@ -37,6 +37,7 @@ function fakeClient(replies: Reply[]) {
               finish_reason: reply.finish_reason ?? 'stop',
               message: { content: reply.content ?? '', reasoning: reply.reasoning },
             }],
+            usage: { prompt_tokens: 1000, completion_tokens: 200 },
           };
         },
       },
@@ -174,6 +175,40 @@ async function main() {
     assert.equal(broken.total, 3);
     assert.equal(broken.finishReasons.length, 3);
     assert.ok(broken.budget > 1000, 'the probe itself discovers the budget is too small');
+  }
+
+  // ── An unknown model falls back instead of bricking every decision ────────
+  // A mistyped or retired model id otherwise fails every call while the bot looks
+  // healthy, answering HOLD to everything — the silent failure that left this
+  // account untraded for days.
+  process.env.AI_MODEL_FALLBACK = 'z-ai/glm-4.6';
+  setConfig(loadConfig());
+  {
+    const { brain, client } = brainWith([
+      { throws: { status: 404, message: 'The model `z-ai/glm-5-turbo` does not exist' } },
+      { content: VALID },
+    ]);
+    const d = await (brain as any).call('probe', 'JJJ/USD');
+    assert.equal(d.verdict, 'BUY', 'the decision still lands via the fallback');
+    assert.equal(client.sent[1].model, 'z-ai/glm-4.6', 'the fallback model is used');
+    assert.equal(brain.activeModel(), 'z-ai/glm-4.6');
+  }
+  // Without a fallback configured it fails loudly rather than pretending.
+  delete process.env.AI_MODEL_FALLBACK;
+  setConfig(loadConfig());
+  {
+    const { brain } = brainWith([{ throws: { status: 404, message: 'model not found' } }]);
+    assert.equal((await (brain as any).call('probe', 'KKK/USD')).verdict, 'HOLD');
+  }
+
+  // ── Token usage is measured, so credit burn is a fact not a guess ─────────
+  {
+    const { brain } = brainWith([{ content: VALID }, { content: VALID }]);
+    await (brain as any).call('probe', 'LLL/USD');
+    await (brain as any).call('probe', 'MMM/USD');
+    assert.equal(brain.usage.calls, 2);
+    assert.equal(brain.usage.promptTokens, 2000);
+    assert.equal(brain.usage.completionTokens, 400);
   }
 
   // ── Preflight reporting distinguishes fatal from merely worrying ───────────
