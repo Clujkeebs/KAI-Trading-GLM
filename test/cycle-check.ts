@@ -41,8 +41,17 @@ class FakeKraken {
   sellFillRatio = 1;
   loadMarketsCalls = 0;
 
+  /** Pairs deliberately withheld, to exercise the unlisted-market check. */
+  delisted = new Set<string>();
+
   constructor(public pairs: string[]) {
-    for (const pair of pairs) {
+    for (const pair of pairs) this.ensure(pair);
+  }
+
+  /** Markets and prices materialise on demand, so any BASE/USD pair resolves. */
+  private ensure(pair: string) {
+    if (this.delisted.has(pair)) return null;
+    if (!this.markets[pair]) {
       const [base, quote] = pair.split('/');
       this.markets[pair] = {
         symbol: pair, base, quote, active: true, spot: true,
@@ -50,26 +59,30 @@ class FakeKraken {
       };
       this.prices[pair] = bouncing(pair.length)[199].close;
     }
+    return this.markets[pair];
   }
 
   async loadMarkets() { this.loadMarketsCalls++; return this.markets; }
   market(pair: string) {
-    const m = this.markets[pair];
+    const m = this.ensure(pair);
     if (!m) throw new ccxt.BadSymbol(`no market ${pair}`);
     return m;
   }
   amountToPrecision(_pair: string, qty: number) { return String(Math.floor(qty * 1e8) / 1e8); }
   async fetchTicker(pair: string) {
-    if (this.prices[pair] === undefined) throw new ccxt.BadSymbol(`no ticker ${pair}`);
+    if (!this.ensure(pair)) throw new ccxt.BadSymbol(`no ticker ${pair}`);
     return { symbol: pair, last: this.prices[pair], quoteVolume: 250_000 };
   }
   async fetchTickers(pairs: string[]) {
-    return Object.fromEntries(pairs.filter(p => this.prices[p] !== undefined)
+    return Object.fromEntries(pairs.filter(p => this.ensure(p))
       .map(p => [p, { symbol: p, last: this.prices[p], quoteVolume: 250_000 }]));
   }
   async fetchOHLCV(pair: string, _tf: string, _since: unknown, _limit: number) {
+    if (!this.ensure(pair)) throw new ccxt.BadSymbol(`no candles ${pair}`);
+    // Anchored to now so the preflight's candle-freshness check sees live data.
+    const offset = Date.now() - 200 * hour;
     return bouncing(pair.length, this.prices[pair])
-      .map(c => [c.timestamp, c.open, c.high, c.low, c.close, c.volume]);
+      .map(c => [c.timestamp + offset, c.open, c.high, c.low, c.close, c.volume]);
   }
   async fetchBalance() { return this.balance; }
   async fetchOrder(id: string) { return this.placed.get(id); }
@@ -97,6 +110,9 @@ const fakeAi = (verdict: 'BUY' | 'HOLD' | 'SELL', sizePct = 20) => ({
   },
   async review() {
     return { verdict: 'HOLD' as const, confidence: 5, reasoning: 'test', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
+  },
+  async selfTest(samples: number) {
+    return { valid: samples, salvaged: 0, total: samples, finishReasons: { stop: samples }, avgLatencyMs: 12, budget: 4000, lastError: '' };
   },
 }) as any;
 
@@ -213,6 +229,51 @@ async function main() {
   assert.equal(liveMem.state.totalTrades, 1);
 
   assert.ok(fake.loadMarketsCalls <= 2, `markets loaded ${fake.loadMarketsCalls} times; it should be memoised`);
+
+  // ── Preflight passes against a healthy exchange ────────────────────────────
+  const { runPreflight } = bot;
+  const named = (checks: any[], name: string) => checks.find(c => c.name === name)!;
+
+  fake.balance = { USD: { free: 500, used: 0, total: 500 } };
+  const healthyMem = new Memory();
+  const healthy = await runPreflight(live, healthyMem, fakeAi('HOLD'), 2);
+  for (const check of healthy)
+    assert.ok(check.ok, `${check.name} should pass on a healthy exchange: ${check.detail}`);
+  assert.match(named(healthy, 'Market data').detail, /pairs analysable/);
+  assert.match(named(healthy, 'Buying power').detail, /entries are possible/);
+  assert.match(named(healthy, 'AI decisions').detail, /2\/2 clean/);
+
+  // ── A watchlist pair Kraken does not list is caught, not silently skipped ──
+  fake.delisted.add('HYPE/USD');
+  delete fake.markets['HYPE/USD'];
+  const delisted = await runPreflight(live, new Memory(), fakeAi('HOLD'), 0);
+  const markets = named(delisted, 'Kraken markets');
+  assert.equal(markets.ok, false);
+  assert.equal(markets.critical, true);
+  assert.match(markets.detail, /HYPE\/USD/);
+  fake.delisted.delete('HYPE/USD');
+
+  // ── A position too small to sell means its stop can never execute ──────────
+  const strandedMem = new Memory();
+  const stranded = 'LINK/USD';
+  strandedMem.openPosition(stranded, 0.00002, fake.prices[stranded], 1, 999, 'defi', 'dust', 'dust');
+  const strandedChecks = await runPreflight(live, strandedMem, fakeAi('HOLD'), 0);
+  const exits = named(strandedChecks, 'Exit reachability');
+  assert.equal(exits.ok, false, 'an unsellable position must be reported');
+  assert.equal(exits.critical, true);
+  assert.match(exits.detail, /LINK\/USD/);
+
+  // ── An account with no free cash cannot fund entries, and says so ──────────
+  // This is the state the deployed bot was actually in: $0.05 free against a
+  // $203 portfolio, spending AI calls on entries it could never place.
+  fake.balance = { USD: { free: 0.05, used: 0, total: 0.05 }, SOL: { free: 2, used: 0, total: 2 } };
+  const brokeChecks = await runPreflight(live, new Memory(), fakeAi('HOLD'), 0);
+  const buyingPower = named(brokeChecks, 'Buying power');
+  assert.equal(buyingPower.ok, false);
+  assert.equal(buyingPower.critical, false, 'no cash is a warning, not a reason to stop managing positions');
+  assert.match(buyingPower.detail, /no new entry can be funded/);
+  // And the balance is reported honestly rather than counting holdings as cash.
+  assert.match(named(brokeChecks, 'Account balance').detail, /\$0\.0500 free cash \| \$20[0-9.]+ tradable/);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');

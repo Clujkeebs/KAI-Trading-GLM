@@ -29,7 +29,8 @@ All settings live in `.env` (see `.env.example`):
 
 - `AI_API_KEY` — OpenRouter API key (required)
 - `AI_PROVIDER` / `AI_MODEL` — defaults to `openrouter` / `z-ai/glm-5.2`
-- `AI_MAX_TOKENS` — AI completion/reasoning token budget (default `1500`, positive integer)
+- `AI_MAX_TOKENS` — AI completion token budget (default `4000`). Reasoning models spend this on thinking before emitting content, so too small a value truncates every decision; the bot doubles it automatically, up to 16000, when it detects truncation
+- `AI_REASONING_EFFORT` — `off`, `low`, `medium` or `high` (default `low`); caps reasoning so the budget is left for the JSON
 - `AI_BASE_URL` — optional OpenAI-compatible API base URL override; blank uses the provider's configured URL
 - `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` — required to run (Trade permission only)
 - `PAPER_MODE` — `false` by default for real money; set `true` for simulated trades
@@ -115,15 +116,34 @@ AI responses request JSON object output, tolerate surrounding markdown and trunc
 payloads, and retry once with a corrective JSON-only instruction before falling back to
 HOLD. Truncated responses never supply stop or target adjustments.
 
+## Preflight and the doctor
+
+Unit tests prove the maths. They cannot prove the deployment can reach Kraken, parse its own
+balance, or get usable JSON out of the model — so the bot checks that against the real thing
+before it trades, and logs the result:
+
+```bash
+npm run doctor    # run the checks and exit
+```
+
+It verifies market coverage for every watchlist pair, candle freshness and analysability,
+the account breakdown, whether free cash can fund the cheapest entry, whether every open
+position can actually be sold (a position that cannot be sold has a stop that can never
+execute), and how many live AI probes return a usable decision.
+
+The same checks run at startup unless `PREFLIGHT=false`. A failure does not stop the bot:
+stops and trailing exits are deterministic and keep protecting open positions even when the
+model is unreachable.
+
 ## Tests
 
 ```bash
 npm test
 ```
 
-Three suites, no network required: indicator and risk math (`logic-check`), position and P/L
-accounting (`memory-check`), and a full cycle driven end to end against a stubbed exchange
-(`cycle-check`).
+Four suites, no network required: indicator and risk math (`logic-check`), position and P/L
+accounting (`memory-check`), AI response handling including truncation recovery (`ai-check`),
+and full cycles plus preflight driven end to end against a stubbed exchange (`cycle-check`).
 
 ## Disclaimer
 
