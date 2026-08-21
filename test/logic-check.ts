@@ -3,7 +3,8 @@ import ccxt from 'ccxt';
 import {
   TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse,
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
-  csvField, fmt, setConfig, loadConfig,
+  csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
+  normalizeStance, applyEntryPlan,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -280,3 +281,73 @@ assert.equal(reasoningAi.decision?.verdict, 'SELL');
 assert.equal(parseAiResponse('').kind, 'empty');
 
 console.log('logic checks passed');
+
+// ── Kraken staking-balance names resolve to their underlying asset ───────────
+// SOL03.S / DOT28.S carry a duration code. Keeping the digits meant the asset
+// matched no market, so a staked position was invisible in the portfolio total.
+assert.equal(normalizeAsset('SOL03.S'), 'SOL');
+assert.equal(normalizeAsset('DOT28.S'), 'DOT');
+assert.equal(normalizeAsset('ATOM21.S'), 'ATOM');
+assert.equal(normalizeAsset('AVAX.B'), 'AVAX');
+assert.equal(normalizeAsset('ETH2.S'), 'ETH');
+assert.equal(normalizeAsset('XXBT'), 'BTC');
+assert.equal(normalizeAsset('ZUSD'), 'USD');
+assert.equal(normalizeAsset('sol'), 'SOL');
+// A name that is only digits must not normalise away to nothing.
+assert.equal(normalizeAsset('1INCH'), '1INCH');
+assert.equal(isStakedBalance('SOL03.S'), true);
+assert.equal(isStakedBalance('SOL'), false);
+
+console.log('asset naming checks passed');
+
+// ── Portfolio stance parsing ─────────────────────────────────────────────────
+assert.equal(normalizeStance({ stance: 'RISK_OFF' }).stance, 'RISK_OFF');
+assert.equal(normalizeStance({ stance: 'risk on' }).stance, 'RISK_ON');
+assert.equal(normalizeStance({ stance: 'risk-off' }).stance, 'RISK_OFF');
+// Anything unrecognised must not silently freeze or unleash the account.
+assert.equal(normalizeStance({ stance: 'PANIC' }).stance, 'NEUTRAL');
+assert.equal(normalizeStance({}).stance, 'NEUTRAL');
+assert.equal(normalizeStance({ cash_target_pct: 40 }).cashTargetPct, 0.4);
+assert.equal(normalizeStance({ cash_target_pct: 500 }).cashTargetPct, 1, 'a cash target is a share, capped at 100%');
+assert.equal(normalizeStance({ cash_target_pct: -10 }).cashTargetPct, 0);
+assert.equal(normalizeStance({ requested_funds_usd: 500 }).requestedFundsUsd, 500);
+assert.equal(normalizeStance({ requested_funds_usd: -5 }).requestedFundsUsd, 0);
+assert.equal(normalizeStance({ confidence: 99 }).confidence, 10);
+
+// ── The model owns the entry plan, inside the risk cap ───────────────────────
+const entryPlan = planTrade(base)!;
+const decide = (over: Record<string, unknown> = {}) => ({
+  verdict: 'BUY' as const, confidence: 8, reasoning: 'test', positionSizePct: 10,
+  adjustedStop: null, adjustedTarget: null, ...over,
+});
+
+// No opinion offered: the bot's ATR plan stands.
+assert.equal(applyEntryPlan(entryPlan, 100, decide()).stop, entryPlan.stop);
+
+// A deliberate, wider stop inside the cap is honoured — this is the model taking
+// a considered risk, which is exactly what it is there to do.
+const wider = applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 88 }));
+assert.equal(wider.stop, 88);
+assert.ok(Math.abs(wider.riskPct - 0.12) < 1e-9);
+assert.match(wider.notes.join(' '), /using the AI stop/);
+
+// A tighter stop is honoured too.
+assert.equal(applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 97 })).stop, 97);
+
+// Past the 15% cap it is clamped, not obeyed: one trade cannot cost the account
+// an unbounded amount.
+const clamped = applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 40 }));
+assert.equal(clamped.stop, 85);
+assert.match(clamped.notes.join(' '), /clamped/);
+
+// A stop at or above entry is nonsense and is refused outright.
+const nonsense = applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 101 }));
+assert.equal(nonsense.stop, entryPlan.stop);
+assert.match(nonsense.notes.join(' '), /not below entry/);
+
+const retarget = applyEntryPlan(entryPlan, 100, decide({ adjustedTarget: 140 }));
+assert.equal(retarget.target, 140);
+assert.ok(retarget.rr > entryPlan.rr, 'a higher target improves the stated reward ratio');
+assert.equal(applyEntryPlan(entryPlan, 100, decide({ adjustedTarget: 90 })).target, entryPlan.target);
+
+console.log('stance and entry-plan checks passed');

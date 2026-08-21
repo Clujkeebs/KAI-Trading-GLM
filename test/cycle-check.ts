@@ -104,12 +104,21 @@ class FakeKraken {
   async createMarketSellOrder(pair: string, amount: number) { return this.record('sell', pair, amount); }
 }
 
-const fakeAi = (verdict: 'BUY' | 'HOLD' | 'SELL', sizePct = 20) => ({
+const fakeAi = (
+  verdict: 'BUY' | 'HOLD' | 'SELL',
+  sizePct = 20,
+  { stance, cashTargetPct = 0, requestedFundsUsd = 0 }: {
+    stance?: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF'; cashTargetPct?: number; requestedFundsUsd?: number;
+  } = {},
+) => ({
   async analyze() {
     return { verdict, confidence: 8, reasoning: 'test', positionSizePct: sizePct, adjustedStop: null, adjustedTarget: null };
   },
   async review() {
     return { verdict: 'HOLD' as const, confidence: 5, reasoning: 'test', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
+  },
+  async reviewPortfolio() {
+    return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', cashTargetPct, requestedFundsUsd };
   },
   async selfTest(samples: number) {
     return { valid: samples, salvaged: 0, total: samples, finishReasons: { stop: samples }, avgLatencyMs: 12, budget: 4000, lastError: '' };
@@ -274,6 +283,45 @@ async function main() {
   assert.match(buyingPower.detail, /no new entry can be funded/);
   // And the balance is reported honestly rather than counting holdings as cash.
   assert.match(named(brokeChecks, 'Account balance').detail, /\$0\.0500 free cash \| \$20[0-9.]+ tradable/);
+
+  // ── RISK_OFF means the model declines to deploy capital this cycle ─────────
+  // The whole point of the stance call: it can sit in cash and wait for lower
+  // prices instead of being forced to answer one pair at a time.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = { USD: { free: 1000, used: 0, total: 1000 } };
+  const paper = new Exchange(undefined, undefined, true);
+  const riskOffMem = new Memory();
+  await runCycle(paper, riskOffMem, fakeAi('BUY', 20, { stance: 'RISK_OFF' }));
+  assert.equal(riskOffMem.getOpenPositions().length, 0,
+    'RISK_OFF must block new entries even when the per-pair verdict is BUY');
+  assert.equal(riskOffMem.state.lastStance?.stance, 'RISK_OFF', 'the stance is remembered across cycles');
+
+  // ── Dry powder is withheld from buys ───────────────────────────────────────
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const reserveMem = new Memory();
+  const reserveStart = reserveMem.paperCash();
+  await runCycle(paper, reserveMem, fakeAi('BUY', 90, { stance: 'RISK_ON', cashTargetPct: 0.6 }));
+  const reserved = reserveMem.getOpenPositions();
+  assert.equal(reserved.length, 1);
+  // 90% of the portfolio was requested, but 60% is held back for a dip.
+  assert.ok(reserved[0].costBasisUsd <= reserveStart * 0.4 + 1,
+    `spent ${reserved[0].costBasisUsd} despite a 60% cash reserve`);
+  assert.ok(reserved[0].costBasisUsd > 0);
+
+  // ── A funding request survives restarts until it is actually funded ────────
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const fundingMem = new Memory();
+  await runCycle(paper, fundingMem, fakeAi('HOLD', 0, { stance: 'NEUTRAL', requestedFundsUsd: 750 }));
+  assert.equal(fundingMem.state.fundingRequest?.usd, 750, 'the request is recorded');
+  assert.equal(new Memory().state.fundingRequest?.usd, 750, 'and survives a restart');
+  // It clears itself once that much cash is actually available.
+  fundingMem.clearFundingRequestIfFunded(100);
+  assert.equal(fundingMem.state.fundingRequest?.usd, 750, 'a partial top-up does not clear it');
+  fundingMem.clearFundingRequestIfFunded(750);
+  assert.equal(fundingMem.state.fundingRequest, null);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');

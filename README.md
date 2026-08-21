@@ -69,19 +69,43 @@ that it only ever tightens.
 
 ### Optional safety limits (disabled unless set)
 
+These are backstops, not a leash: they bound catastrophe, and leave normal decisions to the model.
+
 - `MAX_DAILY_LOSS_PCT` — stop opening positions once realised losses today reach this share of the portfolio
 - `MAX_OPEN_POSITIONS` — ceiling on simultaneously open positions
 - `MAX_SECTOR_EXPOSURE_PCT` — cap exposure to any one sector
 
 ## What the bot decides vs. what the AI decides
 
-The AI owns *selection and sizing*: whether to buy, and what share of the portfolio to request.
-The bot owns *risk*: where the stop goes, where the target goes, when the stop ratchets up, and
-what the exchange will actually accept. The AI can tighten a stop; it cannot widen one.
+The AI is the decision maker. Each cycle it makes two calls:
+
+**The stance** — one judgement on the whole book, before any individual trade is considered:
+
+- `RISK_ON` / `NEUTRAL` / `RISK_OFF`. `RISK_OFF` means no new entries at all this cycle —
+  the model can sit in cash and wait for lower prices rather than being forced to answer
+  one pair at a time. Exits, stops and trailing stops keep running regardless.
+- `cash_target_pct` — dry powder to hold back for a dip. The bot will not spend below it.
+- `requested_funds_usd` — if the opportunity is bigger than the account can fund, the model
+  asks for capital. The request is logged prominently, persisted across restarts, and shown
+  in every portfolio summary until that much free cash actually appears.
+
+**The trade** — per pair: buy or not, how much of the portfolio, and its own stop and target,
+which override the bot's ATR defaults.
+
+The bot keeps exactly three rules, and they are about survival rather than opinion:
+
+1. A stop further than `MAX_STOP_DISTANCE_PCT` from entry is clamped to it. One trade cannot
+   cost an unbounded share of the account.
+2. Once a position is open, stops only tighten. The AI can pull a stop in; nothing widens it.
+3. Orders must satisfy free cash and Kraken's amount, cost and precision rules.
+
+Everything else — how many positions, how concentrated, how aggressive, when to sit out — is
+the model's call.
 
 The AI is given real history — the last 25 closed trades, realised P/L per sector, current
 exposure and this sector's target weight — so its stated memory of past trades reflects what
-actually happened.
+actually happened. For the stance call it also gets market breadth across the watchlist and
+the split between free cash, tradable value and staked balances it cannot sell.
 
 By default, the bot's self-imposed exposure, R/R, confidence, and minimum-size guardrails are **off**.
 Every watchlist pair with valid technical data is ranked and may reach the AI; weak

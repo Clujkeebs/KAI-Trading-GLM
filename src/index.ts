@@ -67,6 +67,22 @@ interface ClosedTradeSummary {
   closedAt: string; closeReason: string; holdDays: number;
 }
 interface SectorStat { trades: number; wins: number; pnlUsd: number }
+/**
+ * The model's call on the whole book, made once per cycle before any individual
+ * entry is considered. Without this the AI could only answer BUY/HOLD/SELL on one
+ * pair at a time and had no way to say "this market is toppy, sit in cash and wait
+ * for lower prices" — or to ask for more capital.
+ */
+interface PortfolioStance {
+  stance: 'RISK_ON' | 'NEUTRAL' | 'RISK_OFF';
+  confidence: number;
+  reasoning: string;
+  /** Share of the portfolio the model wants held back as dry powder, 0-1. */
+  cashTargetPct: number;
+  /** Extra capital the model is asking the operator to add, in USD. */
+  requestedFundsUsd: number;
+}
+interface FundingRequest { usd: number; reasoning: string; requestedAt: string }
 interface TradeRecord {
   timestamp: string; pair: string; side: 'BUY' | 'SELL';
   price: number; qty: number; costBasisUsd: number;
@@ -104,6 +120,10 @@ interface BotState {
   riskDayPnl: number;
   /** Simulated cash in paper mode, so paper results actually compound. */
   paperCash: number | null;
+  /** The model's most recent read on the market, for continuity across cycles. */
+  lastStance: PortfolioStance | null;
+  /** Standing request for more capital, surfaced until the operator acts on it. */
+  fundingRequest: FundingRequest | null;
 }
 
 // --- CONFIG ---
@@ -286,9 +306,19 @@ const CASH_EQUIVALENTS = new Set([
   'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
 ]);
 
+/**
+ * Kraken names staking balances `<ASSET><DURATION>.<SUFFIX>` — SOL03.S, DOT28.S,
+ * ATOM21.S. Keeping the duration digits meant `SOL03` matched no market, so a
+ * staked SOL position was invisible to the bot: it appeared in neither the
+ * portfolio total nor the unmapped-holding warnings.
+ */
 function normalizeAsset(asset: string): string {
   const base = asset.toUpperCase().split('.')[0];
-  return ASSET_ALIASES[base] || base;
+  if (ASSET_ALIASES[base]) return ASSET_ALIASES[base];
+  const withoutDuration = base.replace(/\d+$/, '');
+  if (withoutDuration && withoutDuration !== base)
+    return ASSET_ALIASES[withoutDuration] || withoutDuration;
+  return base;
 }
 
 function isStakedBalance(asset: string): boolean {
@@ -666,6 +696,48 @@ export function planTrade(ta: TechnicalAnalysis): TradePlan | null {
     : Math.max(atrTarget, price + risk * 1.5);
   const basis = atr === null ? 'structure only (ATR unavailable)' : `${CONFIG.atrStopMult}x ATR ${fmt(atr)}`;
   return { stop, target, rr: (target - price) / risk, riskPct: risk / price, basis };
+}
+
+/**
+ * Applies the model's own stop and target for a new entry, falling back to the
+ * bot's ATR plan for anything it does not specify.
+ *
+ * At entry the model owns the trade plan — it can run a wider stop for a volatile
+ * name or a tighter one for a tight base. The single rule the bot keeps is the
+ * hard risk cap: a stop further from entry than MAX_STOP_DISTANCE_PCT is clamped,
+ * because one trade should not be able to cost an unbounded share of the account.
+ * Once the position is open the ratchet-only rule takes over and stops never widen.
+ */
+export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecision): TradePlan & { notes: string[] } {
+  const notes: string[] = [];
+  let stop = plan.stop;
+  let target = plan.target;
+
+  if (decision.adjustedStop !== null && Number.isFinite(decision.adjustedStop)) {
+    const floor = price * (1 - CONFIG.maxStopDistancePct);
+    if (decision.adjustedStop >= price) {
+      notes.push(`ignored AI stop ${fmt(decision.adjustedStop)}: not below entry ${fmt(price)}`);
+    } else if (decision.adjustedStop < floor) {
+      stop = floor;
+      notes.push(`AI stop ${fmt(decision.adjustedStop)} clamped to the ${pct(CONFIG.maxStopDistancePct)} risk cap at ${fmt(floor)}`);
+    } else {
+      stop = decision.adjustedStop;
+      notes.push(`using the AI stop ${fmt(stop)} instead of ${fmt(plan.stop)}`);
+    }
+  }
+
+  if (decision.adjustedTarget !== null && Number.isFinite(decision.adjustedTarget)) {
+    if (decision.adjustedTarget <= price)
+      notes.push(`ignored AI target ${fmt(decision.adjustedTarget)}: not above entry ${fmt(price)}`);
+    else {
+      target = decision.adjustedTarget;
+      notes.push(`using the AI target ${fmt(target)} instead of ${fmt(plan.target)}`);
+    }
+  }
+
+  const risk = price - stop;
+  if (!(risk > 0)) return { ...plan, notes };
+  return { stop, target, rr: (target - price) / risk, riskPct: risk / price, basis: plan.basis, notes };
 }
 
 /**
@@ -1446,6 +1518,7 @@ class Memory {
       totalPnl: 0, bestTrade: null, worstTrade: null,
       lastScan: '', lastAiDecision: '', cycleCount: 0,
       recentTrades: [], sectorStats: {}, riskDay: utcDay(), riskDayPnl: 0, paperCash: null,
+      lastStance: null, fundingRequest: null,
       ...saved,
     };
     // A hand-edited or partially written state file must not leave the bot with
@@ -1457,6 +1530,8 @@ class Memory {
     this.state.riskDay = typeof saved.riskDay === 'string' && saved.riskDay ? saved.riskDay : utcDay();
     this.state.riskDayPnl = Number.isFinite(saved.riskDayPnl as number) ? Number(saved.riskDayPnl) : 0;
     this.state.paperCash = typeof saved.paperCash === 'number' && Number.isFinite(saved.paperCash) ? saved.paperCash : null;
+    this.state.lastStance = saved.lastStance && typeof saved.lastStance === 'object' ? saved.lastStance : null;
+    this.state.fundingRequest = saved.fundingRequest && typeof saved.fundingRequest === 'object' ? saved.fundingRequest : null;
     for (const key of ['totalTrades', 'wins', 'losses', 'totalPnl', 'cycleCount'] as const) {
       if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
     }
@@ -1605,6 +1680,32 @@ class Memory {
     this.state.riskDayPnl = +(this.state.riskDayPnl + pnlUsd).toFixed(6);
   }
 
+  /**
+   * Persists the model's market call. A funding request is kept standing until the
+   * operator actually adds capital, so it survives restarts and stays visible.
+   */
+  recordStance(stance: PortfolioStance) {
+    this.state.lastStance = stance;
+    if (stance.requestedFundsUsd > 0) {
+      this.state.fundingRequest = {
+        usd: stance.requestedFundsUsd,
+        reasoning: stance.reasoning,
+        requestedAt: new Date().toISOString(),
+      };
+    }
+    this.saveState();
+  }
+
+  /** Clears a standing funding request once that much new cash has arrived. */
+  clearFundingRequestIfFunded(cashUsd: number) {
+    const request = this.state.fundingRequest;
+    if (request && cashUsd >= request.usd) {
+      console.log(`  [FUNDING] Request for ${fmt(request.usd)} is covered by ${fmt(cashUsd)} of free cash; clearing it.`);
+      this.state.fundingRequest = null;
+      this.saveState();
+    }
+  }
+
   /** Simulated cash for paper mode, seeded from PORTFOLIO_VALUE on first use. */
   paperCash(): number {
     if (this.state.paperCash === null) {
@@ -1739,6 +1840,11 @@ You own position sizing. Request the percentage of the total portfolio you want 
 The bot can only spend available free cash and must obey Kraken's amount, cost, and precision rules.
 Any additional limits shown by the bot are optional configuration, not strategy rules.
 
+You also own the trade plan on a NEW entry. The stop and target shown below are the
+bot's ATR-based default; set "adjusted_stop" and "adjusted_target" to override them
+with your own levels. A stop further than the risk cap from entry is clamped to it.
+Once a position is open, stops only ever tighten — you can pull one in, never widen it.
+
 YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
@@ -1866,6 +1972,53 @@ function salvageAiResponse(text: string): AiDecision | null {
     confidence: confidenceMatch ? Number(confidenceMatch[1]) : 5,
     reasoning: reasoningMatch?.[1] || 'Salvaged truncated response',
   }, true);
+}
+
+const STANCE_SYSTEM_PROMPT = `You are the portfolio manager of a live crypto trading account.
+
+Once per cycle you set the stance for the whole book, before any individual trade is
+considered. You are not being asked about one coin. You are being asked: given this
+market and this account, should we be deploying capital right now at all?
+
+STANCE:
+- RISK_ON — conditions favour putting money to work; take the setups you are offered
+- NEUTRAL — trade selectively, nothing forced
+- RISK_OFF — do not open new positions. Sit in cash and wait for lower prices.
+  Choose this when the market looks extended, breadth is deteriorating, or you expect
+  a drawdown you would rather buy into than hold through. Existing stops and exits
+  keep running regardless; this only governs NEW entries.
+
+CASH TARGET:
+"cash_target_pct" is the share of the portfolio you want held back as dry powder,
+from 0 to 100. The bot will not spend below it. Raise it when you want ammunition
+for a dip; drop it to 0 when you want to be fully invested.
+
+REQUESTING CAPITAL:
+If the opportunity in front of you is larger than the account can fund, set
+"requested_funds_usd" to the amount you want added. The operator reads these and
+funds them manually. Ask for 0 when the account is adequate. Do not ask every cycle;
+ask when it would change what you can actually do.
+
+You own this call. The bot does not second-guess the stance.
+
+RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
+Keep "reasoning" under 25 words.
+{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater}`;
+
+export function normalizeStance(json: any): PortfolioStance {
+  const raw = String(json?.stance || '').toUpperCase().replace(/[\s-]/g, '_');
+  const stance: PortfolioStance['stance'] =
+    raw === 'RISK_ON' || raw === 'RISK_OFF' || raw === 'NEUTRAL' ? raw : 'NEUTRAL';
+  const confidenceValue = Number(json?.confidence);
+  const cashValue = Number(json?.cash_target_pct);
+  const fundsValue = Number(json?.requested_funds_usd);
+  return {
+    stance,
+    confidence: Number.isFinite(confidenceValue) ? Math.min(10, Math.max(1, Math.round(confidenceValue))) : 5,
+    reasoning: typeof json?.reasoning === 'string' && json.reasoning.trim() ? json.reasoning.trim() : 'No reason given',
+    cashTargetPct: Number.isFinite(cashValue) ? Math.min(1, Math.max(0, cashValue / 100)) : 0,
+    requestedFundsUsd: Number.isFinite(fundsValue) && fundsValue > 0 ? fundsValue : 0,
+  };
 }
 
 class AiBrain {
@@ -2082,6 +2235,82 @@ HOLD, SELL, or ADJUST?`, pair);
       }
     }
     return create(this.responseFormatSupported, this.reasoningParamSupported);
+  }
+
+  /**
+   * One JSON object from the model, with the same truncation handling as a trade
+   * decision. Returns null when nothing parseable comes back.
+   */
+  private async requestJsonObject(system: string, prompt: string, label: string): Promise<any | null> {
+    const messages = [
+      { role: 'system', content: system },
+      { role: 'user', content: prompt },
+    ];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await this.request(messages, label);
+        const choice = res.choices?.[0];
+        const text = textContent(choice?.message?.content).trim() ||
+          textContent(choice?.message?.reasoning ?? choice?.message?.reasoning_content);
+        const objectText = extractJsonObject(text);
+        if (objectText) {
+          try { return JSON.parse(objectText); } catch { /* fall through to retry */ }
+        }
+        if (isTruncated(choice?.finish_reason) && this.growTokenBudget(label)) continue;
+      } catch (e: any) {
+        console.error(`  [AI] Error ${label}: ${e.message}`);
+        if (!isRetryableError(e)) break;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Asks the model for its call on the whole book. Falling back to NEUTRAL keeps
+   * the bot behaving exactly as it did before this existed when the model is
+   * unreachable — it neither forces trades nor freezes the account.
+   */
+  async reviewPortfolio(
+    account: PortfolioSnapshot,
+    candidates: Array<{ pair: string; ta: TechnicalAnalysis; score: { score: number } }>,
+  ): Promise<PortfolioStance> {
+    const breadth = candidates.length;
+    const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
+    const bearish = candidates.filter(c => c.ta.htfTrend === 'bearish').length;
+    const avgRsi = breadth > 0
+      ? (candidates.reduce((sum, c) => sum + c.ta.rsi, 0) / breadth).toFixed(1) : 'n/a';
+    const overbought = candidates.filter(c => c.ta.rsi > 70).length;
+    const oversold = candidates.filter(c => c.ta.rsi < 35).length;
+    const best = candidates.slice(0, 5)
+      .map(c => `${c.pair} (score ${c.score.score.toFixed(0)}, RSI ${c.ta.rsi}, 4h ${c.ta.htfTrend})`)
+      .join('; ') || 'none';
+    const standing = this.memory.state.fundingRequest;
+
+    const prompt = `${this.memory.getContextSummary()}
+
+ACCOUNT:
+Free cash: ${fmt(account.cashUsd)}
+Tradable value (cash + sellable crypto): ${fmt(account.tradableUsd)}
+Staked / locked (cannot be traded or sold by the bot): ${fmt(account.stakedUsd)}
+Account total: ${fmt(account.totalUsd)}
+Cash as a share of tradable value: ${account.tradableUsd > 0 ? pct(account.cashUsd / account.tradableUsd) : 'n/a'}
+${standing ? `You already asked for ${fmt(standing.usd)} on ${standing.requestedAt} and it has not been funded yet.` : 'No outstanding funding request.'}
+
+MARKET BREADTH (${breadth} watchlist pairs with usable data):
+4h trend: ${bullish} bullish, ${bearish} bearish, ${breadth - bullish - bearish} neutral
+Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (<35)
+Best-ranked setups: ${best}
+
+What is the stance for this cycle?`;
+
+    const json = await this.requestJsonObject(STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
+    if (!json) {
+      console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
+      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', cashTargetPct: 0, requestedFundsUsd: 0 };
+    }
+    // Persisting is the caller's job, so the record is kept no matter which
+    // implementation produced the stance.
+    return normalizeStance(json);
   }
 
   /**
@@ -2442,6 +2671,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   // ── FETCH REAL BALANCE ──
   const account = await exchange.getPortfolioValue(mem);
+  mem.clearFundingRequestIfFunded(account.cashUsd);
   // Sizing runs off tradable value: staked balances are real money the bot cannot
   // spend, and counting them inflated every position size the AI was asked for.
   const portfolioValue = account.tradableUsd;
@@ -2575,7 +2805,23 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // ── PHASE 3: AI DECISIONS ──
   console.log('\n── PHASE 3: AI analysis ──');
 
-  const aiCandidates = candidates.slice(0, CONFIG.aiDecisionsPerCycle);
+  // The model's call on the whole book comes first. It can decline to deploy
+  // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
+  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', cashTargetPct: 0, requestedFundsUsd: 0 };
+  if (candidates.length > 0 && !shutdownRequested) {
+    stance = await ai.reviewPortfolio(account, candidates);
+    mem.recordStance(stance);
+    console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
+    if (stance.cashTargetPct > 0)
+      console.log(`  [STANCE] Holding back ${pct(stance.cashTargetPct)} of the portfolio as dry powder (${fmt(portfolioValue * stance.cashTargetPct)})`);
+    if (stance.requestedFundsUsd > 0)
+      console.log(`\n  *** FUNDING REQUEST: the model is asking for ${fmt(stance.requestedFundsUsd)} ***\n  Reason: ${stance.reasoning}\n`);
+  }
+  const cashReserveUsd = portfolioValue * stance.cashTargetPct;
+  if (stance.stance === 'RISK_OFF')
+    console.log('  [STANCE] RISK_OFF — no new entries this cycle; exits and stops continue as normal.');
+
+  const aiCandidates = stance.stance === 'RISK_OFF' ? [] : candidates.slice(0, CONFIG.aiDecisionsPerCycle);
   if (aiCandidates.length > 0)
     console.log(`  [AI BUDGET] Reached: ${aiCandidates.map(c => `${c.pair} (${c.score.score.toFixed(2)})`).join(', ')}`);
   for (const c of aiCandidates) {
@@ -2588,7 +2834,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.log(`  [PASS] ${c.pair}: could not build a valid stop/target from the data`);
       continue;
     }
-    const { stop: sl, target: tp, rr, riskPct } = c.plan;
+    const plan = c.plan;
     const quoteAsset = exchange.getQuoteAsset(c.pair);
     const quoteKey = quoteAsset || c.pair;
     const spentThisCycle = cycleCashSpent[quoteKey] || 0;
@@ -2600,11 +2846,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       : exchange.paper
         ? Math.max(0, mem.paperCash() - spentThisCycle)
         : 0;
-    const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
+    // Dry powder the model asked to keep is off limits to new buys.
+    const spendableCash = Math.max(0, availableCash - cashReserveUsd) * (1 - CONFIG.feeReservePct);
     const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
     console.log(`  [BUY CASH] ${c.pair}: ${quoteAsset || 'quote'} available ${fmt(availableCash)} | spendable ${fmt(spendableCash)} | cycle spent ${fmt(spentThisCycle)}`);
 
-    const d = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
+    const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
       spendableCashUsd: spendableCash,
       marketMinimumUsd: marketMinimum,
@@ -2613,6 +2860,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       sectorExposureUsd: sectorExposure[c.sector] ?? 0,
       sectorTargetPct: SECTOR_WEIGHTS[c.sector] ?? 0.05,
     }, c.plan);
+
+    // The model may set its own entry stop and target. The only rule the bot
+    // keeps is the hard risk cap: a stop further than MAX_STOP_DISTANCE_PCT from
+    // entry is clamped, never widened past it.
+    const entry = applyEntryPlan(plan, c.ta.currentPrice, decision);
+    const { stop: sl, target: tp, rr, riskPct } = entry;
+    if (entry.notes.length) console.log(`  [PLAN] ${c.pair}: ${entry.notes.join('; ')}`);
+    const d = decision;
 
     if (d.verdict !== 'BUY' ||
         (CONFIG.aiConfidenceThreshold !== null && d.confidence < CONFIG.aiConfidenceThreshold)) {
@@ -2643,7 +2898,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         Math.max(0, portfolioValue * CONFIG.maxSectorExposurePct - (sectorExposure[c.sector] ?? 0)));
 
     if (spendableCash < marketMinimum) {
-      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve (free ${fmt(availableCash)})`);
+      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve${cashReserveUsd > 0 ? ` and ${fmt(cashReserveUsd)} dry powder` : ''} (free ${fmt(availableCash)})`);
       continue;
     }
     if (configuredLimitSize < marketMinimum) {
@@ -2706,9 +2961,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log(`  Tradable: ${fmt(account.tradableUsd)} | Account total: ${fmt(account.totalUsd)} | Open: ${positions.length}`);
   console.log(`  Open risk to stops: ${fmt(openRisk)}${portfolioValue > 0 ? ` (${pct(openRisk / portfolioValue)} of portfolio)` : ''} | Realised today: ${fmt(mem.realizedPnlToday())}`);
   console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.winRate().toFixed(0)}% over ${mem.state.totalTrades} closes`);
+  const funding = mem.state.fundingRequest;
+  if (funding)
+    console.log(`  [FUNDING] Outstanding request: ${fmt(funding.usd)} since ${funding.requestedAt} — "${funding.reasoning}"`);
 }
 
-export { TA, applyPositionAdjustments, updateTradeExtremes, loadConfig, csvField, Memory, fmt, Exchange, runCycle, AiBrain, reportPreflight };
+export { TA, applyPositionAdjustments, updateTradeExtremes, loadConfig, csvField, Memory, fmt, Exchange, runCycle, AiBrain, reportPreflight, normalizeAsset, isStakedBalance };
 export type { TradingConfig };
 
 if (require.main === module)
