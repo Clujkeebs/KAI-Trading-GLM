@@ -713,6 +713,10 @@ export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecis
   let stop = plan.stop;
   let target = plan.target;
 
+  // The model routinely echoes the levels it was shown; only a real change is
+  // worth reporting.
+  const differs = (a: number, b: number) => Math.abs(a - b) > Math.max(b * 1e-4, Number.EPSILON);
+
   if (decision.adjustedStop !== null && Number.isFinite(decision.adjustedStop)) {
     const floor = price * (1 - CONFIG.maxStopDistancePct);
     if (decision.adjustedStop >= price) {
@@ -722,7 +726,7 @@ export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecis
       notes.push(`AI stop ${fmt(decision.adjustedStop)} clamped to the ${pct(CONFIG.maxStopDistancePct)} risk cap at ${fmt(floor)}`);
     } else {
       stop = decision.adjustedStop;
-      notes.push(`using the AI stop ${fmt(stop)} instead of ${fmt(plan.stop)}`);
+      if (differs(stop, plan.stop)) notes.push(`AI stop ${fmt(stop)} replaces ${fmt(plan.stop)}`);
     }
   }
 
@@ -731,7 +735,7 @@ export function applyEntryPlan(plan: TradePlan, price: number, decision: AiDecis
       notes.push(`ignored AI target ${fmt(decision.adjustedTarget)}: not above entry ${fmt(price)}`);
     else {
       target = decision.adjustedTarget;
-      notes.push(`using the AI target ${fmt(target)} instead of ${fmt(plan.target)}`);
+      if (differs(target, plan.target)) notes.push(`AI target ${fmt(target)} replaces ${fmt(plan.target)}`);
     }
   }
 
@@ -1090,7 +1094,7 @@ class Exchange {
       if (matchedQty < holdingQty * 0.99 || matchedCost <= 0) throw new Error('no usable buy history');
       return { price: matchedCost / matchedQty, source: 'Kraken trade history' };
     } catch {
-      console.warn(`  [RECONCILE] ${pair} entry history unavailable; using current price`);
+      console.log(`  [RECONCILE] ${pair} entry history unavailable; using current price for cost basis`);
       return { price: fallback, source: 'current price fallback' };
     }
   }
@@ -1386,6 +1390,13 @@ class Exchange {
           continue;
         }
         if (CONFIG.minTradeUsd !== null && holding.value < CONFIG.minTradeUsd) continue;
+        // Leftover dust from a sale is not a position. Importing it spent a trade
+        // history lookup and an OHLCV fetch, then the dust rule below closed it
+        // again on the same pass and wrote a meaningless trade to the record.
+        if (holding.value < BALANCE_DUST_USD) {
+          console.log(`  [RECONCILE] ${pair} dust ${fmt(holding.value)} left over; ignoring`);
+          continue;
+        }
         const entry = await this.getEntryPrice(pair, holding.qty, holding.price);
         const reason = `Imported from Kraken balance (${entry.source})`;
         // Flat ±5%/±10% bands anchored on the import price meant a holding already
@@ -2442,22 +2453,37 @@ export async function runPreflight(
     add('Account balance', false, `balance fetch failed: ${e.message}`, true);
   }
 
-  // 4. Can the bot buy anything at all? Free cash below every minimum means the
-  //    scan and every AI call it funds are pure cost.
+  // 4. Can the bot buy anything at all? This must measure the *quote* balance a
+  //    USD-quoted order can actually draw on. Totalling every cash equivalent
+  //    counts USDC and USDT that no USD pair can spend, which reported $14.60 of
+  //    buying power against a real free USD balance of $0.05.
   if (account) {
-    const spendable = account.cashUsd * (1 - CONFIG.feeReservePct);
-    const minimums: number[] = [];
-    for (const pair of ALL_PAIRS.slice(0, 5)) {
+    let bestFunded: { pair: string; spendable: number; minimum: number } | null = null;
+    let cheapest: { pair: string; minimum: number } | null = null;
+    let quoteCash = 0;
+    for (const pair of ALL_PAIRS) {
       const price = prices[pair];
       if (price === undefined) continue;
       const minimum = await exchange.getMinimumTradeUsd(pair, price);
-      if (minimum !== null) minimums.push(minimum);
+      if (minimum === null) continue;
+      if (!cheapest || minimum < cheapest.minimum) cheapest = { pair, minimum };
+      const free = exchange.getAvailableCash(pair);
+      if (free === null) continue;
+      quoteCash = Math.max(quoteCash, free);
+      const spendable = free * (1 - CONFIG.feeReservePct);
+      if (spendable >= minimum && (!bestFunded || spendable - minimum > bestFunded.spendable - bestFunded.minimum))
+        bestFunded = { pair, spendable, minimum };
     }
-    const cheapest = minimums.length ? Math.min(...minimums) : null;
-    add('Buying power', cheapest !== null && spendable >= cheapest,
+    const idleCash = Math.max(0, account.cashUsd - quoteCash);
+    const idleNote = idleCash > 0.01
+      ? ` (${fmt(idleCash)} of the ${fmt(account.cashUsd)} cash balance is in stablecoins no USD pair can spend)`
+      : '';
+    add('Buying power', bestFunded !== null,
       cheapest === null
         ? 'could not determine any exchange minimum'
-        : `${fmt(spendable)} spendable vs ${fmt(cheapest)} cheapest minimum — ${spendable >= cheapest ? 'entries are possible' : 'no new entry can be funded'}`);
+        : bestFunded
+          ? `${fmt(bestFunded.spendable)} spendable covers ${bestFunded.pair}'s ${fmt(bestFunded.minimum)} minimum — entries are possible${idleNote}`
+          : `${fmt(quoteCash * (1 - CONFIG.feeReservePct))} spendable vs ${fmt(cheapest.minimum)} for the cheapest pair (${cheapest.pair}) — no new entry can be funded${idleNote}`);
   }
 
   // 5. Exit reachability — a position that cannot be sold has an unenforceable stop.
@@ -2851,6 +2877,18 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
     console.log(`  [BUY CASH] ${c.pair}: ${quoteAsset || 'quote'} available ${fmt(availableCash)} | spendable ${fmt(spendableCash)} | cycle spent ${fmt(spentThisCycle)}`);
 
+    // Affordability is settled before the model is consulted. Asking it to analyse
+    // an entry that cannot be funded burns an API call to be told what the balance
+    // already said — production was doing this three times a cycle, every cycle.
+    if (marketMinimum === null) {
+      console.log(`  [PASS] ${c.pair}: exchange minimum unavailable; cannot size a buy safely`);
+      continue;
+    }
+    if (spendableCash < marketMinimum) {
+      console.log(`  [PASS] ${c.pair}: needs ${fmt(marketMinimum)} but only ${fmt(spendableCash)} is spendable${cashReserveUsd > 0 ? ` after ${fmt(cashReserveUsd)} dry powder` : ''} (free ${fmt(availableCash)}); not asking the AI`);
+      continue;
+    }
+
     const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
       spendableCashUsd: spendableCash,
@@ -2881,10 +2919,6 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     }
 
     const aiSize = portfolioValue * d.positionSizePct / 100;
-    if (marketMinimum === null) {
-      console.log(`  [PASS] ${c.pair}: exchange minimum unavailable; cannot size buy safely`);
-      continue;
-    }
 
     let configuredLimitSize = Number.POSITIVE_INFINITY;
     if (CONFIG.maxExposurePct !== null)
@@ -2897,10 +2931,6 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       configuredLimitSize = Math.min(configuredLimitSize,
         Math.max(0, portfolioValue * CONFIG.maxSectorExposurePct - (sectorExposure[c.sector] ?? 0)));
 
-    if (spendableCash < marketMinimum) {
-      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve${cashReserveUsd > 0 ? ` and ${fmt(cashReserveUsd)} dry powder` : ''} (free ${fmt(availableCash)})`);
-      continue;
-    }
     if (configuredLimitSize < marketMinimum) {
       console.log(`  [PASS] ${c.pair}: configured limits leave ${fmt(configuredLimitSize)}, below exchange minimum ${fmt(marketMinimum)}`);
       continue;

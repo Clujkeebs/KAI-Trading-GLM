@@ -329,7 +329,7 @@ assert.equal(applyEntryPlan(entryPlan, 100, decide()).stop, entryPlan.stop);
 const wider = applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 88 }));
 assert.equal(wider.stop, 88);
 assert.ok(Math.abs(wider.riskPct - 0.12) < 1e-9);
-assert.match(wider.notes.join(' '), /using the AI stop/);
+assert.match(wider.notes.join(' '), /AI stop .* replaces/);
 
 // A tighter stop is honoured too.
 assert.equal(applyEntryPlan(entryPlan, 100, decide({ adjustedStop: 97 })).stop, 97);

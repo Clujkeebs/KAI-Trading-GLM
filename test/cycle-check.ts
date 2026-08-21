@@ -284,6 +284,20 @@ async function main() {
   // And the balance is reported honestly rather than counting holdings as cash.
   assert.match(named(brokeChecks, 'Account balance').detail, /\$0\.0500 free cash \| \$20[0-9.]+ tradable/);
 
+  // ── Dust left over from a sale is not imported as a position ──────────────
+  // Production imported a $0.00002 WLD remnant, then closed it on the same pass
+  // and wrote a meaningless trade to the record.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  fake.balance = {
+    USD: { free: 100, used: 0, total: 100 },
+    LINK: { free: 0.0000004, used: 0, total: 0.0000004 },
+  };
+  const dustMem = new Memory();
+  await live.reconcilePositions(dustMem);
+  assert.equal(dustMem.getOpenPositions().length, 0, 'dust must not become a position');
+  assert.equal(dustMem.state.totalTrades, 0, 'and must not be recorded as a trade');
+
   // ── RISK_OFF means the model declines to deploy capital this cycle ─────────
   // The whole point of the stance call: it can sit in cash and wait for lower
   // prices instead of being forced to answer one pair at a time.
