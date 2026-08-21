@@ -6,6 +6,7 @@ import {
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
+  isExcludedPair,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -574,3 +575,37 @@ assert.match(advice, /Nothing forces your hand here/, 'it must read as guidance,
 setConfig(loadConfig());
 
 console.log('self-check and sizing-guidance checks passed');
+
+// ── Reserved assets are off limits entirely ──────────────────────────────────
+// A hard boundary, deliberately: these are holdings the operator reserved. Being
+// staked is not protection — unstaking would otherwise hand them to the bot.
+setConfig({ ...loadConfig(), excludedAssets: new Set(['SOL', 'AVAX']) });
+assert.equal(isExcludedPair('SOL/USD'), true);
+assert.equal(isExcludedPair('AVAX/USD'), true);
+assert.equal(isExcludedPair('LINK/USD'), false);
+// Kraken's staking names must resolve to the same underlying asset.
+assert.equal(isExcludedPair(`${normalizeAsset('SOL03.S')}/USD`), true);
+assert.equal(isExcludedPair(`${normalizeAsset('AVAX.B')}/USD`), true);
+// A reserved asset must not be reachable through a different quote currency.
+assert.equal(isExcludedPair('SOL/USDC'), true);
+assert.equal(isExcludedPair('SOL/EUR'), true);
+// Nothing is excluded unless it was named.
+setConfig({ ...loadConfig(), excludedAssets: new Set() });
+assert.equal(isExcludedPair('SOL/USD'), false);
+
+// Names are normalised on the way in, so casing and spacing do not defeat it.
+process.env.EXCLUDED_ASSETS = ' sol , avax ';
+const loaded = loadConfig();
+assert.deepEqual([...loaded.excludedAssets].sort(), ['AVAX', 'SOL']);
+delete process.env.EXCLUDED_ASSETS;
+assert.equal(loadConfig().excludedAssets.size, 0);
+
+// The model is told, so it never proposes one in the first place.
+setConfig({ ...loadConfig(), excludedAssets: new Set(['SOL', 'AVAX']), targetPositionCount: 10 });
+const guarded = concentrationNote(1000, 3);
+assert.match(guarded, /RESERVED: AVAX, SOL/);
+assert.match(guarded, /not yours to trade/);
+assert.match(guarded, /around 10 positions/);
+setConfig(loadConfig());
+
+console.log('reserved-asset checks passed');

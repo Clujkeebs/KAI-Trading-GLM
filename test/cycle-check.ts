@@ -558,6 +558,52 @@ async function main() {
   assert.equal(tinyMem.getOpenPositions().length, 0, 'a token-sized request is declined outright');
   assert.equal(fake.orders.filter(o => o.side === 'buy').length, buysBeforeTiny);
 
+  // ── Reserved assets are never traded, even when already held ──────────────
+  // The operator's SOL and AVAX must survive a cycle untouched: not adopted as
+  // positions, not sold, and not counted as capital the bot can deploy.
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  // Earlier scenarios in this file traded SOL, so start the log clean.
+  fs.rmSync(path.join(stateDir, 'trades.csv'), { force: true });
+  setConfig({ ...loadConfig(), excludedAssets: new Set(['SOL', 'AVAX']) });
+  fake.balance = {
+    USD: { free: 300, used: 0, total: 300 },
+    SOL: { free: 5, used: 0, total: 5 },
+    AVAX: { free: 9, used: 0, total: 9 },
+    LINK: { free: 2, used: 0, total: 2 },
+  };
+  const reservedMem = new Memory();
+  // Pretend an earlier run had adopted SOL, with a stop sitting above the market
+  // so it would certainly be sold if the bot still considered it its own.
+  reservedMem.openPosition('SOL/USD', 5, fake.prices['SOL/USD'] * 1.5,
+    fake.prices['SOL/USD'] * 1.4, fake.prices['SOL/USD'] * 2, 'l1', 'legacy', 'legacy');
+  const ordersBefore = fake.orders.length;
+  await runCycle(live, reservedMem, fakeAi('BUY', 25, { stance: 'RISK_ON' }));
+
+  const touched = fake.orders.slice(ordersBefore)
+    .filter(o => o.pair === 'SOL/USD' || o.pair === 'AVAX/USD');
+  assert.deepEqual(touched, [], 'no order may be placed against a reserved asset');
+  assert.equal(reservedMem.positions['SOL/USD'], undefined,
+    'the stale position is released from management, not closed as a trade');
+  assert.ok(!reservedMem.getOpenPositions().some(p => p.pair === 'SOL/USD'));
+  // Releasing must not write a fictitious exit into the record. Other pairs may
+  // legitimately trade in the same cycle, so check the log rather than the count.
+  const tradeLog = fs.existsSync(path.join(stateDir, 'trades.csv'))
+    ? fs.readFileSync(path.join(stateDir, 'trades.csv'), 'utf-8') : '';
+  assert.ok(!/SOL\/USD|AVAX\/USD/.test(tradeLog), 'no reserved asset appears in the trade history');
+  assert.ok(!reservedMem.state.recentTrades.some(t => t.pair === 'SOL/USD' || t.pair === 'AVAX/USD'));
+  // The balances themselves are untouched.
+  assert.equal(fake.balance.SOL.total, 5);
+  assert.equal(fake.balance.AVAX.total, 9);
+
+  // A direct order is refused outright, whatever asks for it. `fake.orders` is
+  // cumulative across this file, so measure only what these two calls placed.
+  const beforeDirect = fake.orders.length;
+  assert.equal(await live.buy('SOL/USD', 50), null, 'buying a reserved asset is refused');
+  assert.equal(await live.sell('SOL/USD', 5), null, 'selling a reserved asset is refused');
+  assert.deepEqual(fake.orders.slice(beforeDirect), [], 'neither reached the exchange');
+  setConfig(loadConfig());
+
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('cycle checks passed');
 }

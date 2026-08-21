@@ -78,6 +78,18 @@ Because that ranking is deterministic, the last slot is reserved for whichever p
 longest without a review. Otherwise the same low-urgency names would be skipped every cycle, and
 a position that is never reviewed can never be trimmed or closed on judgement — only by its stop.
 
+### Reserved assets
+
+`EXCLUDED_ASSETS` names holdings the bot must never touch. Unlike everything else here this is
+a hard boundary rather than guidance — it is about ownership, not strategy. Reserved assets are
+dropped from the watchlist scan, never adopted as positions, refused at the order layer, and
+excluded from the tradable value used for sizing. A position already tracked for one is
+*released* rather than closed, so no fictitious exit is written to the history.
+
+Kraken's staking names resolve to the underlying asset, so `SOL` also covers `SOL03.S` and
+`AVAX` covers `AVAX.B`. Being staked is not protection by itself: unstaking would otherwise hand
+the balance straight to the bot.
+
 ### Concentration
 
 `TARGET_POSITION_COUNT` tells the model how concentrated the operator wants the book. It is
