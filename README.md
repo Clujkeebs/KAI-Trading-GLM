@@ -6,8 +6,10 @@ decisions and Kraken for market data and execution, with live mode enabled by de
 Risk is managed by the bot, not the model: stops and targets are sized from ATR, stops ratchet
 upward as a trade works, and they are never widened — by the AI or by anything else.
 
-Working on this with an AI agent? Read [SOUL.md](SOUL.md) for what the system is for and
-[AGENTS.md](AGENTS.md) for the repo's commands, invariants and conventions.
+Working on this with an AI agent? [SOUL.md](SOUL.md) is the trading model's mandate and
+part of its prompt; [AGENTS.md](AGENTS.md) contains rules for coding agents;
+[CLAUDE.md](CLAUDE.md) is the Claude Code entry point; and [COLLAB.md](COLLAB.md) is the
+shared change log between Devin and Claude Code.
 
 ## Setup
 
@@ -35,6 +37,7 @@ All settings live in `.env` (see `.env.example`):
 - `AI_MAX_TOKENS` — AI completion token budget (default `4000`). Reasoning models spend this on thinking before emitting content, so too small a value truncates every decision; the bot doubles it automatically, up to 16000, when it detects truncation
 - `AI_REASONING_EFFORT` — `off`, `low`, `medium` or `high` (default `low`); caps reasoning so the budget is left for the JSON
 - `AI_BASE_URL` — optional OpenAI-compatible API base URL override; blank uses the provider's configured URL
+- `SOUL_FILE` — optional path override for the trading model's charter (relative paths use the repository root); loaded once at startup and prepended to every decision prompt. Missing or unreadable files warn and leave existing prompts unchanged
 - `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` — required to run (Trade permission only)
 - `PAPER_MODE` — `false` by default for real money; set `true` for simulated trades
 - `PORTFOLIO_VALUE` — starting balance for paper mode, and the fallback when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle. Paper mode tracks simulated cash from here on, so paper results compound

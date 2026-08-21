@@ -6,6 +6,55 @@ import * as path from 'path';
 
 dotenv.config();
 
+export interface SoulCharterLoad {
+  path: string;
+  contents: string | null;
+  size: number;
+  error?: string;
+}
+
+const SOUL_HEADER = "OPERATOR'S TRADING CHARTER — this standing mandate outranks convenience or habit.";
+
+export function resolveSoulFilePath(moduleDir = __dirname, override = process.env.SOUL_FILE): string {
+  const repoRoot = path.resolve(moduleDir, '..');
+  const configured = override?.trim();
+  return configured
+    ? (path.isAbsolute(configured) ? configured : path.resolve(repoRoot, configured))
+    : path.join(repoRoot, 'SOUL.md');
+}
+
+export function loadSoulCharter(filePath: string): SoulCharterLoad {
+  try {
+    const contents = fs.readFileSync(filePath, 'utf8');
+    return { path: filePath, contents, size: contents.length };
+  } catch (error: any) {
+    return {
+      path: filePath,
+      contents: null,
+      size: 0,
+      error: error?.message || String(error),
+    };
+  }
+}
+
+export function composeSystemPrompt(existingPrompt: string, charterContents: string | null): string {
+  if (!charterContents?.trim()) return existingPrompt;
+  const separator = charterContents.endsWith('\n') ? '\n' : '\n\n';
+  return `${SOUL_HEADER}\n\n${charterContents}${separator}${existingPrompt}`;
+}
+
+function initializeSoulCharter(): SoulCharterLoad {
+  const loaded = loadSoulCharter(resolveSoulFilePath());
+  if (loaded.contents === null) {
+    console.warn(`  [SOUL] Trading charter unavailable at ${loaded.path}: ${loaded.error}; continuing with existing prompts`);
+  } else {
+    console.log(`  [SOUL] Trading charter loaded from ${loaded.path} (${loaded.size} characters)`);
+  }
+  return loaded;
+}
+
+const SOUL_CHARTER = initializeSoulCharter();
+
 // ============================================================
 // AI CRYPTO TRADING BOT v2.1 — GLM 5.2 + KRAKEN
 // Single-file, production-ready. Deploy to Railway.
@@ -2320,6 +2369,7 @@ RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Think briefly. Emit the JSON object as your very first output token.
 Keep "reasoning" under 12 words and "counter_case" under 20. Do not restate the data you were given.
 {"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null, "alert_price": number or null, "counter_case": "strongest argument against this", "verdict_holds": true or false}`;
+const DECISION_SYSTEM_PROMPT = composeSystemPrompt(SYSTEM_PROMPT, SOUL_CHARTER.contents);
 
 type AiParseResult = {
   decision: AiDecision | null;
@@ -2509,6 +2559,7 @@ stance in "counter_case", then keep the stance only if it survives that.
 
 Keep "reasoning" under 25 words and "counter_case" under 20.
 {"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this"}`;
+const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents);
 
 export function normalizeStance(json: any): PortfolioStance {
   const raw = String(json?.stance || '').toUpperCase().replace(/[\s-]/g, '_');
@@ -2633,7 +2684,7 @@ HOLD, SELL, or ADJUST?`, pair);
   private async call(prompt: string, pair: string): Promise<AiDecision> {
     const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false, counterCase: '', verdictHolds: true };
     const messages: any[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: DECISION_SYSTEM_PROMPT },
       { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
     ];
     // A salvaged decision is a last resort, not an answer: it carries no position
@@ -2825,7 +2876,7 @@ Best-ranked setups: ${best}
 ${concentration ? `\n${concentration}\n` : ''}
 What is the stance for this cycle?`;
 
-    const json = await this.requestJsonObject(STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
+    const json = await this.requestJsonObject(CHARTERED_STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
     if (!json) {
       console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
       return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
@@ -2875,7 +2926,7 @@ cycle, and it is not your conviction to spend.
 JSON ONLY:
 {"case_for_holding": "the strongest argument to keep it, under 25 words", "still_sell": true or false, "reasoning": "why, under 15 words"}`;
 
-    const json = await this.requestJsonObject(SYSTEM_PROMPT, prompt, `${pair} second opinion`);
+    const json = await this.requestJsonObject(DECISION_SYSTEM_PROMPT, prompt, `${pair} second opinion`);
     if (!json) {
       // No usable answer means no confirmation. Holding is the reversible choice.
       return { confirmed: false, reasoning: 'second opinion unavailable; keeping the position' };
@@ -2902,7 +2953,7 @@ JSON ONLY:
     let latencyTotal = 0;
     let lastError = '';
     const probe = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: DECISION_SYSTEM_PROMPT },
       {
         role: 'user',
         content: `NEW OPPORTUNITY:

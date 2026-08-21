@@ -6,7 +6,7 @@ import {
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
-  isExcludedPair,
+  isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -281,6 +281,16 @@ const reasoningAi = parseAiResponse('', '{"verdict":"SELL","confidence":7,"reaso
 assert.equal(reasoningAi.kind, 'parsed');
 assert.equal(reasoningAi.decision?.verdict, 'SELL');
 assert.equal(parseAiResponse('').kind, 'empty');
+
+const existingPrompt = 'EXISTING SYSTEM PROMPT';
+const charterPrompt = composeSystemPrompt(existingPrompt, 'Stand by the operator.');
+assert.match(charterPrompt, /OPERATOR'S TRADING CHARTER/);
+assert.ok(charterPrompt.includes('Stand by the operator.'));
+assert.ok(charterPrompt.endsWith(existingPrompt));
+assert.equal(composeSystemPrompt(existingPrompt, null), existingPrompt);
+assert.equal(resolveSoulFilePath('/repo/src'), '/repo/SOUL.md');
+assert.equal(resolveSoulFilePath('/repo/dist'), '/repo/SOUL.md');
+assert.equal(loadSoulCharter('/home/ubuntu/does-not-exist/SOUL.md').contents, null);
 
 const reviewPositions = [
   { ...position, pair: 'URGENT/USD', entryPrice: 90, currentPrice: 100, stopLoss: 99, takeProfit: 130 },
