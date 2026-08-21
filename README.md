@@ -38,6 +38,7 @@ All settings live in `.env` (see `.env.example`):
 - `MIN_RR_RATIO` — optional minimum risk/reward filter; disabled by default
 - `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor for buy decisions from 1–10; disabled by default
 - `AI_SELL_CONFIDENCE_THRESHOLD` — optional AI confidence floor for sell decisions from 1–10; disabled by default
+- `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
 
 The AI owns position sizing and requests a portfolio percentage. By default, the bot's
 self-imposed risk, exposure, R/R, confidence, and minimum-size guardrails are **off**.

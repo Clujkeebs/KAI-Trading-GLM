@@ -43,10 +43,10 @@ interface TradeRecord {
   pnlUsd: number; pnlPct: number; status: string;
   sector: string; reason: string; aiVerdict: string; aiConfidence: number;
 }
-interface OrderFill { qty: number; price: number }
+interface OrderFill { qty: number; price: number; feeUsd: number }
 interface BotState {
   startedAt: string; totalTrades: number; wins: number; losses: number;
-  totalPnl: number; bestTrade: string; worstTrade: string;
+  totalPnl: number; bestTrade: number | null; worstTrade: number | null;
   lastScan: string; lastAiDecision: string; cycleCount: number;
 }
 
@@ -64,6 +64,7 @@ type TradingConfig = {
   aiConfidenceThreshold: number | null;
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
+  feeReservePct: number;
   loopMode: boolean;
 };
 let CONFIG: TradingConfig;
@@ -116,6 +117,7 @@ function loadConfig(): TradingConfig {
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
+    feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     loopMode,
   };
 }
@@ -124,6 +126,7 @@ const BALANCE_DUST_USD = 1;
 const POSITION_QTY_TOLERANCE_PCT = 0.01;
 const IMPORTED_POSITION_STOP_PCT = 0.05;
 const IMPORTED_POSITION_TARGET_PCT = 0.10;
+const REQUEST_TIMEOUT_MS = 20_000;
 
 const WATCHLIST: Record<string, string[]> = {
   ai: ['VIRTUAL/USD', 'RENDER/USD', 'FET/USD', 'TAO/USD'],
@@ -200,12 +203,16 @@ async function withRetry<T>(label: string, operation: () => Promise<T>, attempts
 const TA = {
   rsi(closes: number[], period = 14): number {
     if (closes.length < period + 1) return 50;
-    const deltas: number[] = [];
-    for (let i = 1; i < closes.length; i++) deltas.push(closes[i] - closes[i - 1]);
-    const recent = deltas.slice(-period);
-    const avgGain = recent.filter(d => d > 0).reduce((a, b) => a + b, 0) / period;
-    const avgLoss = recent.filter(x => x < 0).reduce((a, b) => a + Math.abs(b), 0) / period;
+    const deltas = closes.slice(1).map((close, i) => close - closes[i]);
+    let avgGain = deltas.slice(0, period).filter(d => d > 0).reduce((a, b) => a + b, 0) / period;
+    let avgLoss = deltas.slice(0, period).filter(d => d < 0).reduce((a, b) => a + Math.abs(b), 0) / period;
+    for (const delta of deltas.slice(period)) {
+      avgGain = (avgGain * (period - 1) + Math.max(delta, 0)) / period;
+      avgLoss = (avgLoss * (period - 1) + Math.max(-delta, 0)) / period;
+    }
+    if (avgGain === 0 && avgLoss === 0) return 50;
     if (avgLoss === 0) return 100;
+    if (avgGain === 0) return 0;
     return parseFloat((100 - 100 / (1 + avgGain / avgLoss)).toFixed(2));
   },
 
@@ -304,6 +311,34 @@ const TA = {
   },
 };
 
+function applyPositionAdjustments(
+  position: Position,
+  adjustedStop: number | null,
+  adjustedTarget: number | null
+): { stop: number | null; target: number | null; rejected: string[] } {
+  let stop: number | null = null;
+  let target: number | null = null;
+  const rejected: string[] = [];
+  if (adjustedStop !== null) {
+    if (!Number.isFinite(adjustedStop) || adjustedStop <= 0 || adjustedStop >= position.currentPrice)
+      rejected.push(`stop ${fmt(adjustedStop)} is not below current price ${fmt(position.currentPrice)}`);
+    else if (adjustedStop <= position.stopLoss)
+      rejected.push(`stop ${fmt(adjustedStop)} would loosen the existing stop ${fmt(position.stopLoss)}`);
+    else stop = adjustedStop;
+  }
+  if (adjustedTarget !== null) {
+    if (!Number.isFinite(adjustedTarget) || adjustedTarget <= position.currentPrice)
+      rejected.push(`target ${fmt(adjustedTarget)} is not above current price ${fmt(position.currentPrice)}`);
+    else target = adjustedTarget;
+  }
+  return { stop, target, rejected };
+}
+
+function updateTradeExtremes(state: BotState, pnl: number): void {
+  if (pnl > 0 && (state.bestTrade === null || pnl > state.bestTrade)) state.bestTrade = pnl;
+  if (pnl < 0 && (state.worstTrade === null || pnl < state.worstTrade)) state.worstTrade = pnl;
+}
+
 // ============================================================
 // EXCHANGE CLIENT — Kraken via ccxt (paper or live)
 // ============================================================
@@ -315,10 +350,11 @@ class Exchange {
   private balanceLoaded = false;
   private marketsLoaded = false;
   private cyclePrices: Record<string, number> = {};
+  private cycleTickers: Record<string, { price: number; volume24h: number }> = {};
 
   constructor(apiKey?: string, apiSecret?: string, paperMode = true) {
     this.paper = paperMode;
-    const opts: Record<string, any> = { enableRateLimit: true };
+    const opts: Record<string, any> = { enableRateLimit: true, timeout: REQUEST_TIMEOUT_MS };
     if (!paperMode) {
       if (!apiKey || !apiSecret) throw new Error('KRAKEN_API_KEY and KRAKEN_API_SECRET required for live mode');
       opts.apiKey = apiKey;
@@ -331,9 +367,15 @@ class Exchange {
   }
 
   async getPrice(pair: string): Promise<number | null> {
+    if (this.cyclePrices[pair] !== undefined) return this.cyclePrices[pair];
     try {
       const t = await withRetry<any>(`ticker ${pair}`, () => this.ex.fetchTicker(pair));
-      return t.last ?? t.close ?? null;
+      const price = t.last ?? t.close ?? null;
+      if (price !== null) {
+        this.cyclePrices[pair] = price;
+        this.cycleTickers[pair] = { price, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+      }
+      return price;
     } catch (e) {
       console.warn(`[EXCHANGE] Price unavailable for ${pair}: ${e instanceof Error ? e.message : String(e)}`);
       return null;
@@ -341,9 +383,13 @@ class Exchange {
   }
 
   async getTicker(pair: string): Promise<{ price: number; volume24h: number } | null> {
+    if (this.cycleTickers[pair]) return this.cycleTickers[pair];
     try {
       const t = await withRetry<any>(`ticker ${pair}`, () => this.ex.fetchTicker(pair));
-      return { price: t.last ?? t.close ?? 0, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+      const ticker = { price: t.last ?? t.close ?? 0, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+      this.cyclePrices[pair] = ticker.price;
+      this.cycleTickers[pair] = ticker;
+      return ticker;
     } catch (e) {
       console.warn(`[EXCHANGE] Ticker unavailable for ${pair}: ${e instanceof Error ? e.message : String(e)}`);
       return null;
@@ -362,6 +408,30 @@ class Exchange {
 
   async getPricesBatch(pairs: string[]): Promise<Record<string, number>> {
     const out: Record<string, number> = {};
+    try {
+      await this.ensureMarkets();
+      if (this.ex.has?.fetchTickers) {
+        const tickers = await withRetry<any>(`tickers batch`, () => this.ex.fetchTickers(pairs));
+        for (const pair of pairs) {
+          const t = tickers[pair] || Object.values(tickers).find((value: any) => value?.symbol === pair);
+          const price = t?.last ?? t?.close ?? null;
+          if (price !== null) {
+            const ticker = { price, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+            out[pair] = price;
+            this.cyclePrices[pair] = price;
+            this.cycleTickers[pair] = ticker;
+          }
+        }
+        for (const pair of pairs) {
+          if (out[pair] !== undefined) continue;
+          const price = await this.getPrice(pair);
+          if (price !== null) out[pair] = price;
+        }
+        return out;
+      }
+    } catch (e) {
+      console.warn(`[EXCHANGE] Bulk tickers unavailable: ${e instanceof Error ? e.message : String(e)}; using per-pair requests`);
+    }
     for (const p of pairs) {
       const pr = await this.getPrice(p);
       if (pr !== null) out[p] = pr;
@@ -374,6 +444,11 @@ class Exchange {
     const price = await this.getPrice(pair);
     if (price !== null) this.cyclePrices[pair] = price;
     return price;
+  }
+
+  beginCycle() {
+    this.cyclePrices = {};
+    this.cycleTickers = {};
   }
 
   private async ensureMarkets(): Promise<void> {
@@ -439,19 +514,25 @@ class Exchange {
       .reduce((sum, { qty }) => sum + qty, 0);
   }
 
-  private getCashField(balance: any, field: string): number {
+  private getAssetField(balance: any, assetName: string, field: string): number {
+    const wanted = normalizeAsset(assetName);
     let found = false;
     let total = 0;
     for (const [asset, value] of Object.entries(balance || {})) {
-      if (!this.isCashEquivalent(asset) || !value || typeof value !== 'object') continue;
+      if (['free', 'used', 'total', 'info'].includes(asset) || isStakedBalance(asset) ||
+          normalizeAsset(asset) !== wanted || !value || typeof value !== 'object') continue;
       const amount = Number((value as any)[field]);
-      if (Number.isFinite(amount)) { total += amount; found = true; }
+      if (Number.isFinite(amount)) {
+        total += amount;
+        found = true;
+      }
     }
     if (found) return total;
     const bucket = balance?.[field];
     if (!bucket || typeof bucket !== 'object') return 0;
+    total = 0;
     for (const [asset, value] of Object.entries(bucket)) {
-      if (!this.isCashEquivalent(asset)) continue;
+      if (isStakedBalance(asset) || normalizeAsset(asset) !== wanted) continue;
       const amount = Number(value);
       if (Number.isFinite(amount)) total += amount;
     }
@@ -514,7 +595,7 @@ class Exchange {
     }
   }
 
-  private orderFill(order: any, fallbackQty: number, fallbackPrice: number): OrderFill {
+  private orderFill(order: any, fallbackQty: number, fallbackPrice: number, pair: string): OrderFill {
     const filledQty = Number(order?.filled);
     const orderQty = Number(order?.amount);
     const cost = Number(order?.cost);
@@ -525,14 +606,33 @@ class Exchange {
     const price = Number.isFinite(average) && average > 0
       ? average : Number.isFinite(orderPrice) && orderPrice > 0
         ? orderPrice : Number.isFinite(cost) && cost > 0 && qty > 0 ? cost / qty : fallbackPrice;
-    return { qty, price };
+    const market = this.ex.market(pair);
+    const fees = order?.fees?.length ? order.fees : order?.fee ? [order.fee] : [];
+    const feeUsd = fees.reduce((sum: number, fee: any) => {
+      const feeCost = Number(fee?.cost);
+      if (!Number.isFinite(feeCost) || feeCost <= 0) return sum;
+      const currency = normalizeAsset(String(fee?.currency || ''));
+      const base = normalizeAsset(market?.base || '');
+      const quote = normalizeAsset(market?.quote || '');
+      if (currency === quote || CASH_EQUIVALENTS.has(currency)) return sum + feeCost;
+      if (currency === base) return sum + feeCost * price;
+      return sum;
+    }, 0);
+    return { qty, price, feeUsd };
   }
 
-  private async normalizeOrderAmount(pair: string, qty: number, price: number): Promise<number | null> {
+  private async normalizeOrderAmount(pair: string, qty: number, price: number, truncate = false): Promise<number | null> {
     try {
       await this.ensureMarkets();
       const market = this.ex.market(pair);
-      const amount = Number(this.ex.amountToPrecision(pair, qty));
+      const precisionMode = this.ex.precisionMode;
+      if (truncate) this.ex.precisionMode = ccxt.TRUNCATE;
+      let amount: number;
+      try {
+        amount = Number(this.ex.amountToPrecision(pair, qty));
+      } finally {
+        this.ex.precisionMode = precisionMode;
+      }
       const minAmount = Number(market?.limits?.amount?.min || 0);
       const minCost = Number(market?.limits?.cost?.min || 0);
       if (!Number.isFinite(amount) || amount <= 0) {
@@ -578,9 +678,18 @@ class Exchange {
     }
   }
 
-  getAvailableCash(): number | null {
+  getAvailableCash(pair: string): number | null {
     if (!this.balanceLoaded || !this.cycleBalance) return null;
-    return this.getCashField(this.cycleBalance, 'free');
+    const market = this.ex.market(pair);
+    if (!market?.quote) return null;
+    return this.getAssetField(this.cycleBalance, market.quote, 'free');
+  }
+
+  getAvailableBase(pair: string): number | null {
+    if (!this.balanceLoaded || !this.cycleBalance) return null;
+    const market = this.ex.market(pair);
+    if (!market?.base) return null;
+    return this.getAssetField(this.cycleBalance, market.base, 'free');
   }
 
   private syncPositionQuantity(mem: Memory, pair: string, qty: number, currentPrice?: number) {
@@ -602,12 +711,12 @@ class Exchange {
       const qty = usd / price;
       if (this.paper) {
         console.log(`  [PAPER BUY] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(usd)}`);
-        return { qty, price };
+        return { qty, price, feeUsd: 0 };
       }
       const orderQty = await this.normalizeOrderAmount(pair, qty, price);
       if (orderQty === null) return null;
       const order = await this.ex.createMarketBuyOrder(pair, orderQty);
-      const fill = this.orderFill(order, orderQty, price);
+      const fill = this.orderFill(order, orderQty, price, pair);
       console.log(`  [LIVE BUY] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
       return fill;
     } catch (e: any) { console.error(`  [BUY FAIL] ${pair}: ${e.message}`); return null; }
@@ -619,12 +728,17 @@ class Exchange {
       if (!price) return null;
       if (this.paper) {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
-        return { qty, price };
+        return { qty, price, feeUsd: 0 };
       }
-      const orderQty = await this.normalizeOrderAmount(pair, qty, price);
+      const availableBase = this.getAvailableBase(pair);
+      if (availableBase === null || availableBase <= 0) {
+        console.warn(`  [ORDER SKIP] ${pair}: no free base balance available for sell`);
+        return null;
+      }
+      const orderQty = await this.normalizeOrderAmount(pair, Math.min(qty, availableBase), price, true);
       if (orderQty === null) return null;
       const order = await this.ex.createMarketSellOrder(pair, orderQty);
-      const fill = this.orderFill(order, orderQty, price);
+      const fill = this.orderFill(order, orderQty, price, pair);
       console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
       return fill;
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
@@ -744,11 +858,15 @@ class Memory {
 
   constructor() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    this.state = this.loadJson<BotState>(STATE_FILE, {
+    const saved = this.loadJson<Partial<BotState>>(STATE_FILE, {});
+    this.state = {
       startedAt: new Date().toISOString(), totalTrades: 0, wins: 0, losses: 0,
-      totalPnl: 0, bestTrade: '', worstTrade: '',
+      totalPnl: 0, bestTrade: null, worstTrade: null,
       lastScan: '', lastAiDecision: '', cycleCount: 0,
-    });
+      ...saved,
+    };
+    this.state.bestTrade = typeof saved.bestTrade === 'number' ? saved.bestTrade : null;
+    this.state.worstTrade = typeof saved.worstTrade === 'number' ? saved.worstTrade : null;
     this.positions = this.loadJson<Record<string, Position>>(POSITIONS_FILE, {});
   }
 
@@ -766,21 +884,21 @@ class Memory {
   savePositions() { this.saveAtomic(POSITIONS_FILE, this.positions); }
   saveState() { this.saveAtomic(STATE_FILE, this.state); }
 
-  openPosition(pair: string, qty: number, price: number, sl: number, tp: number, sector: string, reason: string, aiReason: string) {
+  openPosition(pair: string, qty: number, price: number, sl: number, tp: number, sector: string, reason: string, aiReason: string, feeUsd = 0) {
     const pos: Position = {
       pair, status: 'open', sector, entryPrice: price, qty,
-      costBasisUsd: +(qty * price).toFixed(2), stopLoss: sl, takeProfit: tp,
+      costBasisUsd: +(qty * price + feeUsd).toFixed(2), stopLoss: sl, takeProfit: tp,
       currentPrice: price, reason, aiReasoning: aiReason, openedAt: new Date().toISOString(),
     };
     this.positions[pair] = pos;
     this.savePositions();
   }
 
-  closePosition(pair: string, exitPrice: number, reason: string): Position | null {
+  closePosition(pair: string, exitPrice: number, reason: string, feeUsd = 0): Position | null {
     const p = this.positions[pair];
     if (!p || p.status !== 'open') return null;
     p.exitPrice = exitPrice;
-    p.exitValueUsd = +(p.qty * exitPrice).toFixed(2);
+    p.exitValueUsd = +(p.qty * exitPrice - feeUsd).toFixed(2);
     p.pnlUsd = +(p.exitValueUsd - p.costBasisUsd).toFixed(2);
     p.pnlPct = +((p.pnlUsd / p.costBasisUsd) * 100).toFixed(2);
     p.status = 'closed';
@@ -790,13 +908,10 @@ class Memory {
     this.state.totalPnl += p.pnlUsd;
     if (p.pnlUsd > 0) {
       this.state.wins++;
-      if (!this.state.bestTrade || p.pnlUsd > parseFloat(this.state.bestTrade.split(':')[1]))
-        this.state.bestTrade = `${pair}:+$${p.pnlUsd}`;
     } else {
       this.state.losses++;
-      if (!this.state.worstTrade || p.pnlUsd < -parseFloat(this.state.worstTrade.split(':')[1]))
-        this.state.worstTrade = `${pair}:-$${Math.abs(p.pnlUsd)}`;
     }
+    updateTradeExtremes(this.state, p.pnlUsd);
     this.savePositions(); this.saveState();
     return p;
   }
@@ -834,8 +949,8 @@ class Memory {
       `I am an AI crypto trading bot. Running since ${this.state.startedAt}.`,
       `Total trades: ${this.state.totalTrades} | Wins: ${this.state.wins} | Losses: ${this.state.losses}`,
       `Total P/L: ${fmt(this.state.totalPnl)} | Win rate: ${wr}%`,
-      this.state.bestTrade ? `Best trade: ${this.state.bestTrade}` : '',
-      this.state.worstTrade ? `Worst trade: ${this.state.worstTrade}` : '',
+      this.state.bestTrade !== null ? `Best trade: ${fmt(this.state.bestTrade)}` : '',
+      this.state.worstTrade !== null ? `Worst trade: ${fmt(this.state.worstTrade)}` : '',
       `Cycles completed: ${this.state.cycleCount}`, '',
     ];
     if (open.length > 0) {
@@ -910,6 +1025,8 @@ class AiBrain {
       apiKey,
       baseURL: urls[provider] || urls.openrouter,
       defaultHeaders: Object.keys(headers).length ? headers : undefined,
+      timeout: REQUEST_TIMEOUT_MS,
+      maxRetries: 0,
     });
     this.model = model;
     this.memory = memory;
@@ -966,8 +1083,9 @@ HOLD, SELL, or ADJUST?`, pair);
       const raw = res.choices[0]?.message?.content?.trim();
       if (!raw) { console.warn(`[AI] Empty response for ${pair}`); return fallback; }
       const json = JSON.parse(raw.replace(/```json?\n?/g, '').replace(/```/g, '').trim());
+      const verdict = String(json.verdict || '').toUpperCase();
       const d: AiDecision = {
-        verdict: json.verdict?.toUpperCase() || 'HOLD',
+        verdict: verdict === 'BUY' || verdict === 'SELL' || verdict === 'HOLD' ? verdict : 'HOLD',
         confidence: Math.min(10, Math.max(1, parseInt(json.confidence) || 5)),
         reasoning: json.reasoning || 'No reason',
         positionSizePct: Math.max(0, Number(json.position_size_pct) || 0),
@@ -1021,7 +1139,7 @@ async function main() {
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
-  console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')}`);
+  console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
   const memory = new Memory();
@@ -1065,6 +1183,7 @@ async function main() {
 }
 
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
+  exchange.beginCycle();
   // ── RECONCILE LIVE BALANCE ──
   if (!exchange.paper) await exchange.reconcilePositions(mem);
 
@@ -1086,7 +1205,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.warn(`  [ALERT] ${alert.action}: ${alert.pair} — ${alert.reason}`);
       const fill = await exchange.sell(alert.pair, pos.qty);
       if (fill) {
-        const closed = mem.closePosition(alert.pair, fill.price, alert.reason);
+        const closed = mem.closePosition(alert.pair, fill.price, alert.reason, fill.feeUsd);
         if (closed) mem.logTrade({
           timestamp: new Date().toISOString(), pair: alert.pair, side: 'SELL',
           price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
@@ -1115,7 +1234,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
             const fill = await exchange.sell(pos.pair, pos.qty);
             if (fill) {
               const reason = `AI: ${d.reasoning}`;
-              const closed = mem.closePosition(pos.pair, fill.price, reason);
+              const closed = mem.closePosition(pos.pair, fill.price, reason, fill.feeUsd);
               if (closed) mem.logTrade({
                 timestamp: new Date().toISOString(), pair: pos.pair, side: 'SELL',
                 price: fill.price, qty: fill.qty, costBasisUsd: pos.costBasisUsd,
@@ -1127,8 +1246,19 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           }
         }
         if (mem.positions[pos.pair]?.status === 'open') {
-          if (d.adjustedStop) { pos.stopLoss = d.adjustedStop; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} stop → ${fmt(d.adjustedStop)}`); }
-          if (d.adjustedTarget) { pos.takeProfit = d.adjustedTarget; mem.savePositions(); console.log(`  [ADJUST] ${pos.pair} target → ${fmt(d.adjustedTarget)}`); }
+          const adjustments = applyPositionAdjustments(pos, d.adjustedStop, d.adjustedTarget);
+          for (const rejection of adjustments.rejected)
+            console.warn(`  [ADJUST REJECT] ${pos.pair}: ${rejection}`);
+          if (adjustments.stop !== null) {
+            pos.stopLoss = adjustments.stop;
+            mem.savePositions();
+            console.log(`  [ADJUST] ${pos.pair} stop → ${fmt(adjustments.stop)}`);
+          }
+          if (adjustments.target !== null) {
+            pos.takeProfit = adjustments.target;
+            mem.savePositions();
+            console.log(`  [ADJUST] ${pos.pair} target → ${fmt(adjustments.target)}`);
+          }
         }
       } catch (e) {
         console.warn(`  [PHASE 1] ${pos.pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -1147,11 +1277,13 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   let aiBudget = CONFIG.aiDecisionsPerCycle;
   const candidates: Array<{ pair: string; sector: string; ta: TechnicalAnalysis; vol: number }> = [];
 
-  for (const pair of canOpen ? ALL_PAIRS : []) {
+  const scanPairs = canOpen ? ALL_PAIRS : [];
+  const scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
+  for (const pair of scanPairs) {
     try {
       if (holding.has(pair)) continue;
-      const price = await exchange.getPrice(pair);
-      if (price === null) continue;
+      const price = scanPrices[pair];
+      if (price === undefined) continue;
       const candles = await exchange.getOhlcv(pair, '1h', 200);
       if (candles.length < 50) continue;
       const ta = TA.full(candles, price);
@@ -1198,14 +1330,15 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
     const riskPct = risk > 0 ? risk / c.ta.currentPrice : 0;
     const aiSize = portfolioValue * d.positionSizePct / 100;
-    const availableCash = exchange.getAvailableCash() ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
+    const availableCash = exchange.getAvailableCash(c.pair) ?? (exchange.paper ? Math.max(0, portfolioValue - exposure) : 0);
+    const spendableCash = availableCash * (1 - CONFIG.feeReservePct);
     const exposureRoom = CONFIG.maxExposurePct === null
       ? Number.POSITIVE_INFINITY
       : Math.max(0, portfolioValue * CONFIG.maxExposurePct - exposure);
     const marketMinimum = await exchange.getMinimumTradeUsd(c.pair, c.ta.currentPrice);
     if (marketMinimum === null) continue;
 
-    let maxAllowedSize = Math.min(availableCash, exposureRoom);
+    let maxAllowedSize = Math.min(spendableCash, exposureRoom);
     if (CONFIG.maxRiskPerTradePct !== null && riskPct > 0)
       maxAllowedSize = Math.min(maxAllowedSize, portfolioValue * CONFIG.maxRiskPerTradePct / riskPct);
     if (CONFIG.maxPortfolioRiskPct !== null && riskPct > 0)
@@ -1215,8 +1348,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.log(`  [PASS] ${c.pair}: AI requested zero position size`);
       continue;
     }
-    if (availableCash < marketMinimum) {
-      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds available cash ${fmt(availableCash)}`);
+    if (spendableCash < marketMinimum) {
+      console.log(`  [PASS] ${c.pair}: exchange minimum ${fmt(marketMinimum)} exceeds spendable cash ${fmt(spendableCash)} after fee reserve (free ${fmt(availableCash)})`);
       continue;
     }
     if (finalSize < marketMinimum) {
@@ -1235,9 +1368,9 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     if (shutdownRequested) break;
     const fill = await exchange.buy(c.pair, finalSize);
     if (fill) {
-      const costBasisUsd = +(fill.qty * fill.price).toFixed(2);
+      const costBasisUsd = +(fill.qty * fill.price + fill.feeUsd).toFixed(2);
       mem.openPosition(c.pair, fill.qty, fill.price, sl, tp, c.sector,
-        `RSI=${c.ta.rsi} ${c.ta.trend} R/R=${rr.toFixed(1)}`, d.reasoning);
+        `RSI=${c.ta.rsi} ${c.ta.trend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: c.pair, side: 'BUY',
         price: fill.price, qty: fill.qty, costBasisUsd, stopLoss: sl, takeProfit: tp,
@@ -1264,4 +1397,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log(`  P/L: ${fmt(mem.state.totalPnl)} | Win rate: ${mem.state.totalTrades > 0 ? ((mem.state.wins / mem.state.totalTrades) * 100).toFixed(0) : 0}%`);
 }
 
-main().catch(e => { console.error('FATAL:', e); process.exit(1); });
+export { TA, applyPositionAdjustments, updateTradeExtremes };
+
+if (require.main === module)
+  main().catch(e => { console.error('FATAL:', e); process.exit(1); });

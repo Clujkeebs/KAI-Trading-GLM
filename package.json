@@ -8,7 +8,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts --once",
     "dev:loop": "tsx src/index.ts --loop",
-    "test": "tsx src/index.ts --once"
+    "test": "tsx test/logic-check.ts"
   },
   "dependencies": {
     "ccxt": "4.5.0",
