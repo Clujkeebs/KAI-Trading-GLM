@@ -4,7 +4,7 @@ import {
   TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse,
   planTrade, trailingStop, scoreSetup, closedCandles, isRetryableError,
   csvField, fmt, setConfig, loadConfig, normalizeAsset, isStakedBalance,
-  normalizeStance, applyEntryPlan,
+  normalizeStance, applyEntryPlan, normalizeTrimFraction,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -351,3 +351,29 @@ assert.ok(retarget.rr > entryPlan.rr, 'a higher target improves the stated rewar
 assert.equal(applyEntryPlan(entryPlan, 100, decide({ adjustedTarget: 90 })).target, entryPlan.target);
 
 console.log('stance and entry-plan checks passed');
+
+// ── Partial exits ────────────────────────────────────────────────────────────
+// trim_pct lets the model take some profit or raise cash without abandoning a
+// thesis. Anything missing or nonsensical means a full exit, never a silent
+// partial one.
+assert.equal(normalizeTrimFraction(40), 0.4);
+assert.equal(normalizeTrimFraction(100), 1);
+assert.equal(normalizeTrimFraction(250), 1, 'over 100% is still just the whole position');
+assert.equal(normalizeTrimFraction(null), 1);
+assert.equal(normalizeTrimFraction(undefined), 1);
+assert.equal(normalizeTrimFraction('60'), 0.6);
+assert.equal(normalizeTrimFraction(0), 1, 'a zero trim is meaningless, so exit fully');
+assert.equal(normalizeTrimFraction(-10), 1);
+assert.equal(normalizeTrimFraction('nonsense'), 1);
+
+const trimmed = parseAiResponse('{"verdict":"SELL","confidence":8,"reasoning":"take some profit","trim_pct":35}');
+assert.equal(trimmed.decision?.verdict, 'SELL');
+assert.equal(trimmed.decision?.trimFraction, 0.35);
+const fullExit = parseAiResponse('{"verdict":"SELL","confidence":9,"reasoning":"thesis broken"}');
+assert.equal(fullExit.decision?.trimFraction, 1, 'no trim_pct means the whole position');
+// A truncated reply must not be read as a partial exit it never expressed.
+const cutOff = parseAiResponse('{"verdict":"SELL","confidence":9,"reasoning":"thesis brok');
+assert.equal(cutOff.kind, 'salvaged');
+assert.equal(cutOff.decision?.trimFraction, 1);
+
+console.log('trim checks passed');

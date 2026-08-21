@@ -36,6 +36,8 @@ export interface TechnicalAnalysis {
 export interface AiDecision {
   verdict: 'BUY' | 'HOLD' | 'SELL'; confidence: number; reasoning: string;
   positionSizePct: number; adjustedStop: number | null; adjustedTarget: number | null;
+  /** Fraction of the position a SELL should close, 0-1. Defaults to all of it. */
+  trimFraction: number;
 }
 interface BuyContext {
   portfolioValueUsd: number;
@@ -1879,10 +1881,16 @@ YOUR MEMORY:
 You remember all past trades, your win rate, what strategies worked. Learn from mistakes.
 If a sector keeps losing money, reduce allocation.
 
+SELLING PART OF A POSITION:
+On a SELL you may set "trim_pct" to the percentage of that position to sell, from 1
+to 100. Omit it, or use 100, to exit completely. Use a partial trim to take some
+profit while staying in a winner, or to raise cash toward the reserve you asked for
+in your stance without abandoning a thesis you still believe.
+
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Think briefly. Emit the JSON object as your very first output token.
 Keep "reasoning" under 12 words. Do not restate the data you were given.
-{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null}`;
+{"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null}`;
 
 type AiParseResult = {
   decision: AiDecision | null;
@@ -1927,6 +1935,13 @@ function extractJsonObject(text: string): string | null {
   return null;
 }
 
+/** trim_pct arrives as 0-100; anything missing or unusable means a full exit. */
+export function normalizeTrimFraction(value: unknown): number {
+  const percent = Number(value);
+  if (!Number.isFinite(percent) || percent <= 0) return 1;
+  return Math.min(1, percent / 100);
+}
+
 function normalizeAiDecision(json: any, salvage = false): AiDecision {
   const verdict = String(json?.verdict || '').toUpperCase();
   const confidenceValue = Number(json?.confidence);
@@ -1944,6 +1959,9 @@ function normalizeAiDecision(json: any, salvage = false): AiDecision {
     positionSizePct: salvage ? 0 : Math.max(0, Number(json?.position_size_pct) || 0),
     adjustedStop,
     adjustedTarget,
+    // A salvaged reply lost its tail, so assume a full exit rather than guessing
+    // at a partial one from an incomplete payload.
+    trimFraction: salvage ? 1 : normalizeTrimFraction(json?.trim_pct),
   };
 }
 
@@ -2123,9 +2141,9 @@ A position percentage that translates below the pair minimum will be raised to t
 BUY or HOLD?`, pair);
   }
 
-  async review(pair: string, ta: TechnicalAnalysis): Promise<AiDecision> {
+  async review(pair: string, ta: TechnicalAnalysis, cashNote = ''): Promise<AiDecision> {
     const p = this.memory.positions[pair];
-    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
+    if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
     const percent = p.costBasisUsd > 0 ? (pnl / p.costBasisUsd) * 100 : 0;
     const days = ((Date.now() - new Date(p.openedAt).getTime()) / 86400000).toFixed(1);
@@ -2141,6 +2159,7 @@ Supports: ${ta.supports.join(', ') || 'none'} | Resistances: ${ta.resistances.jo
 
 The bot already trails the stop upward on its own; only propose adjusted_stop if you
 want it tighter than the value above. Stops are never widened.
+${cashNote}
 
 Buy reason: ${p.reason}
 AI reasoning at entry: ${p.aiReasoning}
@@ -2149,7 +2168,7 @@ HOLD, SELL, or ADJUST?`, pair);
   }
 
   private async call(prompt: string, pair: string): Promise<AiDecision> {
-    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null };
+    const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1 };
     const messages: any[] = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
@@ -2668,17 +2687,22 @@ async function main() {
 async function executeExit(
   exchange: Exchange, mem: Memory, pair: string,
   reason: string, aiVerdict: string, aiConfidence: number,
+  fraction = 1,
 ): Promise<boolean> {
   const pos = mem.positions[pair];
   if (!pos || pos.status !== 'open') return false;
-  const requestedQty = pos.qty;
   const { stopLoss, takeProfit, costBasisUsd, sector } = pos;
+  const positionQty = pos.qty;
+  // A deliberate trim and a partial fill land in the same place below: whatever is
+  // left over stays open unless it is too small to be worth holding.
+  const requestedQty = fraction >= 1 ? positionQty : Math.min(positionQty, positionQty * fraction);
+  if (!(requestedQty > 0)) return false;
 
   const fill = await exchange.sell(pair, requestedQty);
   if (!fill) return false;
 
   const soldQty = Math.min(fill.qty, requestedQty);
-  const residualQty = requestedQty - soldQty;
+  const residualQty = positionQty - soldQty;
   const residualValue = residualQty * fill.price;
   if (exchange.paper) mem.adjustPaperCash(soldQty * fill.price - fill.feeUsd);
 
@@ -2733,6 +2757,18 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   console.log('\n── PHASE 1: Check positions ──');
   const open = mem.getOpenPositions();
 
+  // The cash target the model set last cycle is only half a lever if it can merely
+  // block buying. When the account is below that target the only way to reach it is
+  // to sell something, so the review is told how far short it is and can trim.
+  const standingStance = mem.state.lastStance;
+  const cashTargetUsd = standingStance ? account.tradableUsd * standingStance.cashTargetPct : 0;
+  const cashShortfallUsd = Math.max(0, cashTargetUsd - account.cashUsd);
+  const cashNote = standingStance && cashShortfallUsd > 0
+    ? `CASH TARGET: you asked to hold ${pct(standingStance.cashTargetPct)} of the portfolio in cash (${fmt(cashTargetUsd)}). The account holds ${fmt(account.cashUsd)}, so it is ${fmt(cashShortfallUsd)} short. Selling is the only way to close that gap — SELL with a "trim_pct" if you want to raise cash from this position, or HOLD if you would rather stay invested here and raise it elsewhere.`
+    : '';
+  if (cashShortfallUsd > 0 && open.length > 0)
+    console.log(`  [CASH TARGET] ${fmt(account.cashUsd)} held vs ${fmt(cashTargetUsd)} target (${pct(standingStance!.cashTargetPct)}); ${fmt(cashShortfallUsd)} short — trims are available to the AI this cycle`);
+
   if (open.length > 0) {
     const prices = await exchange.getPricesBatch(open.map(p => p.pair));
     mem.updatePrices(prices);
@@ -2772,12 +2808,15 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           }
         }
 
-        const d = await ai.review(pos.pair, ta);
+        const d = await ai.review(pos.pair, ta, cashNote);
 
         if (!shutdownRequested && d.verdict === 'SELL' &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
-          console.log(`  [AI SELL] ${pos.pair}: ${d.reasoning}`);
-          await executeExit(exchange, mem, pos.pair, `AI: ${d.reasoning}`, d.verdict, d.confidence);
+          const partial = d.trimFraction < 1;
+          console.log(`  [AI ${partial ? `TRIM ${(d.trimFraction * 100).toFixed(0)}%` : 'SELL'}] ${pos.pair}: ${d.reasoning}`);
+          await executeExit(exchange, mem, pos.pair,
+            `AI${partial ? ` trim ${(d.trimFraction * 100).toFixed(0)}%` : ''}: ${d.reasoning}`,
+            d.verdict, d.confidence, d.trimFraction);
         }
 
         const current = mem.positions[pos.pair];
