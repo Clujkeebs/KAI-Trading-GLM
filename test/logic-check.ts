@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import ccxt from 'ccxt';
-import { TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse } from '../src/index';
+import { TA, applyPositionAdjustments, updateTradeExtremes, parseAiResponse, rankReviewPositions } from '../src/index';
 
 const closes = [
   44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08,
@@ -64,5 +64,14 @@ const reasoningAi = parseAiResponse('', '{"verdict":"SELL","confidence":7,"reaso
 assert.equal(reasoningAi.kind, 'parsed');
 assert.equal(reasoningAi.decision?.verdict, 'SELL');
 assert.equal(parseAiResponse('').kind, 'empty');
+
+const reviewPositions = [
+  { ...position, pair: 'URGENT/USD', entryPrice: 90, currentPrice: 100, stopLoss: 99, takeProfit: 130 },
+  { ...position, pair: 'LOWER_PNL/USD', entryPrice: 110, currentPrice: 100, stopLoss: 80, takeProfit: 102 },
+  { ...position, pair: 'HIGHER_PNL/USD', entryPrice: 80, currentPrice: 100, stopLoss: 98, takeProfit: 110 },
+];
+assert.deepEqual(rankReviewPositions(reviewPositions).map(p => p.pair), [
+  'URGENT/USD', 'HIGHER_PNL/USD', 'LOWER_PNL/USD',
+]);
 
 console.log('logic checks passed');

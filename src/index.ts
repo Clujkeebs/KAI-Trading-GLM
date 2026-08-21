@@ -69,6 +69,7 @@ type TradingConfig = {
   aiConfidenceThreshold: number | null;
   aiSellConfidenceThreshold: number | null;
   aiDecisionsPerCycle: number;
+  aiReviewsPerCycle: number | null;
   scanMaxRsi: number | null;
   feeReservePct: number;
   aiMaxTokens: number;
@@ -89,6 +90,16 @@ function envNumber(name: string, fallback: number, min: number, max?: number): n
 function envInteger(name: string, fallback: number, min: number): number {
   const value = envNumber(name, fallback, min);
   if (!Number.isInteger(value)) throw new Error(`${name} must be a whole number; got "${process.env[name]}"`);
+  return value;
+}
+
+function optionalEnvInteger(name: string, min: number, fallback: number): number | null {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (raw.trim() === '') return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || !Number.isInteger(value))
+    throw new Error(`${name} must be a positive whole number; got "${raw}"`);
   return value;
 }
 
@@ -125,6 +136,7 @@ function loadConfig(): TradingConfig {
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
     aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
+    aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
     scanMaxRsi: optionalEnvNumber('SCAN_MAX_RSI', 0, 100),
     feeReservePct: envNumber('FEE_RESERVE_PCT', 0.01, 0, 0.1),
     aiMaxTokens: envInteger('AI_MAX_TOKENS', 1500, 1),
@@ -380,6 +392,28 @@ function scoreSetup(ta: TechnicalAnalysis): {
   };
 }
 
+function reviewUrgency(position: Position): number {
+  if (!Number.isFinite(position.currentPrice) || position.currentPrice <= 0) return Number.POSITIVE_INFINITY;
+  return Math.min(
+    Math.abs(position.currentPrice - position.stopLoss),
+    Math.abs(position.takeProfit - position.currentPrice),
+  ) / position.currentPrice;
+}
+
+function reviewPnlPct(position: Position): number {
+  return position.entryPrice > 0
+    ? ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100
+    : 0;
+}
+
+export function rankReviewPositions(positions: Position[]): Position[] {
+  return [...positions].sort((a, b) => {
+    const urgencyDelta = reviewUrgency(a) - reviewUrgency(b);
+    if (urgencyDelta !== 0) return urgencyDelta;
+    return Math.abs(reviewPnlPct(b)) - Math.abs(reviewPnlPct(a));
+  });
+}
+
 // ============================================================
 // EXCHANGE CLIENT — Kraken via ccxt (paper or live)
 // ============================================================
@@ -389,6 +423,7 @@ class Exchange {
   readonly paper: boolean;
   private cycleBalance: any = null;
   private balanceLoaded = false;
+  private balanceDirty = false;
   private marketsLoaded = false;
   private cyclePrices: Record<string, number> = {};
   private cycleTickers: Record<string, { price: number; volume24h: number }> = {};
@@ -490,6 +525,7 @@ class Exchange {
   beginCycle() {
     this.cyclePrices = {};
     this.cycleTickers = {};
+    this.balanceDirty = false;
   }
 
   private async ensureMarkets(): Promise<void> {
@@ -772,6 +808,7 @@ class Exchange {
       if (!price) return null;
       if (this.paper) {
         console.log(`  [PAPER SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(qty * price)}`);
+        this.balanceDirty = true;
         return { qty, price, feeUsd: 0 };
       }
       // A stale or failed balance snapshot must not block an exit; Kraken rejects an
@@ -786,6 +823,7 @@ class Exchange {
       if (orderQty === null) return null;
       const order = await this.ex.createMarketSellOrder(pair, orderQty);
       const fill = this.orderFill(order, orderQty, price, pair);
+      this.balanceDirty = true;
       console.log(`  [LIVE SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)}`);
       return fill;
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
@@ -870,9 +908,12 @@ class Exchange {
     try {
       if (!this.paper) {
         await this.ensureMarkets();
-        const balance = this.balanceLoaded ? this.cycleBalance : await withRetry('balance fetch', () => this.ex.fetchBalance());
+        const balance = this.balanceLoaded && !this.balanceDirty
+          ? this.cycleBalance
+          : await withRetry('balance refresh', () => this.ex.fetchBalance());
         this.cycleBalance = balance;
         this.balanceLoaded = true;
+        this.balanceDirty = false;
         if (!balance) throw new Error('balance unavailable');
         const usd = this.getCashValue(balance);
         let cryptoValue = 0;
@@ -885,13 +926,27 @@ class Exchange {
         return total > 0 ? total : CONFIG.fallbackPortfolioValue;
       }
     } catch (e: any) {
+      if (!this.paper && this.balanceDirty) {
+        this.cycleBalance = null;
+        this.balanceLoaded = false;
+      }
       console.warn(`  [BALANCE] API call failed (${e.message}), using PORTFOLIO_VALUE fallback`);
     }
     // Paper mode (or API fallback): calculate from memory
     const invested = mem.getOpenPositions().reduce((s, p) => s + p.costBasisUsd, 0);
     const cash = CONFIG.fallbackPortfolioValue - invested;
     console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(invested)} invested = ${fmt(CONFIG.fallbackPortfolioValue)}`);
+    if (this.paper) this.balanceDirty = false;
     return CONFIG.fallbackPortfolioValue;
+  }
+
+  async refreshAfterPhase1Sales(mem: Memory): Promise<number | null> {
+    if (!this.balanceDirty) return null;
+    console.log(`  [BALANCE] Refreshing after Phase 1 sell; using settled ${this.paper ? 'paper' : 'Kraken'} balance for Phase 2`);
+    const value = await this.getPortfolioValue(mem);
+    if (!this.paper && this.balanceDirty)
+      console.warn('  [BALANCE] Post-sell refresh failed; live buying power remains unavailable');
+    return value;
   }
 }
 
@@ -1330,7 +1385,7 @@ async function main() {
   console.log(`Pairs: ${ALL_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
-  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle}/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
+  console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'}`);
 
@@ -1381,7 +1436,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (!exchange.paper) await exchange.reconcilePositions(mem);
 
   // ── FETCH REAL BALANCE ──
-  const portfolioValue = await exchange.getPortfolioValue(mem);
+  let portfolioValue = await exchange.getPortfolioValue(mem);
 
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
@@ -1409,9 +1464,21 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       }
     }
 
-    // AI reviews remaining positions
+    // AI reviews remaining positions, prioritizing positions nearest to a stop or target.
     const stillOpen = mem.getOpenPositions();
-    for (const pos of stillOpen) {
+    const rankedReviews = rankReviewPositions(stillOpen);
+    const reviewLimit = CONFIG.aiReviewsPerCycle === null
+      ? rankedReviews.length
+      : Math.min(CONFIG.aiReviewsPerCycle, rankedReviews.length);
+    console.log(`  [PHASE 1] AI review budget: ${CONFIG.aiReviewsPerCycle === null ? 'all' : `${reviewLimit}/${rankedReviews.length}`}`);
+    for (const [index, pos] of rankedReviews.entries()) {
+      const urgency = reviewUrgency(pos);
+      const pnlPct = reviewPnlPct(pos);
+      if (index >= reviewLimit) {
+        console.log(`  [PHASE 1] AI review skipped ${pos.pair}: budget (${index + 1}/${rankedReviews.length}) | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
+        continue;
+      }
+      console.log(`  [PHASE 1] AI review ${pos.pair}: rank ${index + 1}/${reviewLimit} | urgency ${(urgency * 100).toFixed(2)}% | P/L ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`);
       try {
         const candles = await exchange.getOhlcv(pos.pair, '1h', 200);
         if (candles.length < 50) continue;
@@ -1457,6 +1524,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         console.warn(`  [PHASE 1] ${pos.pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    const refreshedPortfolioValue = await exchange.refreshAfterPhase1Sales(mem);
+    if (refreshedPortfolioValue !== null) portfolioValue = refreshedPortfolioValue;
   }
 
   // ── PHASE 2: SCAN FOR OPPORTUNITIES ──
