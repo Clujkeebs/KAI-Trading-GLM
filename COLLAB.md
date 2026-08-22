@@ -179,3 +179,16 @@ strength, and window-high/drawdown edge cases. Build, all test suites, and white
 are run before shipment; a local paper/mock request-body smoke will verify charter/playbook
 presence and the new fields. No live Kraken candles, authenticated model behavior, or live
 orders are verified.
+
+### 2026-08-22 — Devin — Playbook integration verification
+
+**Verified:** `npm run build`, `npm test`, and `git diff --check` passed. The local paper
+smoke at `/home/ubuntu/kai-playbook-smoke.log` used a mocked exchange and
+`AI_BASE_URL`; its captured request bodies are in
+`/home/ubuntu/playbook-prompt-requests.jsonl`. The stance and per-pair requests contained
+the charter and playbook in that order, and per-pair requests contained both the 24-hour
+relative-strength fields and fetched-window-high drawdown fields. The smoke made no live
+orders and used no real credentials.
+
+**Unverified:** Live Kraken market/candle responses, authenticated provider behavior, and
+production model interpretation of the archived playbook remain unverified.
