@@ -71,11 +71,15 @@ class FakeKraken {
   amountToPrecision(_pair: string, qty: number) { return String(Math.floor(qty * 1e8) / 1e8); }
   async fetchTicker(pair: string) {
     if (!this.ensure(pair)) throw new ccxt.BadSymbol(`no ticker ${pair}`);
-    return { symbol: pair, last: this.prices[pair], quoteVolume: 250_000 };
+    const last = this.prices[pair];
+    return { symbol: pair, last, high: last * 1.05, low: last * 0.95, percentage: 1, quoteVolume: 250_000 };
   }
   async fetchTickers(pairs: string[]) {
     return Object.fromEntries(pairs.filter(p => this.ensure(p))
-      .map(p => [p, { symbol: p, last: this.prices[p], quoteVolume: 250_000 }]));
+      .map(p => {
+        const last = this.prices[p];
+        return [p, { symbol: p, last, high: last * 1.05, low: last * 0.95, percentage: 1, quoteVolume: 250_000 }];
+      }));
   }
   async fetchOHLCV(pair: string, _tf: string, _since: unknown, _limit: number) {
     if (!this.ensure(pair)) throw new ccxt.BadSymbol(`no candles ${pair}`);
@@ -283,6 +287,7 @@ async function main() {
   assert.match(named(healthy, 'AI decisions').detail, /2\/2 clean/);
 
   // ── A watchlist pair Kraken does not list is caught, not silently skipped ──
+  bot.setConfig({ ...bot.loadConfig(), scanUniverse: 'watchlist' });
   fake.delisted.add('HYPE/USD');
   delete fake.markets['HYPE/USD'];
   const delisted = await runPreflight(live, new Memory(), fakeAi('HOLD'), 0);

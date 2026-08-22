@@ -108,6 +108,7 @@ interface BuyContext {
   sectorExposureUsd: number;
   sectorTargetPct: number;
   concentration: string;
+  marketContext?: string;
 }
 export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
@@ -139,10 +140,12 @@ export interface Position {
   bookedPnlUsd?: number;
   closedAt?: string; exitPrice?: number; exitValueUsd?: number;
   pnlUsd?: number; pnlPct?: number; closeReason?: string;
+  entryVerdict?: string;
 }
-interface ClosedTradeSummary {
+export interface ClosedTradeSummary {
   pair: string; sector: string; pnlUsd: number; pnlPct: number;
   closedAt: string; closeReason: string; holdDays: number;
+  entryPrice?: number; entryReason?: string; entryVerdict?: string;
 }
 interface SectorStat { trades: number; wins: number; pnlUsd: number }
 /**
@@ -225,6 +228,11 @@ type TradingConfig = {
   aiDecisionsPerCycle: number;
   aiReviewsPerCycle: number | null;
   stanceMaxAgeCycles: number | null;
+  scanUniverse: 'auto' | 'watchlist';
+  min24hQuoteVolumeUsd: number;
+  scanTaLimit: number;
+  dailyMoversCount: number;
+  aiWebSearch: boolean;
   /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
   targetPositionCount: number | null;
   /** Assets the bot must never buy, sell, or manage. The operator's property. */
@@ -331,9 +339,16 @@ function loadConfig(): TradingConfig {
     minTradeUsd: optionalEnvNumber('MIN_TRADE_USD', 0),
     aiConfidenceThreshold: optionalEnvNumber('AI_CONFIDENCE_THRESHOLD', 1, 10),
     aiSellConfidenceThreshold: optionalEnvNumber('AI_SELL_CONFIDENCE_THRESHOLD', 1, 10),
-    aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 3, 1),
+    aiDecisionsPerCycle: envInteger('AI_DECISIONS_PER_CYCLE', 6, 1),
     aiReviewsPerCycle: optionalEnvInteger('AI_REVIEWS_PER_CYCLE', 1, 5),
     stanceMaxAgeCycles: optionalEnvInteger('STANCE_MAX_AGE_CYCLES', 1, 4),
+    scanUniverse: envEnum('SCAN_UNIVERSE', ['auto', 'watchlist'], 'auto'),
+    min24hQuoteVolumeUsd: envNumber('MIN_24H_QUOTE_VOLUME_USD', 250_000, 0),
+    scanTaLimit: envInteger('SCAN_TA_LIMIT', 40, 1),
+    dailyMoversCount: envInteger('DAILY_MOVERS_COUNT', 3, 1),
+    aiWebSearch: process.env.AI_WEB_SEARCH === undefined
+      ? true
+      : process.env.AI_WEB_SEARCH.trim() !== '' && envBoolean('AI_WEB_SEARCH', false),
     targetPositionCount: optionalEnvInteger('TARGET_POSITION_COUNT', 1, null),
     excludedAssets: new Set(
       (process.env.EXCLUDED_ASSETS || '')
@@ -395,6 +410,13 @@ const WATCHLIST: Record<string, string[]> = {
 const WATCHLIST_PAIRS = Object.values(WATCHLIST).flat();
 /** Watchlist minus anything the operator has reserved. */
 const tradablePairs = () => WATCHLIST_PAIRS.filter(pair => !isExcludedPair(pair));
+const STABLECOIN_BASES = new Set([
+  'USDC', 'USDT', 'DAI', 'PYUSD', 'TUSD', 'USDP', 'USDD', 'FDUSD',
+  'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
+]);
+const WRAPPED_EARN_BASES = new Set([
+  'CBETH', 'ETH2', 'RETH', 'STETH', 'SUSDE', 'WBTC', 'WETH', 'WSOL', 'WSTETH',
+]);
 const SECTOR_WEIGHTS: Record<string, number> = {
   ai: 0.25, rwa: 0.20, defi: 0.25, l1: 0.10,
   perp_dex: 0.10, momentum: 0.05, depin: 0.03, privacy: 0.02,
@@ -410,6 +432,123 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const STANCE_CLOCK_SLACK = 2;
 
 // --- HELPERS ---
+
+export interface ScanMarket {
+  symbol?: string;
+  base?: string;
+  quote?: string;
+  active?: boolean;
+  spot?: boolean;
+  type?: string;
+}
+
+export interface ScanTicker {
+  pair: string;
+  price: number;
+  high24h: number;
+  low24h: number;
+  changePct: number;
+  volume24h: number;
+}
+
+export interface CoarseTicker extends ScanTicker {
+  coarseScore: number;
+}
+
+export interface DailyMovers {
+  gainers: ScanTicker[];
+  losers: ScanTicker[];
+}
+
+export function formatPairHistory(pair: string, recentTrades: ClosedTradeSummary[]): string {
+  const history = recentTrades.filter(trade => trade.pair === pair).slice(-3).reverse();
+  if (history.length === 0) return `PAIR HISTORY (${pair}): none recorded.`;
+  const lines = history.map(trade =>
+    `${trade.entryVerdict || 'BUY'} entry ${trade.entryPrice === undefined ? '' : `at ${fmt(trade.entryPrice)} `}` +
+    `→ exit ${trade.pnlUsd >= 0 ? 'profit' : 'loss'} ${fmt(trade.pnlUsd)} (${trade.pnlPct >= 0 ? '+' : ''}${trade.pnlPct}%)` +
+    `${trade.pnlUsd < 0 ? '; thesis outcome: wrong' : '; thesis outcome: worked'}` +
+    `${trade.entryReason ? `; thesis: ${trade.entryReason}` : ''}` +
+    `${trade.closeReason ? `; outcome: ${trade.closeReason}` : ''}`);
+  return `PAIR HISTORY (${pair}):\n${lines.join('\n')}`;
+}
+
+function isWrappedEarnBase(asset: string): boolean {
+  const upper = asset.toUpperCase();
+  const raw = upper.split('.')[0];
+  return upper.includes('.') || WRAPPED_EARN_BASES.has(raw) || /^(?:ETH|SOL)\d+$/.test(raw);
+}
+
+export function filterDiscoveredMarkets(
+  markets: ScanMarket[],
+  heldPairs: Iterable<string>,
+  excludedAssets: Iterable<string>,
+): string[] {
+  const held = new Set([...heldPairs].map(pair => pair.toUpperCase()));
+  const excluded = new Set([...excludedAssets].map(normalizeAsset));
+  const pairs = new Set<string>();
+  for (const market of markets) {
+    const pair = typeof market.symbol === 'string' ? market.symbol.toUpperCase() : '';
+    const base = typeof market.base === 'string' ? market.base.toUpperCase() : '';
+    const quote = typeof market.quote === 'string' ? normalizeAsset(market.quote) : '';
+    if (!pair || !base || quote !== 'USD' || market.active === false ||
+        !(market.spot === true || market.type === 'spot') || held.has(pair))
+      continue;
+    const normalizedBase = normalizeAsset(base);
+    if (STABLECOIN_BASES.has(normalizedBase) || isWrappedEarnBase(base) ||
+        excluded.has(normalizedBase) || isExcludedPair(pair, excluded))
+      continue;
+    pairs.add(pair);
+  }
+  return [...pairs].sort();
+}
+
+export function filterLiquidTickers(tickers: ScanTicker[], minimumVolumeUsd: number): ScanTicker[] {
+  return tickers.filter(ticker =>
+    Number.isFinite(ticker.price) && ticker.price > 0 &&
+    Number.isFinite(ticker.high24h) && ticker.high24h >= ticker.price &&
+    Number.isFinite(ticker.low24h) && ticker.low24h > 0 && ticker.low24h <= ticker.price &&
+    Number.isFinite(ticker.changePct) && Number.isFinite(ticker.volume24h) &&
+    ticker.volume24h >= minimumVolumeUsd);
+}
+
+export function selectDailyMovers(tickers: ScanTicker[], count: number): DailyMovers {
+  const usable = tickers.filter(ticker => Number.isFinite(ticker.changePct));
+  return {
+    gainers: usable.filter(ticker => ticker.changePct > 0)
+      .sort((a, b) => b.changePct - a.changePct).slice(0, count),
+    losers: usable.filter(ticker => ticker.changePct < 0)
+      .sort((a, b) => a.changePct - b.changePct).slice(0, count),
+  };
+}
+
+export function coarseRankTickers(tickers: ScanTicker[]): CoarseTicker[] {
+  const maxVolumeLog = Math.max(1, ...tickers.map(ticker => Math.log1p(ticker.volume24h)));
+  const ranked = tickers.map(ticker => {
+    const range = ticker.high24h > ticker.low24h
+      ? (ticker.price - ticker.low24h) / (ticker.high24h - ticker.low24h)
+      : 0.5;
+    const rangeScore = 1 - Math.max(0, Math.min(1, range));
+    const changeScore = Math.max(0, Math.min(1, (ticker.changePct + 10) / 20));
+    const volumeScore = Math.log1p(ticker.volume24h) / maxVolumeLog;
+    return {
+      ...ticker,
+      coarseScore: rangeScore * 0.5 + changeScore * 0.3 + volumeScore * 0.2,
+    };
+  });
+  return ranked.sort((a, b) =>
+    b.coarseScore - a.coarseScore ||
+    b.volume24h - a.volume24h ||
+    a.pair.localeCompare(b.pair));
+}
+
+export function isMinimumAffordable(spendableCashUsd: number, minimumUsd: number | null): boolean {
+  return minimumUsd !== null && Number.isFinite(spendableCashUsd) &&
+    Number.isFinite(minimumUsd) && spendableCashUsd >= minimumUsd;
+}
+
+export function shouldCheckMoverNews(enabled: boolean, isLoser: boolean, changePct: number): boolean {
+  return enabled && isLoser && Number.isFinite(changePct) && changePct < 0;
+}
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const RETRY_ATTEMPTS = 3;
@@ -475,9 +614,12 @@ function isExcludedAsset(asset: string): boolean {
 }
 
 /** Whether a pair trades an excluded asset, and so must never be touched. */
-export function isExcludedPair(pair: string): boolean {
+export function isExcludedPair(pair: string, excludedAssets?: Iterable<string>): boolean {
   const base = pair.split('/')[0];
-  return base ? isExcludedAsset(base) : false;
+  if (!base) return false;
+  return excludedAssets
+    ? new Set([...excludedAssets].map(normalizeAsset)).has(normalizeAsset(base))
+    : isExcludedAsset(base);
 }
 
 function getSector(pair: string): string {
@@ -1130,7 +1272,7 @@ class Exchange {
   private balanceDirty = false;
   private marketsPromise: Promise<void> | null = null;
   private cyclePrices: Record<string, number> = {};
-  private cycleTickers: Record<string, { price: number; volume24h: number }> = {};
+  private cycleTickers: Record<string, ScanTicker> = {};
 
   constructor(apiKey?: string, apiSecret?: string, paperMode = true) {
     this.paper = paperMode;
@@ -1157,8 +1299,9 @@ class Exchange {
       const t = await withRetry<any>(`ticker ${pair}`, () => this.ex.fetchTicker(pair));
       const price = t.last ?? t.close ?? null;
       if (price !== null) {
-        this.cyclePrices[pair] = price;
-        this.cycleTickers[pair] = { price, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+        this.cyclePrices[pair] = Number(price);
+        const ticker = this.tickerFromRaw(pair, t);
+        if (ticker) this.cycleTickers[pair] = ticker;
       }
       return price;
     } catch (e) {
@@ -1167,11 +1310,31 @@ class Exchange {
     }
   }
 
-  async getTicker(pair: string): Promise<{ price: number; volume24h: number } | null> {
+  private tickerFromRaw(pair: string, raw: any): ScanTicker | null {
+    const price = Number(raw?.last ?? raw?.close ?? 0);
+    const high24h = Number(raw?.high ?? 0);
+    const low24h = Number(raw?.low ?? 0);
+    const quoteVolume = Number(raw?.quoteVolume);
+    const baseVolume = Number(raw?.baseVolume);
+    const volume24h = Number.isFinite(quoteVolume)
+      ? quoteVolume
+      : Number.isFinite(baseVolume) && price > 0 ? baseVolume * price : 0;
+    const percentage = Number(raw?.percentage);
+    const open = Number(raw?.open);
+    const changePct = Number.isFinite(percentage)
+      ? percentage
+      : Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
+    if (!(price > 0) || !Number.isFinite(high24h) || !Number.isFinite(low24h))
+      return null;
+    return { pair, price, high24h, low24h, changePct, volume24h };
+  }
+
+  async getTicker(pair: string): Promise<ScanTicker | null> {
     if (this.cycleTickers[pair]) return this.cycleTickers[pair];
     try {
       const t = await withRetry<any>(`ticker ${pair}`, () => this.ex.fetchTicker(pair));
-      const ticker = { price: t.last ?? t.close ?? 0, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+      const ticker = this.tickerFromRaw(pair, t);
+      if (!ticker) return null;
       this.cyclePrices[pair] = ticker.price;
       this.cycleTickers[pair] = ticker;
       return ticker;
@@ -1202,12 +1365,12 @@ class Exchange {
         const tickers = await withRetry<any>(`tickers batch`, () => this.ex.fetchTickers(pairs));
         for (const pair of pairs) {
           const t = tickers[pair] || Object.values(tickers).find((value: any) => value?.symbol === pair);
-          const price = t?.last ?? t?.close ?? null;
-          if (price !== null) {
-            const ticker = { price, volume24h: t.quoteVolume ?? t.baseVolume ?? 0 };
+          const price = Number(t?.last ?? t?.close ?? 0);
+          const ticker = this.tickerFromRaw(pair, t);
+          if (price > 0) {
             out[pair] = price;
             this.cyclePrices[pair] = price;
-            this.cycleTickers[pair] = ticker;
+            if (ticker) this.cycleTickers[pair] = ticker;
           }
         }
         for (const pair of pairs) {
@@ -1223,6 +1386,43 @@ class Exchange {
     for (const p of pairs) {
       const pr = await this.getPrice(p);
       if (pr !== null) out[p] = pr;
+    }
+    return out;
+  }
+
+  async getTickersBatch(pairs: string[]): Promise<ScanTicker[]> {
+    const out: ScanTicker[] = [];
+    if (pairs.length === 0) return out;
+    try {
+      await this.ensureMarkets();
+      if (this.ex.has?.fetchTickers) {
+        for (let offset = 0; offset < pairs.length; offset += 50) {
+          const chunk = pairs.slice(offset, offset + 50);
+          try {
+            const tickers = await withRetry<any>(`tickers batch ${offset + 1}-${offset + chunk.length}`,
+              () => this.ex.fetchTickers(chunk));
+            for (const pair of chunk) {
+              const raw = tickers[pair] ||
+                Object.values(tickers).find((value: any) => value?.symbol === pair);
+              const ticker = this.tickerFromRaw(pair, raw);
+              if (ticker) {
+                this.cyclePrices[pair] = ticker.price;
+                this.cycleTickers[pair] = ticker;
+                out.push(ticker);
+              }
+            }
+          } catch (e) {
+            console.warn(`[EXCHANGE] Ticker batch unavailable for ${chunk.length} markets: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        return out;
+      }
+    } catch (e) {
+      console.warn(`[EXCHANGE] Bulk tickers unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    for (const pair of pairs) {
+      const ticker = await this.getTicker(pair);
+      if (ticker) out.push(ticker);
     }
     return out;
   }
@@ -1252,6 +1452,17 @@ class Exchange {
         .catch(e => { this.marketsPromise = null; throw e; });
     }
     return this.marketsPromise;
+  }
+
+  async getScanUniverse(mode: 'auto' | 'watchlist', heldPairs: Iterable<string>): Promise<string[]> {
+    if (mode === 'watchlist')
+      return tradablePairs().filter(pair => !new Set([...heldPairs].map(p => p.toUpperCase())).has(pair));
+    await this.ensureMarkets();
+    return filterDiscoveredMarkets(
+      Object.values(this.ex.markets || {}) as ScanMarket[],
+      heldPairs,
+      CONFIG.excludedAssets,
+    );
   }
 
   private usdMarketForAsset(asset: string): any | null {
@@ -2049,6 +2260,7 @@ class Memory {
     pair: string, qty: number, price: number, sl: number, tp: number,
     sector: string, reason: string, aiReason: string, feeUsd = 0, atr: number | null = null,
     alertPrice: number | null = null, origin: 'bot' | 'operator' = 'bot',
+    entryVerdict = 'BUY',
   ) {
     const pos: Position = {
       pair, status: 'open', sector, entryPrice: price, qty,
@@ -2058,7 +2270,7 @@ class Memory {
       currentPrice: price, reason, aiReasoning: aiReason, openedAt: new Date().toISOString(),
       initialStopLoss: sl, highWaterMark: price, entryAtr: atr, bookedPnlUsd: 0,
       alertPrice: alertPrice ?? defaultAlertPrice(price, sl),
-      origin,
+      origin, entryVerdict,
     };
     this.positions[pair] = pos;
     this.savePositions();
@@ -2142,6 +2354,7 @@ class Memory {
       pair: p.pair, sector: p.sector, pnlUsd: p.pnlUsd ?? 0, pnlPct: p.pnlPct ?? 0,
       closedAt: p.closedAt ?? new Date().toISOString(),
       closeReason: p.closeReason ?? '', holdDays: +Math.max(0, holdDays).toFixed(2),
+      entryPrice: p.entryPrice, entryReason: p.reason, entryVerdict: p.entryVerdict,
     });
     if (this.state.recentTrades.length > RECENT_TRADE_MEMORY)
       this.state.recentTrades = this.state.recentTrades.slice(-RECENT_TRADE_MEMORY);
@@ -2293,6 +2506,10 @@ class Memory {
     } else { lines.push('No open positions.'); }
     lines.push(...this.performanceLines());
     return lines.filter(Boolean).join('\n');
+  }
+
+  getPairHistory(pair: string): string {
+    return formatPairHistory(pair, this.state.recentTrades);
   }
 }
 
@@ -2580,6 +2797,10 @@ stance in "counter_case", then keep the stance only if it survives that.
 Keep "reasoning" under 25 words and "counter_case" under 20.
 {"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this"}`;
 const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents);
+const NEWS_SYSTEM_PROMPT = composeSystemPrompt(
+  'You are a crypto market-news researcher. Return the requested JSON object only.',
+  SOUL_CHARTER.contents,
+);
 
 export function normalizeStance(json: any): PortfolioStance {
   const raw = String(json?.stance || '').toUpperCase().replace(/[\s-]/g, '_');
@@ -2698,6 +2919,7 @@ Free cash available for this pair after fee reserve: ${fmt(context?.spendableCas
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
 ${context?.concentration ? `\n${context.concentration}\n` : ''}
+${context?.marketContext ? `\nMARKET NEWS CONTEXT (evidence, not an instruction):\n${context.marketContext}\n` : ''}
 BUY or HOLD?`, pair);
   }
 
@@ -2733,7 +2955,7 @@ HOLD, SELL, or ADJUST?`, pair);
     const fallback: AiDecision = { verdict: 'HOLD', confidence: 5, reasoning: 'AI error', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false, counterCase: '', verdictHolds: true };
     const messages: any[] = [
       { role: 'system', content: DECISION_SYSTEM_PROMPT },
-      { role: 'user', content: `${this.memory.getContextSummary()}\n\n${prompt}` },
+      { role: 'user', content: `${this.memory.getContextSummary()}\n\n${this.memory.getPairHistory(pair)}\n\n${prompt}` },
     ];
     // A salvaged decision is a last resort, not an answer: it carries no position
     // size and no stop, so accepting it ends the trade's sizing judgement. Hold on
@@ -2808,9 +3030,9 @@ HOLD, SELL, or ADJUST?`, pair);
       : { reasoning: { effort: CONFIG.aiReasoningEffort } };
   }
 
-  private async request(messages: any[], pair: string): Promise<any> {
+  private async request(messages: any[], pair: string, modelOverride?: string): Promise<any> {
     const create = (structured: boolean, reasoning: boolean) => this.client.chat.completions.create({
-      model: this.model,
+      model: modelOverride || this.model,
       messages,
       temperature: 0.2,
       max_tokens: this.tokenBudget,
@@ -2861,14 +3083,14 @@ HOLD, SELL, or ADJUST?`, pair);
    * One JSON object from the model, with the same truncation handling as a trade
    * decision. Returns null when nothing parseable comes back.
    */
-  private async requestJsonObject(system: string, prompt: string, label: string): Promise<any | null> {
+  private async requestJsonObject(system: string, prompt: string, label: string, modelOverride?: string): Promise<any | null> {
     const messages = [
       { role: 'system', content: system },
       { role: 'user', content: prompt },
     ];
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const res = await this.request(messages, label);
+        const res = await this.request(messages, label, modelOverride);
         const choice = res.choices?.[0];
         const text = textContent(choice?.message?.content).trim() ||
           textContent(choice?.message?.reasoning ?? choice?.message?.reasoning_content);
@@ -2883,6 +3105,32 @@ HOLD, SELL, or ADJUST?`, pair);
       }
     }
     return null;
+  }
+
+  async checkMoverNews(pair: string, changePct: number): Promise<string> {
+    if (!shouldCheckMoverNews(CONFIG.aiWebSearch, true, changePct)) return '';
+    const model = this.model.endsWith(':online') ? this.model : `${this.model}:online`;
+    const callsBefore = this.usage.calls;
+    const tokensBefore = this.usage.promptTokens + this.usage.completionTokens;
+    const json = await this.requestJsonObject(
+      NEWS_SYSTEM_PROMPT,
+      `Investigate ${pair}, which is down ${changePct.toFixed(1)}% in 24 hours. What happened, and is the cause transient or structural? Return {"cause":"brief summary","assessment":"transient" or "structural" or "unclear","confidence":1-10}.`,
+      `${pair} news`,
+      model,
+    );
+    const tokens = this.usage.promptTokens + this.usage.completionTokens - tokensBefore;
+    if (!json) {
+      console.warn(`  [NEWS] ${pair}: unavailable; continuing without news context (calls ${this.usage.calls - callsBefore}, tokens ${tokens})`);
+      return '';
+    }
+    const cause = typeof json.cause === 'string' ? json.cause.trim() : '';
+    const assessment = typeof json.assessment === 'string' ? json.assessment.trim() : 'unclear';
+    if (!cause) {
+      console.warn(`  [NEWS] ${pair}: unusable verdict; continuing without news context (tokens ${tokens})`);
+      return '';
+    }
+    console.log(`  [NEWS] ${pair}: ${assessment} — ${cause} (tokens ${tokens})`);
+    return `News check: ${assessment}; ${cause}`;
   }
 
   /**
@@ -3084,22 +3332,24 @@ export async function runPreflight(
     checks.push({ name, ok, detail, critical });
   // Always measure against fresh data, never a previous cycle's snapshot.
   exchange.beginCycle();
+  const preflightUniverse = await exchange.getScanUniverse(CONFIG.scanUniverse, new Set());
+  const preflightPairs = preflightUniverse.slice(0, 20);
 
   // 0. The operator's reserved holdings, stated plainly every run.
   if (CONFIG.excludedAssets.size > 0) {
     const reserved = [...CONFIG.excludedAssets].sort().join(', ');
-    const stillListed = WATCHLIST_PAIRS.filter(isExcludedPair);
+    const stillListed = WATCHLIST_PAIRS.filter(pair => isExcludedPair(pair));
     add('Reserved assets', true,
       `${reserved} will not be bought, sold or managed${stillListed.length ? ` (${stillListed.join(', ')} removed from the scan)` : ''}`);
   }
 
   // 1. Market coverage — a watchlist pair Kraken does not list is dead weight.
   try {
-    const missing = await exchange.listMissingMarkets(tradablePairs());
+    const missing = await exchange.listMissingMarkets(preflightPairs);
     add('Kraken markets', missing.length === 0,
       missing.length === 0
-        ? `all ${tradablePairs().length} watchlist pairs are listed`
-        : `${missing.length} unlisted and permanently unreachable: ${missing.join(', ')}`,
+        ? `${preflightPairs.length}/${preflightUniverse.length} ${CONFIG.scanUniverse} markets sampled and listed`
+        : `${missing.length} sampled markets are unlisted and unreachable: ${missing.join(', ')}`,
       true);
   } catch (e: any) {
     add('Kraken markets', false, `market load failed: ${e.message}`, true);
@@ -3109,8 +3359,8 @@ export async function runPreflight(
   const dataProblems: string[] = [];
   let analysed = 0;
   let freshestAgeMinutes = Number.POSITIVE_INFINITY;
-  const prices = await exchange.getPricesBatch(tradablePairs());
-  await mapWithConcurrency(tradablePairs(), CONFIG.ohlcvConcurrency, async pair => {
+  const prices = await exchange.getPricesBatch(preflightPairs);
+  await mapWithConcurrency(preflightPairs, CONFIG.ohlcvConcurrency, async pair => {
     const price = prices[pair];
     if (price === undefined) { dataProblems.push(`${pair}: no price`); return; }
     const candles = await exchange.getOhlcv(pair, '1h', 200);
@@ -3127,8 +3377,8 @@ export async function runPreflight(
   });
   add('Market data', dataProblems.length === 0,
     dataProblems.length === 0
-      ? `${analysed}/${tradablePairs().length} pairs analysable, newest closed candle ${Math.round(freshestAgeMinutes)}min old`
-      : `${analysed}/${tradablePairs().length} usable; ${dataProblems.join('; ')}`,
+      ? `${analysed}/${preflightPairs.length} sampled pairs analysable, newest closed candle ${Math.round(freshestAgeMinutes)}min old`
+      : `${analysed}/${preflightPairs.length} sampled usable; ${dataProblems.join('; ')}`,
     analysed === 0);
 
   // 3. Account — the numbers the bot sizes and reports against.
@@ -3150,7 +3400,7 @@ export async function runPreflight(
     let bestFunded: { pair: string; spendable: number; minimum: number } | null = null;
     let cheapest: { pair: string; minimum: number } | null = null;
     let quoteCash = 0;
-    for (const pair of tradablePairs()) {
+    for (const pair of preflightPairs) {
       const price = prices[pair];
       if (price === undefined) continue;
       const minimum = await exchange.getMinimumTradeUsd(pair, price);
@@ -3267,13 +3517,14 @@ async function main() {
 │  Strategy: AI-Powered Oversold Bounce        │
 │  Risk: ATR stops + trailing exits            │
 └──────────────────────────────────────────────┘`);
-  console.log(`Pairs: ${tradablePairs().length} of ${WATCHLIST_PAIRS.length} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
+  console.log(`Scan universe: ${CONFIG.scanUniverse}${CONFIG.scanUniverse === 'watchlist' ? ` (${tradablePairs().length} of ${WATCHLIST_PAIRS.length} pairs)` : ' (Kraken markets)'} | Sectors: ${Object.keys(WATCHLIST).length} | Balance: fetched from API each cycle`);
   const limit = (value: number | null, suffix = '') => value === null ? 'off' : `${value}${suffix}`;
   console.log(`[CONFIG] Mode: ${CONFIG.paperMode ? 'paper' : 'live'} | Loop: ${loopMode ? 'on' : 'single'} | Interval: ${fastMode ? '5min' : `${CONFIG.scanIntervalMs / 60000}min`}`);
   console.log(`[CONFIG] AI budget: ${CONFIG.aiDecisionsPerCycle} buys/cycle | ${CONFIG.aiReviewsPerCycle === null ? 'all' : CONFIG.aiReviewsPerCycle} reviews/cycle | Stance age: ${CONFIG.stanceMaxAgeCycles === null ? 'off' : `${CONFIG.stanceMaxAgeCycles} cycles`} | Buy confidence: ${limit(CONFIG.aiConfidenceThreshold, '/10')} | Sell confidence: ${limit(CONFIG.aiSellConfidenceThreshold, '/10')} | Position risk: ${limit(CONFIG.maxRiskPerTradePct)}`);
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
   console.log(`[CONFIG] State directory: ${DATA_DIR}`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
+  console.log(`[CONFIG] Scan funnel: ${CONFIG.scanUniverse} | 24h quote-volume floor: $${CONFIG.min24hQuoteVolumeUsd.toLocaleString()} | TA limit: ${CONFIG.scanTaLimit} | Movers: ${CONFIG.dailyMoversCount} each | News: ${CONFIG.aiWebSearch ? 'on' : 'off'}`);
   console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
   console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
   console.log(`[CONFIG] Reserved assets: ${CONFIG.excludedAssets.size ? [...CONFIG.excludedAssets].sort().join(', ') : 'none'} (never bought, sold or managed)`);
@@ -3742,9 +3993,48 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const canOpen = blockers.length === 0;
   if (!canOpen) console.log(`  [PHASE 2] No new entries: ${blockers.join('; ')}.`);
 
-  const scanPairs = canOpen ? tradablePairs().filter(pair => !holding.has(pair)) : [];
-  const scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
-
+  const heldPairs = new Set(mem.getOpenPositions().map(position => position.pair));
+  let universe: string[] = [];
+  let coarseTickers: CoarseTicker[] = [];
+  let scanPairs: string[] = [];
+  let scanPrices: Record<string, number> = {};
+  let scanTickerByPair = new Map<string, ScanTicker>();
+  const moverByPair = new Map<string, 'gainer' | 'loser'>();
+  if (canOpen) {
+    try {
+      universe = await exchange.getScanUniverse(CONFIG.scanUniverse, heldPairs);
+      if (CONFIG.scanUniverse === 'watchlist') {
+        scanPairs = universe;
+        scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
+        const tickers = scanPairs.length > 0 ? await exchange.getTickersBatch(scanPairs) : [];
+        scanTickerByPair = new Map(tickers.map(ticker => [ticker.pair, ticker]));
+        console.log(`  [SCAN] watchlist: ${scanPairs.length} legacy pairs sent to TA`);
+      } else {
+        const tickers = await exchange.getTickersBatch(universe);
+        const liquidTickers = filterLiquidTickers(tickers, CONFIG.min24hQuoteVolumeUsd);
+        coarseTickers = coarseRankTickers(liquidTickers);
+        scanTickerByPair = new Map(liquidTickers.map(ticker => [ticker.pair, ticker]));
+        const movers = selectDailyMovers(liquidTickers, CONFIG.dailyMoversCount);
+        for (const ticker of movers.gainers) moverByPair.set(ticker.pair, 'gainer');
+        for (const ticker of movers.losers) moverByPair.set(ticker.pair, 'loser');
+        scanPairs = [...new Set([
+          ...coarseTickers.slice(0, CONFIG.scanTaLimit).map(ticker => ticker.pair),
+          ...movers.gainers.map(ticker => ticker.pair),
+          ...movers.losers.map(ticker => ticker.pair),
+        ])];
+        scanPrices = Object.fromEntries(scanPairs.map(pair => [pair, scanTickerByPair.get(pair)!.price]));
+        console.log(`  [SCAN] auto: ${universe.length} markets discovered | ${liquidTickers.length} above $${CONFIG.min24hQuoteVolumeUsd.toLocaleString()} 24h quote volume | ${scanPairs.length} sent to TA`);
+        if (coarseTickers.length > 0)
+          console.log(`  [SCAN] Coarse top: ${coarseTickers.slice(0, 5).map(ticker => `${ticker.pair} (${ticker.coarseScore.toFixed(3)})`).join(', ')}`);
+        if (movers.gainers.length > 0 || movers.losers.length > 0)
+          console.log(`  [SCAN] Movers forced into TA: ${movers.gainers.map(t => `${t.pair} +${t.changePct.toFixed(1)}%`).join(', ') || 'none'} | losers: ${movers.losers.map(t => `${t.pair} ${t.changePct.toFixed(1)}%`).join(', ') || 'none'}`);
+        const categories = [...new Set(scanPairs.map(pair => getSector(pair)))];
+        console.log(`  [SCAN] Category spread: ${categories.join(', ') || 'none'}${categories.length === 1 && categories[0] === 'unlisted' ? ' (Kraken provides no sector metadata for discovered markets)' : ''}`);
+      }
+    } catch (e) {
+      console.warn(`  [PHASE 2] Scan universe unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   const scanned = await mapWithConcurrency(scanPairs, CONFIG.ohlcvConcurrency, async pair => {
     try {
       const price = scanPrices[pair];
@@ -3755,10 +4045,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         console.log(`  [SCAN SKIP] ${pair}: RSI ${ta.rsi} > max ${CONFIG.scanMaxRsi}`);
         return null;
       }
-      const ticker = await exchange.getTicker(pair);
+      const ticker = scanTickerByPair.get(pair);
+      const mover = moverByPair.get(pair);
       return {
         pair, sector: getSector(pair), ta,
         vol: ticker?.volume24h ?? 0, score: scoreSetup(ta), plan: planTrade(ta),
+        mover,
       };
     } catch (e) {
       console.warn(`  [PHASE 2] ${pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -3770,7 +4062,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   candidates.sort((a, b) => b.score.score - a.score.score || a.ta.rsi - b.ta.rsi);
   for (const c of candidates) {
     const distance = c.score.supportDistance === null ? 'none' : pct(c.score.supportDistance);
-    console.log(`  [CANDIDATE] ${c.pair}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
+    console.log(`  [CANDIDATE] ${c.pair}${c.mover ? ` [MOVER ${c.mover}]` : ''}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
   }
 
   // ── PHASE 3: AI DECISIONS ──
@@ -3799,11 +4091,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (stance.stance === 'RISK_OFF')
     console.log('  [STANCE] RISK_OFF — no new entries this cycle; exits and stops continue as normal.');
 
-  const aiCandidates = stance.stance === 'RISK_OFF' ? [] : candidates.slice(0, CONFIG.aiDecisionsPerCycle);
-  if (aiCandidates.length > 0)
-    console.log(`  [AI BUDGET] Reached: ${aiCandidates.map(c => `${c.pair} (${c.score.score.toFixed(2)})`).join(', ')}`);
+  const aiCandidates = stance.stance === 'RISK_OFF' ? [] : candidates;
+  let decisionsUsed = 0;
   for (const c of aiCandidates) {
     if (shutdownRequested) break;
+    if (decisionsUsed >= CONFIG.aiDecisionsPerCycle) {
+      console.log(`  [AI BUDGET] ${CONFIG.aiDecisionsPerCycle} affordable decisions used; skipping remaining candidates`);
+      break;
+    }
     if (CONFIG.maxOpenPositions !== null && mem.getOpenPositions().length >= CONFIG.maxOpenPositions) {
       console.log('  [PASS] MAX_OPEN_POSITIONS reached mid-cycle; stopping new entries.');
       break;
@@ -3836,11 +4131,16 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.log(`  [PASS] ${c.pair}: exchange minimum unavailable; cannot size a buy safely`);
       continue;
     }
-    if (spendableCash < marketMinimum) {
+    if (!isMinimumAffordable(spendableCash, marketMinimum)) {
       console.log(`  [PASS] ${c.pair}: needs ${fmt(marketMinimum)} but only ${fmt(spendableCash)} is spendable${cashReserveUsd > 0 ? ` after ${fmt(cashReserveUsd)} dry powder` : ''} (free ${fmt(availableCash)}); not asking the AI`);
       continue;
     }
 
+    decisionsUsed++;
+    console.log(`  [AI BUDGET] Decision ${decisionsUsed}/${CONFIG.aiDecisionsPerCycle}: ${c.pair} (${c.score.score.toFixed(2)})`);
+    const newsContext = c.mover === 'loser' && typeof (ai as any).checkMoverNews === 'function'
+      ? await (ai as any).checkMoverNews(c.pair, scanTickerByPair.get(c.pair)?.changePct ?? 0)
+      : '';
     const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
       spendableCashUsd: spendableCash,
@@ -3850,6 +4150,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       sectorExposureUsd: sectorExposure[c.sector] ?? 0,
       sectorTargetPct: SECTOR_WEIGHTS[c.sector] ?? 0.05,
       concentration: concentrationNote(portfolioValue, mem.getOpenPositions().length),
+      marketContext: newsContext,
     }, c.plan);
 
     // The model may set its own entry stop and target. The only rule the bot
@@ -3929,7 +4230,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         console.log(`  [PLAN] ${c.pair}: filled at ${fmt(fill.price)} vs ${fmt(c.ta.currentPrice)} planned; stop ${fmt(sl)} → ${fmt(settled.stop)}, target ${fmt(tp)} → ${fmt(settled.target)}`);
       mem.openPosition(c.pair, fill.qty, fill.price, settled.stop, settled.target, c.sector,
         `RSI=${c.ta.rsi} ${c.ta.trend}/${c.ta.htfTrend} R/R=${rr.toFixed(1)}`, d.reasoning, fill.feeUsd, c.ta.atr,
-        d.alertPrice !== null && d.alertPrice > settled.stop && d.alertPrice < fill.price ? d.alertPrice : null);
+        d.alertPrice !== null && d.alertPrice > settled.stop && d.alertPrice < fill.price ? d.alertPrice : null,
+        'bot', d.verdict);
       if (exchange.paper) mem.adjustPaperCash(-filledCost);
       mem.logTrade({
         timestamp: new Date().toISOString(), pair: c.pair, side: 'BUY',

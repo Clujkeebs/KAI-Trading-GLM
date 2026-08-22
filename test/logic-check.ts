@@ -10,7 +10,9 @@ import {
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
-  isStanceFresh, normalizeCycleCount, nextCycleNumber, Memory,
+  isStanceFresh, normalizeCycleCount, nextCycleNumber, filterDiscoveredMarkets,
+  filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
+  formatPairHistory, isMinimumAffordable, Memory,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -372,6 +374,53 @@ assert.equal(nextCycleNumber(57), 58);
 assert.equal(nextCycleNumber(-1), 1);
 assert.equal(nextCycleNumber('corrupt'), 1);
 fs.rmSync(stanceStateDir, { recursive: true, force: true });
+
+// ── Discovered scan universe and cheap ticker funnel ──────────────────────────
+const discoveredMarkets = [
+  { symbol: 'GOOD/USD', base: 'GOOD', quote: 'USD', active: true, spot: true },
+  { symbol: 'USDT/USD', base: 'USDT', quote: 'USD', active: true, spot: true },
+  { symbol: 'RESERVED/USD', base: 'RESERVED', quote: 'USD', active: true, spot: true },
+  { symbol: 'HELD/USD', base: 'HELD', quote: 'USD', active: true, spot: true },
+  { symbol: 'GOOD/EUR', base: 'GOOD', quote: 'EUR', active: true, spot: true },
+  { symbol: 'DEAD/USD', base: 'DEAD', quote: 'USD', active: false, spot: true },
+  { symbol: 'SWAP/USD', base: 'SWAP', quote: 'USD', active: true, spot: false, type: 'swap' },
+  { symbol: 'WBTC/USD', base: 'WBTC', quote: 'USD', active: true, spot: true },
+];
+assert.deepEqual(
+  filterDiscoveredMarkets(discoveredMarkets, ['HELD/USD'], ['RESERVED']),
+  ['GOOD/USD'],
+);
+
+const liquidTickers = filterLiquidTickers([
+  { pair: 'LOW/USD', price: 10, high24h: 12, low24h: 8, changePct: 1, volume24h: 99 },
+  { pair: 'GOOD/USD', price: 9, high24h: 12, low24h: 8, changePct: 1, volume24h: 100 },
+  { pair: 'MISSING/USD', price: 9, high24h: 0, low24h: 0, changePct: 1, volume24h: 500 },
+], 100);
+assert.deepEqual(liquidTickers.map(ticker => ticker.pair), ['GOOD/USD']);
+const coarse = coarseRankTickers([
+  { pair: 'LOW/USD', price: 8.5, high24h: 12, low24h: 8, changePct: 2, volume24h: 500_000 },
+  { pair: 'MOMENTUM/USD', price: 11, high24h: 12, low24h: 8, changePct: 9, volume24h: 500_000 },
+  { pair: 'BALANCED/USD', price: 10, high24h: 12, low24h: 8, changePct: 4, volume24h: 1_000_000 },
+]);
+assert.equal(coarse[0].pair, 'LOW/USD', 'coarse rank favours a supported low-range setup');
+assert.equal(isMinimumAffordable(4.99, 5), false);
+assert.equal(isMinimumAffordable(5, 5), true);
+assert.equal(isMinimumAffordable(5, null), false);
+const movers = selectDailyMovers([
+  { pair: 'UP/USD', price: 1, high24h: 2, low24h: 0.5, changePct: 12, volume24h: 500_000 },
+  { pair: 'DOWN/USD', price: 1, high24h: 2, low24h: 0.5, changePct: -15, volume24h: 500_000 },
+  { pair: 'MID/USD', price: 1, high24h: 2, low24h: 0.5, changePct: 3, volume24h: 500_000 },
+], 1);
+assert.deepEqual(movers.gainers.map(t => t.pair), ['UP/USD']);
+assert.deepEqual(movers.losers.map(t => t.pair), ['DOWN/USD']);
+assert.equal(shouldCheckMoverNews(true, true, -10), true);
+assert.equal(shouldCheckMoverNews(false, true, -10), false);
+assert.equal(shouldCheckMoverNews(true, false, -10), false);
+assert.match(formatPairHistory('DOWN/USD', [{
+  pair: 'DOWN/USD', sector: 'unlisted', pnlUsd: -2, pnlPct: -20, closedAt: '2025-01-01',
+  closeReason: 'structural failure', holdDays: 2, entryPrice: 10, entryReason: 'bounce thesis',
+  entryVerdict: 'BUY',
+}]), /BUY entry.*loss.*structural failure/);
 
 // ── The model owns the entry plan, inside the risk cap ───────────────────────
 const entryPlan = planTrade(base)!;

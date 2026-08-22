@@ -43,7 +43,7 @@ All settings live in `.env` (see `.env.example`):
 - `PORTFOLIO_VALUE` — starting balance for paper mode, and the fallback when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle. Paper mode tracks simulated cash from here on, so paper results compound
 - `SCAN_INTERVAL_MINUTES` — scan cadence in loop mode
 - `LOOP_MODE` — continuous operation by default; set `false` for one cycle
-- `AI_DECISIONS_PER_CYCLE` — maximum new-buy decisions per cycle (default `3`)
+- `AI_DECISIONS_PER_CYCLE` — maximum affordable new-buy decisions per cycle (default `6`); unaffordable exchange minimums are skipped before spending a model call
 - `AI_REVIEWS_PER_CYCLE` — maximum Phase 1 AI position reviews per cycle (default `5`); blank reviews all positions, ranked by stop/target urgency
 - `STANCE_MAX_AGE_CYCLES` — maximum age of a saved portfolio stance in cycles (default `4`); blank disables expiry. The stance is evaluated every cycle, including when no pairs are scannable
 - `MAX_EXPOSURE_PCT` — optional exposure cap as a portfolio fraction; disabled by default
@@ -54,6 +54,11 @@ All settings live in `.env` (see `.env.example`):
 - `AI_CONFIDENCE_THRESHOLD` — optional AI confidence floor for buy decisions from 1–10; disabled by default
 - `AI_SELL_CONFIDENCE_THRESHOLD` — optional AI confidence floor for sell decisions from 1–10; disabled by default
 - `SCAN_MAX_RSI` — optional hard scan filter for RSI; disabled by default, valid range `0`–`100`
+- `SCAN_UNIVERSE` — `auto` (default) discovers active Kraken spot markets quoted in USD, or `watchlist` preserves the legacy 20-pair scan
+- `MIN_24H_QUOTE_VOLUME_USD` — Stage 1 24-hour USD quote-volume floor (default `$250,000`); lower-liquidity markets are dropped before TA
+- `SCAN_TA_LIMIT` — maximum coarse-ranked markets receiving full TA (default `40`)
+- `DAILY_MOVERS_COUNT` — liquid daily gainers and losers forced into Stage 2 (default `3` each)
+- `AI_WEB_SEARCH` — enable the optional OpenRouter `:online` loser news check before a mover decision (default `true`; blank or false disables it)
 - `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
 - `DATA_DIR` — where positions, state and trade history live (default `./data`)
 - `OHLCV_CONCURRENCY` — parallel market-data requests per cycle (default `4`)
@@ -94,6 +99,22 @@ stances without metadata are treated as stale. Configured expiry also has a wall
 backstop of two times the cycle budget (`STANCE_MAX_AGE_CYCLES` multiplied by the scan
 interval), allowing for a slow cycle or delayed restart without leaving a mandate active
 indefinitely.
+
+### Scan funnel
+
+With `SCAN_UNIVERSE=auto`, each cycle discovers active Kraken spot markets quoted in USD,
+then excludes stablecoin bases, wrapped or staked/earn-style symbols, configured exclusions,
+and holdings already in the account. A single batched ticker stage drops markets below the
+`MIN_24H_QUOTE_VOLUME_USD` floor and coarse-ranks the survivors using range position,
+24-hour change, and volume. Full OHLCV/TA analysis and `scoreSetup` then run only on the top
+`SCAN_TA_LIMIT` markets, plus the configured daily gainers and losers. `SCAN_UNIVERSE=watchlist`
+retains the legacy 20-pair universe. Liquid losers may receive a separate OpenRouter
+`:online` news check before their trading decision when `AI_WEB_SEARCH=true`; failed
+searches are non-blocking. Decisions also receive compact same-pair history from
+persisted trade records.
+Preflight samples a bounded subset rather than running TA over the discovered market set.
+All discovered pairs use the shared `unlisted` sector bucket; the optional
+`MAX_SECTOR_EXPOSURE_PCT` cap, when enabled, applies to that aggregate bucket.
 
 ### Positions you bought yourself
 
@@ -244,7 +265,7 @@ spend most or all of a tiny account if the AI requests it; use `PAPER_MODE=true`
 
 ## Deployment
 
-`Procfile` defines a continuous `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. Live mode reconciles and manages every held asset with an active Kraken `BASE/USD` spot market, while Phase 2 new-buy scanning remains limited to the watchlist. State and trade history are persisted under `DATA_DIR` (default `./data`); Railway-style ephemeral filesystems wipe that on redeploy, so either point `DATA_DIR` at a mounted volume or rely on live mode reconciling positions from the Kraken balance each cycle. Unreadable state files are backed up rather than silently discarded.
+`Procfile` defines a continuous `worker` process running `npm start`, suitable for Railway or other Procfile-based hosts. Live mode reconciles and manages every held asset with an active Kraken `BASE/USD` spot market. In `SCAN_UNIVERSE=auto`, Phase 2 discovers active USD spot markets from Kraken, filters them by stablecoin/exclusion/holding rules and a ticker liquidity floor, then runs full TA only on the coarse top `SCAN_TA_LIMIT`; `watchlist` preserves the legacy scan. State and trade history are persisted under `DATA_DIR` (default `./data`); Railway-style ephemeral filesystems wipe that on redeploy, so either point `DATA_DIR` at a mounted volume or rely on live mode reconciling positions from the Kraken balance each cycle. Unreadable state files are backed up rather than silently discarded.
 
 Market data is fetched with bounded concurrency; ccxt's rate limiter still serialises the
 requests. Errors that cannot succeed on a retry — bad credentials, rejected orders, unknown

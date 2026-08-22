@@ -97,3 +97,26 @@ cycle sell-biased and expensive.
 **Verified:** Paper cycle with a mock provider: sell → refresh → same-cycle buy.
 **Watch out:** Claude's concurrent work landed in the same window; that merge is
 `0d3a44c`, and no upstream behaviour was dropped.
+
+### 2026-08-22 — Devin — Broad ticker funnel, daily movers, and pair memory
+
+**Changed:** `SCAN_UNIVERSE=auto` now discovers active USD spot markets from Kraken, removes
+reserved/stablecoin/wrapped/held assets, applies a `$250,000` 24-hour quote-volume floor,
+coarse-ranks the survivors, and runs full TA on `SCAN_TA_LIMIT=40` markets. The legacy
+watchlist remains available. Liquid daily gainers and losers are selected from the same
+ticker batch (`DAILY_MOVERS_COUNT=3` each) and forced into TA, with category and mover tags
+in the scan logs. `AI_DECISIONS_PER_CYCLE` remains six affordable decisions, and candidates
+below the exchange minimum are skipped before an AI call. Loser movers can request a separate
+OpenRouter `:online` news check when `AI_WEB_SEARCH=true`; failures continue without news.
+Compact same-pair closed-trade history is included in decision context, including entry
+verdict, thesis and realised outcome.
+**Why:** The fixed 20-pair list starved the buy funnel and gave the model too few affordable
+opportunities; movers and prior outcomes add breadth and context without TA on every market.
+The `$250,000` floor is intentionally in the low hundreds of thousands to avoid obvious
+illiquidity while preserving broad category coverage. Movers add to, rather than replace, the
+coarse TA limit.
+**Verified:** Pure universe, liquidity, ranking, affordability, mover, news-gate and history
+checks; build; all test suites; and diff whitespace checks. Existing paper cycle tests exercised
+auto discovery and category/mover logging. No live Kraken calls, authenticated OpenRouter
+web-search call, or live order was performed; the `:online` capability and account entitlement
+remain unverified, and the news path is safely non-blocking.
