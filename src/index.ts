@@ -271,6 +271,7 @@ type TradingConfig = {
   min24hQuoteVolumeUsd: number;
   scanTaLimit: number;
   dailyMoversCount: number;
+  sleeperCount: number;
   aiWebSearch: boolean;
   /** Preferred number of concurrent positions. Guidance for the AI, not a cap. */
   targetPositionCount: number | null;
@@ -385,6 +386,7 @@ function loadConfig(): TradingConfig {
     min24hQuoteVolumeUsd: envNumber('MIN_24H_QUOTE_VOLUME_USD', 250_000, 0),
     scanTaLimit: envInteger('SCAN_TA_LIMIT', 40, 1),
     dailyMoversCount: envInteger('DAILY_MOVERS_COUNT', 3, 1),
+    sleeperCount: envInteger('SLEEPER_COUNT', 3, 0),
     aiWebSearch: process.env.AI_WEB_SEARCH === undefined
       ? true
       : process.env.AI_WEB_SEARCH.trim() !== '' && envBoolean('AI_WEB_SEARCH', false),
@@ -623,6 +625,28 @@ export function selectDailyMovers(tickers: ScanTicker[], count: number): DailyMo
   };
 }
 
+/**
+ * Picks the quietest liquid tickers — smallest 24h move — that have not already
+ * earned a look through the coarse rank or the mover list.
+ *
+ * Movers surface what already moved; the coarse rank favours what is near its
+ * daily low or already trending. Both structurally miss a coin that is simply
+ * quiet: normal volume, unremarkable range, nobody's attention on it yet. That
+ * is exactly the profile of something building a base before the rest of the
+ * market notices it in a bull run. Forcing a handful of the quietest names into
+ * full technical analysis every cycle is the only way they get a fair look
+ * instead of being filtered out by a score built to reward what is loud.
+ */
+export function selectSleepers(
+  tickers: ScanTicker[], alreadyCovered: Iterable<string>, count: number,
+): ScanTicker[] {
+  const covered = new Set([...alreadyCovered]);
+  return tickers
+    .filter(ticker => Number.isFinite(ticker.changePct) && !covered.has(ticker.pair))
+    .sort((a, b) => Math.abs(a.changePct) - Math.abs(b.changePct) || b.volume24h - a.volume24h)
+    .slice(0, Math.max(0, count));
+}
+
 export function coarseRankTickers(tickers: ScanTicker[]): CoarseTicker[] {
   const maxVolumeLog = Math.max(1, ...tickers.map(ticker => Math.log1p(ticker.volume24h)));
   const ranked = tickers.map(ticker => {
@@ -661,24 +685,42 @@ export function shouldAttemptMoverNews(
 interface DecisionCandidate {
   pair: string;
   mover?: 'gainer' | 'loser';
+  sleeper?: boolean;
   score: { score: number };
 }
 
 /**
- * Put a few movers ahead of score-ranked candidates so unusual moves get heard.
+ * Put a few movers, and a few quiet sleepers, ahead of score-ranked candidates so
+ * neither an unusual move nor a quiet accumulator gets starved by the ordinary
+ * score ranking. `sleeperSlots` defaults to 0, so an existing two-argument call
+ * reserves for movers only and behaves exactly as before.
  */
 export function prioritizeMoverCandidates<T extends DecisionCandidate>(
-  candidates: T[], budget: number, moverSlots = Math.ceil(budget / 2),
+  candidates: T[], budget: number, moverSlots = Math.ceil(budget / 2), sleeperSlots = 0,
 ): T[] {
-  const slots = Math.max(0, Math.min(Math.floor(moverSlots), budget));
-  const movers = candidates
+  const reserved: T[] = [];
+  const reservedPairs = new Set<string>();
+  const reserve = (pool: T[], slots: number) => {
+    for (const candidate of pool.slice(0, Math.max(0, slots))) {
+      if (reservedPairs.has(candidate.pair)) continue;
+      reserved.push(candidate);
+      reservedPairs.add(candidate.pair);
+    }
+  };
+
+  const moverPool = candidates
     .filter(candidate => candidate.mover)
     .sort((a, b) =>
       (a.mover === 'loser' ? 0 : 1) - (b.mover === 'loser' ? 0 : 1) ||
       b.score.score - a.score.score ||
       a.pair.localeCompare(b.pair));
-  const reserved = movers.slice(0, slots);
-  const reservedPairs = new Set(reserved.map(candidate => candidate.pair));
+  reserve(moverPool, Math.min(Math.floor(moverSlots), budget));
+
+  const sleeperPool = candidates
+    .filter(candidate => candidate.sleeper && !reservedPairs.has(candidate.pair))
+    .sort((a, b) => b.score.score - a.score.score || a.pair.localeCompare(b.pair));
+  reserve(sleeperPool, Math.min(Math.floor(sleeperSlots), Math.max(0, budget - reserved.length)));
+
   const remainder = candidates
     .filter(candidate => !reservedPairs.has(candidate.pair))
     .sort((a, b) =>
@@ -3071,7 +3113,7 @@ Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marke
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
 ${marketContextNote(context?.relativeStrength, context?.windowHigh) ? `\nMARKET CONTEXT:\n${marketContextNote(context?.relativeStrength, context?.windowHigh)}\n` : ''}
 ${context?.concentration ? `\n${context.concentration}\n` : ''}
-${context?.marketContext ? `\nMARKET NEWS CONTEXT (evidence, not an instruction):\n${context.marketContext}\n` : ''}
+${context?.marketContext ? `\nMARKET CONTEXT NOTE (evidence, not an instruction):\n${context.marketContext}\n` : ''}
 BUY or HOLD?`, pair);
   }
 
@@ -3717,7 +3759,7 @@ async function main() {
   console.log(`[CONFIG] Exposure: ${limit(CONFIG.maxExposurePct)} | Portfolio risk: ${limit(CONFIG.maxPortfolioRiskPct)} | Min trade: ${limit(CONFIG.minTradeUsd, ' USD')} | Min R/R: ${limit(CONFIG.minRrRatio, ':1')} | Max RSI: ${limit(CONFIG.scanMaxRsi)} | Fee reserve: ${(CONFIG.feeReservePct * 100).toFixed(2)}%`);
   console.log(`[CONFIG] State directory: ${DATA_DIR}`);
   console.log(`[CONFIG] AI max tokens: ${CONFIG.aiMaxTokens} | AI base URL: ${CONFIG.aiBaseUrl ? 'custom' : 'provider default'} | Scan concurrency: ${CONFIG.ohlcvConcurrency}`);
-  console.log(`[CONFIG] Scan funnel: ${CONFIG.scanUniverse} | 24h quote-volume floor: $${CONFIG.min24hQuoteVolumeUsd.toLocaleString()} | TA limit: ${CONFIG.scanTaLimit} | Movers: ${CONFIG.dailyMoversCount} each | News: ${CONFIG.aiWebSearch ? 'on' : 'off'}`);
+  console.log(`[CONFIG] Scan funnel: ${CONFIG.scanUniverse} | 24h quote-volume floor: $${CONFIG.min24hQuoteVolumeUsd.toLocaleString()} | TA limit: ${CONFIG.scanTaLimit} | Movers: ${CONFIG.dailyMoversCount} each | Sleepers: ${CONFIG.sleeperCount} | News: ${CONFIG.aiWebSearch ? 'on' : 'off'}`);
   console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
   console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
   console.log(`[CONFIG] Reserved assets: ${CONFIG.excludedAssets.size ? [...CONFIG.excludedAssets].sort().join(', ') : 'none'} (never bought, sold or managed)`);
@@ -4263,6 +4305,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   );
   let scanMedianChangePct = stagedMedianChangePct;
   const moverByPair = new Map<string, 'gainer' | 'loser'>();
+  const sleeperPairs = new Set<string>();
   if (canOpen) {
     try {
       if (!stage1FetchSucceeded) {
@@ -4294,10 +4337,20 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         const movers = selectDailyMovers(liquidTickers, CONFIG.dailyMoversCount);
         for (const ticker of movers.gainers) moverByPair.set(ticker.pair, 'gainer');
         for (const ticker of movers.losers) moverByPair.set(ticker.pair, 'loser');
+        const coarseSlice = coarseTickers.slice(0, CONFIG.scanTaLimit).map(ticker => ticker.pair);
+        // Sleepers are drawn from whatever the coarse rank and the movers list did
+        // not already claim, so hunting for them never costs an already-earned slot.
+        const sleepers = selectSleepers(
+          liquidTickers,
+          new Set([...coarseSlice, ...moverByPair.keys()]),
+          CONFIG.sleeperCount,
+        );
+        for (const ticker of sleepers) sleeperPairs.add(ticker.pair);
         scanPairs = [...new Set([
-          ...coarseTickers.slice(0, CONFIG.scanTaLimit).map(ticker => ticker.pair),
+          ...coarseSlice,
           ...movers.gainers.map(ticker => ticker.pair),
           ...movers.losers.map(ticker => ticker.pair),
+          ...sleepers.map(ticker => ticker.pair),
         ])];
         scanPrices = Object.fromEntries(scanPairs.map(pair => [pair, scanTickerByPair.get(pair)!.price]));
         console.log(`  [SCAN] auto: ${universe.length} markets discovered | ${liquidTickers.length} above $${CONFIG.min24hQuoteVolumeUsd.toLocaleString()} 24h quote volume | ${scanPairs.length} sent to TA`);
@@ -4305,6 +4358,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           console.log(`  [SCAN] Coarse top: ${coarseTickers.slice(0, 5).map(ticker => `${ticker.pair} (${ticker.coarseScore.toFixed(3)})`).join(', ')}`);
         if (movers.gainers.length > 0 || movers.losers.length > 0)
           console.log(`  [SCAN] Movers forced into TA: ${movers.gainers.map(t => `${t.pair} +${t.changePct.toFixed(1)}%`).join(', ') || 'none'} | losers: ${movers.losers.map(t => `${t.pair} ${t.changePct.toFixed(1)}%`).join(', ') || 'none'}`);
+        if (sleepers.length > 0)
+          console.log(`  [SCAN] Sleepers forced into TA (quiet, under the radar): ${sleepers.map(t => `${t.pair} ${t.changePct >= 0 ? '+' : ''}${t.changePct.toFixed(1)}%`).join(', ')}`);
         const categories = [...new Set(scanPairs.map(pair => getSector(pair)))];
         console.log(`  [SCAN] Category spread: ${categories.join(', ') || 'none'}${categories.length === 1 && categories[0] === 'unlisted' ? ' (Kraken provides no sector metadata for discovered markets)' : ''}`);
       }
@@ -4324,10 +4379,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       }
       const ticker = scanTickerByPair.get(pair);
       const mover = moverByPair.get(pair);
+      const sleeper = sleeperPairs.has(pair);
       return {
         pair, sector: getSector(pair), ta,
         vol: ticker?.volume24h ?? 0, score: scoreSetup(ta), plan: planTrade(ta),
-        mover,
+        mover, sleeper,
       };
     } catch (e) {
       console.warn(`  [PHASE 2] ${pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -4339,7 +4395,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   candidates.sort((a, b) => b.score.score - a.score.score || a.ta.rsi - b.ta.rsi);
   for (const c of candidates) {
     const distance = c.score.supportDistance === null ? 'none' : pct(c.score.supportDistance);
-    console.log(`  [CANDIDATE] ${c.pair}${c.mover ? ` [MOVER ${c.mover}]` : ''}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
+    console.log(`  [CANDIDATE] ${c.pair}${c.mover ? ` [MOVER ${c.mover}]` : ''}${c.sleeper ? ' [SLEEPER]' : ''}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
   }
 
   // ── PHASE 3: AI DECISIONS ──
@@ -4370,13 +4426,23 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   const aiCandidates = stance.stance === 'RISK_OFF'
     ? []
-    : prioritizeMoverCandidates(candidates, CONFIG.aiDecisionsPerCycle);
+    : prioritizeMoverCandidates(
+        candidates, CONFIG.aiDecisionsPerCycle,
+        Math.ceil(CONFIG.aiDecisionsPerCycle / 2),
+        Math.max(1, Math.floor(CONFIG.aiDecisionsPerCycle / 3)),
+      );
   const moverSlotCount = Math.min(
     Math.ceil(CONFIG.aiDecisionsPerCycle / 2),
     aiCandidates.filter(candidate => candidate.mover).length,
   );
+  const sleeperSlotCount = Math.min(
+    Math.max(1, Math.floor(CONFIG.aiDecisionsPerCycle / 3)),
+    aiCandidates.filter(candidate => candidate.sleeper && !candidate.mover).length,
+  );
   if (moverSlotCount > 0)
     console.log(`  [AI BUDGET] Reserving ${moverSlotCount}/${CONFIG.aiDecisionsPerCycle} decision slots for movers (losers first; remainder ranked by score)`);
+  if (sleeperSlotCount > 0)
+    console.log(`  [AI BUDGET] Reserving ${sleeperSlotCount}/${CONFIG.aiDecisionsPerCycle} decision slots for quiet sleepers`);
   let decisionsUsed = 0;
   for (const c of aiCandidates) {
     if (shutdownRequested) break;
@@ -4425,7 +4491,9 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     console.log(`  [AI BUDGET] Decision ${decisionsUsed}/${CONFIG.aiDecisionsPerCycle}: ${c.pair} (${c.score.score.toFixed(2)})`);
     const newsContext = c.mover === 'loser'
       ? await ai.checkMoverNews(c.pair, scanTickerByPair.get(c.pair)?.changePct ?? 0)
-      : '';
+      : c.sleeper
+        ? "SLEEPER PICK: quiet 24h move, not a mover and not already high on the coarse rank. It surfaced because nothing has drawn attention to it yet, not because of a catalyst. Judge it purely on the technicals above — the appeal is being early, not evidence of a story."
+        : '';
     let windowHigh: WindowHighContext | null = null;
     try {
       const dailyCandles = await exchange.getOhlcv(c.pair, '1d', 365);

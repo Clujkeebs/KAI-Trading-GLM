@@ -60,6 +60,7 @@ All settings live in `.env` (see `.env.example`):
 - `MIN_24H_QUOTE_VOLUME_USD` — Stage 1 24-hour USD quote-volume floor (default `$250,000`); lower-liquidity markets are dropped before TA
 - `SCAN_TA_LIMIT` — maximum coarse-ranked markets receiving full TA (default `40`)
 - `DAILY_MOVERS_COUNT` — liquid daily gainers and losers forced into Stage 2 (default `3` each)
+- `SLEEPER_COUNT` — quietest liquid markets forced into full TA every cycle (default `3`, `0` disables)
 - `AI_WEB_SEARCH` — enable the optional OpenRouter `:online` loser news check before a mover decision (default `true`; blank or false disables it)
 - `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
 - `DATA_DIR` — where positions, state and trade history live (default `./data`)
@@ -133,8 +134,16 @@ retains the legacy 20-pair universe. Liquid losers may receive a separate OpenRo
 searches are non-blocking, and a hard capability rejection disables further attempts for
 the rest of the process. Decisions also receive compact same-pair history from persisted
 trade records. Half of the six-decision budget is reserved for movers (losers are
-considered before gainers); the remaining slots follow TA score, so a liquid crash cannot
-be starved by ordinary setups.
+considered before gainers), and a further third for sleepers; the remaining slots follow
+TA score, so neither a liquid crash nor ordinary setups get starved.
+
+The coarse rank and the movers list both structurally miss a market that is simply
+quiet — normal volume, unremarkable 24-hour range, nothing pulling attention to it. That
+is the profile of something basing before the rest of the market notices it. `SLEEPER_COUNT`
+liquid tickers with the smallest 24-hour move, not already claimed by the coarse rank or the
+movers list, are forced into full TA and tagged `[SLEEPER]` in the scan log, so quiet coins
+get judged on their technicals rather than filtered out by a score built to reward what's
+already loud.
 Preflight samples held pairs and the watchlist first, then tops up from the discovered
 universe, rather than taking an arbitrary slice. Known watchlist pairs receive sector
 allocation guidance. Discovered pairs have no sector metadata: their prompts omit sector

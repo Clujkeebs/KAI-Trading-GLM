@@ -46,6 +46,11 @@ it turns a bad week into a terminal one.
 - **Trim to fund.** The weakest holding funds the best idea.
 - **Every extra trade must pay for its fees and slippage.**
 - **One trade proves nothing.** Sectors that keep losing get sized down or skipped.
+- **Hunt the quiet ones.** `[SLEEPER]` marks a market nobody is watching yet. Judge it on
+  its setup, not on how it was found — most will be nothing, and that is fine.
+- **Safer and speculative both have a place.** A steadier core and a smaller, real
+  speculative sleeve are not in conflict. Size each honestly; do not pretend one into the
+  other.
 
 ## Never
 

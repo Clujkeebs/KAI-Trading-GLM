@@ -37,6 +37,31 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Hunt quiet sleeper markets, not just movers
+
+**Changed:** `selectSleepers` forces the `SLEEPER_COUNT` (default 3) liquid tickers with the
+smallest 24h move — not already claimed by the coarse rank or the movers list — into full
+TA every cycle, tagged `[SLEEPER]` in the candidate log. `prioritizeMoverCandidates` gained
+an optional fourth `sleeperSlots` parameter (default 0, so the existing two- and
+three-argument call sites are unchanged) reserving up to a third of the decision budget for
+them after movers, never consuming the whole budget. The per-pair prompt tells the model a
+sleeper surfaced from quiet, not from a catalyst, and to judge it purely on the technicals.
+Added two short bullets to `SOUL.md` — hunt the quiet ones, and a steadier core plus a real
+speculative sleeve are not in conflict — matching the operator's ask to find things "under
+the radar in a bull market" and to size both safe and speculative positions.
+**Why:** The coarse rank rewards range position, 24h change and volume; the movers list is
+explicitly the biggest 24h moves. Both structurally exclude a market that is simply quiet —
+exactly the profile of something basing before the rest of the market notices it — so it
+never got a technical look at all.
+**Verified:** `npm run build` and `npm test` clean (16 suites, including a new one covering
+selection, the liquidity tiebreak, budget backward-compatibility, and that a reserved
+mover+sleeper slot never consumes the entire decision budget). Not yet verified against a
+live cycle; the operator's Railway service has `SLEEPER_COUNT` unset so it will run on the
+default of 3 once deployed.
+**Watch out:** This adds up to `SLEEPER_COUNT` extra full-TA (OHLCV) fetches per cycle,
+plus up to a third of the AI decision budget when a strong sleeper setup appears — same cost
+shape as movers, additive to it.
+
 ### 2026-08-22 — Claude — Reviewed and pulled the universe/charter work; raised the decision budget
 
 **Changed:** Nothing in `src/index.ts`. Fast-forwarded onto this branch's `4b67ce3` after

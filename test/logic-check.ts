@@ -15,7 +15,7 @@ import {
   isStanceFresh, normalizeCycleCount, nextCycleNumber, filterDiscoveredMarkets,
   filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
   shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
-  formatPairHistory, isMinimumAffordable, Memory,
+  formatPairHistory, isMinimumAffordable, Memory, selectSleepers,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -787,3 +787,54 @@ assert.equal(legacyImported['BBB/USD'].origin, 'bot', 'a bot entry keeps its own
 assert.equal(legacyImported['CCC/USD'].origin, 'bot', 'an explicit origin is never overwritten');
 
 console.log('position origin checks passed');
+
+// ── Sleeper hunting: give the quietest ignored coins a fair look ────────────
+// Movers surface what already moved and the coarse rank favours what's near its
+// daily low or already trending; both structurally skip a coin that's simply
+// quiet. selectSleepers forces the quietest liquid names — the ones nobody's
+// looking at — into full technical analysis so they get judged on the merits.
+const mkTicker = (pair: string, changePct: number, volume24h = 1_000_000): ScanTicker => ({
+  pair, price: 10, high24h: 11, low24h: 9, changePct, volume24h,
+});
+const sleeperUniverse = [
+  mkTicker('LOUD/USD', 42),      // already a mover / extreme move
+  mkTicker('QUIET1/USD', 0.4),
+  mkTicker('QUIET2/USD', -0.7),
+  mkTicker('QUIET3/USD', 1.1, 5_000_000), // quieter tier, more liquid
+  mkTicker('MID/USD', 8),
+  mkTicker('COVERED/USD', 0.2), // already claimed by the coarse rank
+];
+const sleepers = selectSleepers(sleeperUniverse, new Set(['LOUD/USD', 'COVERED/USD']), 2);
+assert.deepEqual(sleepers.map(t => t.pair), ['QUIET1/USD', 'QUIET2/USD'],
+  'the quietest uncovered tickers win, ranked by |change%| ascending');
+assert.ok(!sleepers.some(t => t.pair === 'LOUD/USD' || t.pair === 'COVERED/USD'),
+  'a ticker already covered by movers or the coarse rank is never re-selected');
+
+// A tie on quietness breaks toward the more liquid of the two — the safer pick.
+const tieBroken = selectSleepers(
+  [mkTicker('THIN/USD', 0.5, 10_000), mkTicker('DEEP/USD', 0.5, 9_000_000)], new Set(), 1);
+assert.equal(tieBroken[0].pair, 'DEEP/USD');
+
+assert.deepEqual(selectSleepers(sleeperUniverse, new Set(), 0), [], 'SLEEPER_COUNT=0 disables it');
+assert.equal(selectSleepers([], new Set(), 5).length, 0);
+
+// ── Sleeper slots ride alongside mover slots in the decision budget ─────────
+const withSleepers = [
+  { pair: 'M1/USD', mover: 'loser' as const, score: { score: 40 } },
+  { pair: 'S1/USD', sleeper: true, score: { score: 90 } },
+  { pair: 'S2/USD', sleeper: true, score: { score: 30 } },
+  { pair: 'PLAIN/USD', score: { score: 95 } },
+];
+// budget 4: 2 mover slots (only 1 mover exists), 1 sleeper slot, remainder plain.
+const ordered = prioritizeMoverCandidates(withSleepers, 4, 2, 1);
+assert.equal(ordered[0].pair, 'M1/USD', 'the mover still leads');
+assert.equal(ordered[1].pair, 'S1/USD', 'the stronger sleeper takes the reserved slot');
+assert.ok(ordered.map(c => c.pair).includes('PLAIN/USD'),
+  'a reserved slot for movers and sleepers must not consume the whole budget');
+assert.equal(ordered.length, 4);
+// Backward-compat: omitting sleeperSlots reserves none, exactly as before this feature.
+const noSleeperArg = prioritizeMoverCandidates(withSleepers, 4, 2);
+assert.ok(!noSleeperArg.slice(0, 1).some(c => c.sleeper && !c.mover),
+  'a call with no sleeperSlots argument does not reserve for sleepers');
+
+console.log('sleeper checks passed');
