@@ -192,3 +192,31 @@ orders and used no real credentials.
 
 **Unverified:** Live Kraken market/candle responses, authenticated provider behavior, and
 production model interpretation of the archived playbook remain unverified.
+
+### 2026-08-22 — Devin — Supply market context to Phase 1 reviews
+
+**Changed:** The Stage 1 universe discovery, batched ticker fetch, liquidity filtering,
+and universe-median calculation now run before Phase 1. The single ticker batch includes
+both the held pairs needed for review context and the separate held-free buy universe;
+Phase 2 reuses that result without a second ticker fetch in the normal path. If Stage 1
+fails, reviews omit relative strength and the existing price fallback remains available.
+Position reviews now receive each held pair's 24-hour move versus the Stage 1 universe
+median.
+
+Successful one-year daily windows are cached per pair for six hours and reused across
+cycles. At the default five-review budget, the first cycle can add up to five daily-candle
+requests; while cached, later cycles add zero, with a refetch after the TTL.
+
+**Why:** The playbook's dead-money sell test requires market-relative performance during
+Phase 1, not only during new-entry decisions. Caching prevents the review budget from
+turning into five repeated daily-history requests every cycle.
+
+**Verified:** Unit coverage includes the held-plus-universe ticker batch set and cache TTL
+freshness boundaries. `npm run build`, `npm test`, and `git diff --check` pass. The paper
+mock smoke at `/home/ubuntu/kai-review-context-smoke.log` captures a held-position review
+with both relative-strength and fetched-window-high context; request bodies are in
+`/home/ubuntu/review-context-requests.jsonl`.
+
+**Unverified:** Live Kraken ticker batching, live daily-candle responses, and production
+provider/model behavior remain unverified. The fallback-only ticker failure branch was
+covered by code inspection and existing exchange error handling, not a live failure.

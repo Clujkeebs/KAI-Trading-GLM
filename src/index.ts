@@ -89,6 +89,19 @@ const PLAYBOOK = initializePlaybook();
 // --- TYPES ---
 
 export interface OhlcvCandle { timestamp: number; open: number; high: number; low: number; close: number; volume: number }
+const DAILY_WINDOW_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const dailyWindowCache = new Map<string, { fetchedAt: number; candles: OhlcvCandle[] }>();
+
+export function stage1TickerPairs(universe: string[], heldPairs: Iterable<string>): string[] {
+  return [...new Set([...universe, ...heldPairs])];
+}
+
+export function isDailyWindowCacheFresh(
+  fetchedAt: number, now = Date.now(), ttlMs = DAILY_WINDOW_CACHE_TTL_MS,
+): boolean {
+  return Number.isFinite(fetchedAt) && fetchedAt <= now && now - fetchedAt < ttlMs;
+}
+
 type Trend = 'bullish' | 'bearish' | 'neutral';
 export interface TechnicalAnalysis {
   currentPrice: number; rsi: number;
@@ -3917,6 +3930,18 @@ async function analysePair(exchange: Exchange, pair: string, price: number): Pro
   return TA.full(candles, price);
 }
 
+async function getDailyWindow(exchange: Exchange, pair: string): Promise<OhlcvCandle[]> {
+  const now = Date.now();
+  const cached = dailyWindowCache.get(pair);
+  if (cached && isDailyWindowCacheFresh(cached.fetchedAt, now))
+    return cached.candles;
+  const candles = await exchange.getOhlcv(pair, '1d', 365);
+  // Daily highs change slowly; avoid spending a rate-limited request on every review.
+  if (candles.length > 0)
+    dailyWindowCache.set(pair, { fetchedAt: now, candles });
+  return candles;
+}
+
 async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const callsAtCycleStart = { ...{ calls: 0, promptTokens: 0, completionTokens: 0 }, ...(ai.usage ?? {}) };
   exchange.beginCycle();
@@ -3933,6 +3958,37 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
   const open = mem.getOpenPositions();
+  const heldBeforePhase1 = new Set(open.map(position => position.pair));
+  let stagedUniverse: string[] = [];
+  let stagedTickers: ScanTicker[] = [];
+  let stagedLiquidTickers: ScanTicker[] = [];
+  let stagedMedianChangePct: number | null = null;
+  let stage1FetchSucceeded = false;
+  // Reviews need market-relative performance, while entries need a held-free universe.
+  const fetchStage1 = async () => {
+    const universe = await exchange.getScanUniverse(CONFIG.scanUniverse, heldBeforePhase1);
+    const tickerPairs = stage1TickerPairs(universe, heldBeforePhase1);
+    const tickers = tickerPairs.length > 0 ? await exchange.getTickersBatch(tickerPairs) : [];
+    return {
+      universe,
+      tickers,
+      medianChangePct: medianTickerChange(tickers),
+      liquidTickers: filterLiquidTickers(
+        tickers.filter(ticker => universe.includes(ticker.pair)),
+        CONFIG.min24hQuoteVolumeUsd,
+      ),
+    };
+  };
+  try {
+    const stage1 = await fetchStage1();
+    stagedUniverse = stage1.universe;
+    stagedTickers = stage1.tickers;
+    stagedMedianChangePct = stage1.medianChangePct;
+    stagedLiquidTickers = stage1.liquidTickers;
+    stage1FetchSucceeded = true;
+  } catch (e) {
+    console.warn(`  [PHASE 1] Stage 1 ticker context unavailable: ${e instanceof Error ? e.message : String(e)}; reviews will omit relative strength`);
+  }
 
   // The cash target the model set last cycle is only half a lever if it can merely
   // block buying. When the account is below that target the only way to reach it is
@@ -3967,7 +4023,16 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     console.log(`  [CASH TARGET] ${fmt(account.cashUsd)} held vs ${fmt(cashTargetUsd)} target (${pct(standingStance!.cashTargetPct)}); ${fmt(cashShortfallUsd)} short — trims are available to the AI this cycle`);
 
   if (open.length > 0) {
-    const prices = await exchange.getPricesBatch(open.map(p => p.pair));
+    const prices = Object.fromEntries(
+      stagedTickers
+        .filter(ticker => heldBeforePhase1.has(ticker.pair))
+        .map(ticker => [ticker.pair, ticker.price]),
+    );
+    const missingPrices = open
+      .map(position => position.pair)
+      .filter(pair => prices[pair] === undefined);
+    if (missingPrices.length > 0)
+      Object.assign(prices, await exchange.getPricesBatch(missingPrices));
     mem.updatePrices(prices);
 
     // Restore exitability before any stop is evaluated, so a triggered stop is
@@ -4058,14 +4123,18 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         let reviewWindowHigh: WindowHighContext | null = null;
         try {
           reviewWindowHigh = windowHighContext(
-            await exchange.getOhlcv(pos.pair, '1d', 365),
+            await getDailyWindow(exchange, pos.pair),
             ta.currentPrice,
           );
         } catch (e) {
           console.warn(`  [PHASE 1] ${pos.pair} daily window unavailable: ${e instanceof Error ? e.message : String(e)}`);
         }
+        const reviewTicker = stagedTickers.find(ticker => ticker.pair === pos.pair);
+        const reviewRelative = reviewTicker
+          ? relativeStrength(reviewTicker, stagedMedianChangePct)
+          : null;
         const d = await ai.review(pos.pair, ta, cashNote, concentration,
-          [alertNote, ownership].filter(Boolean).join('\n\n'), null, reviewWindowHigh);
+          [alertNote, ownership].filter(Boolean).join('\n\n'), reviewRelative, reviewWindowHigh);
 
         if (!shutdownRequested && d.verdict === 'SELL' && d.verdictHolds &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
@@ -4187,23 +4256,39 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   let coarseTickers: CoarseTicker[] = [];
   let scanPairs: string[] = [];
   let scanPrices: Record<string, number> = {};
-  let scanTickerByPair = new Map<string, ScanTicker>();
-  let scanMedianChangePct: number | null = null;
+  let scanTickerByPair = new Map(
+    stagedTickers
+      .filter(ticker => stagedUniverse.includes(ticker.pair))
+      .map(ticker => [ticker.pair, ticker] as const),
+  );
+  let scanMedianChangePct = stagedMedianChangePct;
   const moverByPair = new Map<string, 'gainer' | 'loser'>();
   if (canOpen) {
     try {
-      universe = await exchange.getScanUniverse(CONFIG.scanUniverse, heldPairs);
+      if (!stage1FetchSucceeded) {
+        const stage1 = await fetchStage1();
+        stagedUniverse = stage1.universe;
+        stagedTickers = stage1.tickers;
+        stagedMedianChangePct = stage1.medianChangePct;
+        stagedLiquidTickers = stage1.liquidTickers;
+        stage1FetchSucceeded = true;
+        scanTickerByPair = new Map(
+          stagedTickers
+            .filter(ticker => stagedUniverse.includes(ticker.pair))
+            .map(ticker => [ticker.pair, ticker] as const),
+        );
+        scanMedianChangePct = stagedMedianChangePct;
+      }
+      universe = stagedUniverse.filter(pair => !heldPairs.has(pair));
       if (CONFIG.scanUniverse === 'watchlist') {
         scanPairs = universe;
-        scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
-        const tickers = scanPairs.length > 0 ? await exchange.getTickersBatch(scanPairs) : [];
-        scanTickerByPair = new Map(tickers.map(ticker => [ticker.pair, ticker]));
-        scanMedianChangePct = medianTickerChange(tickers);
+        scanPrices = Object.fromEntries(scanPairs.map(pair => [
+          pair, scanTickerByPair.get(pair)?.price,
+        ]).filter((entry): entry is [string, number] => entry[1] !== undefined));
         console.log(`  [SCAN] watchlist: ${scanPairs.length} legacy pairs sent to TA`);
       } else {
-        const tickers = await exchange.getTickersBatch(universe);
-        scanMedianChangePct = medianTickerChange(tickers);
-        const liquidTickers = filterLiquidTickers(tickers, CONFIG.min24hQuoteVolumeUsd);
+        scanMedianChangePct = stagedMedianChangePct;
+        const liquidTickers = stagedLiquidTickers.filter(ticker => universe.includes(ticker.pair));
         coarseTickers = coarseRankTickers(liquidTickers);
         scanTickerByPair = new Map(liquidTickers.map(ticker => [ticker.pair, ticker]));
         const movers = selectDailyMovers(liquidTickers, CONFIG.dailyMoversCount);

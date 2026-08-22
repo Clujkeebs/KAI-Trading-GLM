@@ -121,7 +121,10 @@ window-high drawdown, never as an all-time high, and neither input is an automat
 
 With `SCAN_UNIVERSE=auto`, each cycle discovers active Kraken spot markets quoted in USD,
 then excludes stablecoin bases, wrapped or staked/earn-style symbols, configured exclusions,
-and holdings already in the account. A single batched ticker stage drops markets below the
+and holdings already in the account. The ticker stage runs before Phase 1 so held positions
+receive the same market-relative context as new candidates; its single batch includes both
+the buy universe and held pairs, while only non-held pairs can proceed to the buy funnel.
+It drops markets below the
 `MIN_24H_QUOTE_VOLUME_USD` floor and coarse-ranks the survivors using range position,
 24-hour change, and volume. Full OHLCV/TA analysis and `scoreSetup` then run only on the top
 `SCAN_TA_LIMIT` markets, plus the configured daily gainers and losers. `SCAN_UNIVERSE=watchlist`
@@ -138,6 +141,11 @@ allocation guidance. Discovered pairs have no sector metadata: their prompts omi
 targets and exposure guidance, and the optional `MAX_SECTOR_EXPOSURE_PCT` cap does not
 apply to them. Reporting may still aggregate them under `unlisted`, but that bucket cannot
 silently block every discovered entry.
+
+Position reviews fetch an approximately one-year daily candle window for the positions
+actually reviewed. Successful windows are cached per pair for six hours and reused across
+cycles; a first cycle can therefore add up to `AI_REVIEWS_PER_CYCLE` daily-candle requests
+(five by default), while later cycles normally add none until the cache expires.
 
 ### Positions you bought yourself
 

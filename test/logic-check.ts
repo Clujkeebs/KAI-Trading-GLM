@@ -11,6 +11,7 @@ import {
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
   resolvePlaybookFilePath, medianTickerChange, relativeStrength, windowHighContext,
+  stage1TickerPairs, isDailyWindowCacheFresh,
   isStanceFresh, normalizeCycleCount, nextCycleNumber, filterDiscoveredMarkets,
   filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
   shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
@@ -330,6 +331,12 @@ assert.deepEqual(windowHighContext(windowCandles, 10, 1_700_259_200_000), {
 });
 assert.equal(windowHighContext([], 10), null);
 assert.equal(windowHighContext(windowCandles, 0), null);
+assert.deepEqual(stage1TickerPairs(['A/USD', 'B/USD'], ['B/USD', 'HELD/USD']), [
+  'A/USD', 'B/USD', 'HELD/USD',
+]);
+assert.equal(isDailyWindowCacheFresh(1_700_000_000_000, 1_700_000_000_000 + 1_000), true);
+assert.equal(isDailyWindowCacheFresh(1_700_000_000_000, 1_700_000_000_000 + 6 * 60 * 60 * 1000), false);
+assert.equal(isDailyWindowCacheFresh(Number.NaN, 1_700_000_000_000), false);
 
 const reviewPositions = [
   { ...position, pair: 'URGENT/USD', entryPrice: 90, currentPrice: 100, stopLoss: 99, takeProfit: 130 },
