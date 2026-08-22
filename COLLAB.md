@@ -37,6 +37,31 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Exclude fiat currency pairs from the scan universe
+
+**Changed:** `filterDiscoveredMarkets()` now also excludes a new `FIAT_BASES` set (EUR, GBP,
+CHF, AUD, CAD, JPY) alongside the existing `STABLECOIN_BASES`/`WRAPPED_EARN_BASES` checks;
+`EURC` (Circle's EUR stablecoin) added to `STABLECOIN_BASES` itself.
+**Why:** Operator reported the bot "just sitting still," not investing. Traced through live
+logs (cycles 51-53): repeated `NEUTRAL` stances with reasoning like "top setups are
+stablecoins and a meme — no compelling catalyst to deploy into," and the candidate list
+showing `EUR/USD`, `GBP/USD`, `EURC/USD`, `AUD/USD` scoring 60-72 and repeatedly filling
+`[SLEEPER]` slots. These are forex/fiat-stablecoin pairs, not crypto — Kraken lists them as
+USD spot markets, but they have near-zero ATR against USD by definition and no "oversold
+bounce" to ever find. Worse, their flat 24h change is exactly the sleeper heuristic's
+"quiet, under the radar" profile, so they were winning sleeper slots meant for real quiet
+crypto setups. With `AI_DECISIONS_PER_CYCLE=6` and ~2 sleeper slots reserved, 1-2 of six
+decisions per cycle were plausibly being spent on pairs that can never produce a real trade
+idea — a real, structural drag on "finding things to buy," not just the small-tradable-
+capital and cash-target-conservatism explanation given earlier today.
+**Verified:** `npm run build` and `npm test` clean; extended the existing
+`filterDiscoveredMarkets` test in `logic-check.ts` with `EUR/USD`, `GBP/USD`, `EURC/USD`
+fixtures, confirmed excluded the same way a USD stablecoin already was.
+**Watch out:** Not yet observed on a live cycle post-deploy — the fiat pairs were present in
+every cycle sampled before this fix; watch the next few `[SCAN]`/`[CANDIDATE]` log lines to
+confirm they stop appearing, and whether real crypto candidates now occupy the slots they
+were taking.
+
 ### 2026-08-22 — Claude — Stop trimming positions at a loss to fund a new idea
 
 **Changed:** Three prompt-guidance edits, no new code gate:

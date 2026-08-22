@@ -499,10 +499,19 @@ const tradablePairs = () => WATCHLIST_PAIRS.filter(pair => !isExcludedPair(pair)
 const STABLECOIN_BASES = new Set([
   'USDC', 'USDT', 'DAI', 'PYUSD', 'TUSD', 'USDP', 'USDD', 'FDUSD',
   'USDS', 'USDE', 'USDA', 'USDG', 'RLUSD', 'GUSD', 'FRAX', 'LUSD',
+  'EURC', 'EURT', 'EURR', // fiat-pegged stablecoins; same non-opportunity as a USD one
 ]);
 const WRAPPED_EARN_BASES = new Set([
   'CBETH', 'ETH2', 'RETH', 'STETH', 'SUSDE', 'WBTC', 'WETH', 'WSOL', 'WSTETH',
 ]);
+/**
+ * Plain fiat currencies Kraken lists as USD-quoted spot markets (EUR/USD, GBP/USD, ...).
+ * These are forex pairs, not crypto: near-zero ATR against USD, no "oversold bounce" to
+ * find, and their flat 24h change reads as quiet/consolidating to the sleeper scan when it
+ * is really just what a currency pair always looks like. Left in, they crowded out real
+ * candidates at the top of the coarse rank and in sleeper slots.
+ */
+const FIAT_BASES = new Set(['EUR', 'GBP', 'CHF', 'AUD', 'CAD', 'JPY']);
 const SECTOR_WEIGHTS: Record<string, number> = {
   ai: 0.25, rwa: 0.20, defi: 0.25, l1: 0.10,
   perp_dex: 0.10, momentum: 0.05, depin: 0.03, privacy: 0.02,
@@ -741,7 +750,7 @@ export function filterDiscoveredMarkets(
         !(market.spot === true || market.type === 'spot') || held.has(pair))
       continue;
     const normalizedBase = normalizeAsset(base);
-    if (STABLECOIN_BASES.has(normalizedBase) || isWrappedEarnBase(base) ||
+    if (STABLECOIN_BASES.has(normalizedBase) || FIAT_BASES.has(normalizedBase) || isWrappedEarnBase(base) ||
         excluded.has(normalizedBase) || isExcludedPair(pair, excluded))
       continue;
     pairs.add(pair);

@@ -122,8 +122,11 @@ window-high drawdown, never as an all-time high, and neither input is an automat
 ### Scan funnel
 
 With `SCAN_UNIVERSE=auto`, each cycle discovers active Kraken spot markets quoted in USD,
-then excludes stablecoin bases, wrapped or staked/earn-style symbols, configured exclusions,
-and holdings already in the account. The ticker stage runs before Phase 1 so held positions
+then excludes stablecoin bases (including fiat-pegged ones like EURC), plain fiat-currency
+pairs Kraken lists as USD spot markets (EUR, GBP, CHF, AUD, CAD, JPY — forex, not crypto, with
+no oversold bounce to find and a near-zero 24h change that used to read as a quiet sleeper
+setup rather than what it actually is), wrapped or staked/earn-style symbols, configured
+exclusions, and holdings already in the account. The ticker stage runs before Phase 1 so held positions
 receive the same market-relative context as new candidates; its single batch includes both
 the buy universe and held pairs, while only non-held pairs can proceed to the buy funnel.
 It drops markets below the

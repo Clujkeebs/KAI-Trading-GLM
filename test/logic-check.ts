@@ -428,10 +428,14 @@ const discoveredMarkets = [
   { symbol: 'DEAD/USD', base: 'DEAD', quote: 'USD', active: false, spot: true },
   { symbol: 'SWAP/USD', base: 'SWAP', quote: 'USD', active: true, spot: false, type: 'swap' },
   { symbol: 'WBTC/USD', base: 'WBTC', quote: 'USD', active: true, spot: true },
+  { symbol: 'EUR/USD', base: 'EUR', quote: 'USD', active: true, spot: true },
+  { symbol: 'GBP/USD', base: 'GBP', quote: 'USD', active: true, spot: true },
+  { symbol: 'EURC/USD', base: 'EURC', quote: 'USD', active: true, spot: true },
 ];
 assert.deepEqual(
   filterDiscoveredMarkets(discoveredMarkets, ['HELD/USD'], ['RESERVED']),
   ['GOOD/USD'],
+  'fiat currency pairs and fiat-pegged stablecoins are excluded, same as a USD stablecoin',
 );
 
 const liquidTickers = filterLiquidTickers([
