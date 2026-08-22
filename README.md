@@ -328,6 +328,28 @@ AI reviews are budgeted, positions nearest to either exit level are reviewed fir
 lower-urgency positions are logged as skipped. If a Phase 1 sell fills, the bot refreshes
 its settled balance before Phase 2 so the freed quote cash can fund a same-cycle buy.
 
+## Dashboard
+
+Set `DASHBOARD_PASSWORD` to run a small read-only web view alongside the trading loop —
+no separate process, no extra dependencies, one `http` server started from `main()`. It shows
+the current account breakdown (total / free cash / tradable / staked-or-reserved), open
+positions with a "yours"/"bot" origin badge, recent closed trades, the model's latest
+portfolio stance, any standing funding request, and a chat thread with the model.
+
+The chat is asynchronous, not live: a message you send is read by the model on its *next*
+portfolio review, so replies land on the next scan cycle rather than instantly. The model can
+reply, ask for more capital (surfaced as the funding-request banner), or suggest a change to
+`SOUL.md` — a suggestion is only ever shown, never applied automatically. The staked/reserved
+figure is the aggregate cached from the last cycle's account fetch, not a live per-asset
+breakdown; viewing the dashboard never itself calls the exchange.
+
+There is no unauthenticated mode: `DASHBOARD_PASSWORD` gates every route except `/health`
+(so Railway's health check still works) behind HTTP Basic Auth, compared with a timing-safe
+check. `DASHBOARD_USERNAME` defaults to `operator`. It listens on `$PORT` (Railway sets this
+automatically); the page itself ships zero client-side JavaScript — the message box is a
+plain HTML form. It can only read state and queue a text message for the model to see; it
+cannot place an order, change a stop, or touch config.
+
 ## Model choice and what it costs
 
 `AI_MODEL` picks the model; `AI_MODEL_FALLBACK` names one to fall back to if the provider

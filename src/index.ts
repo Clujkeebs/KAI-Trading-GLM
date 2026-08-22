@@ -3,6 +3,8 @@ import ccxt from 'ccxt';
 import OpenAI from 'openai';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import { startDashboard, DashboardSnapshot } from './dashboard';
 
 dotenv.config();
 
@@ -206,8 +208,20 @@ export interface PortfolioStance {
   /** Cycle and time at which this stance was persisted. */
   recordedAt?: string;
   cycle?: number;
+  /** A reply to the operator, or something unprompted — read from the dashboard. */
+  messageToOperator: string;
+  /** A suggested change to SOUL.md. Surfaced only; never applied automatically. */
+  charterSuggestion: string;
 }
 interface FundingRequest { usd: number; reasoning: string; requestedAt: string }
+export interface ChatMessage {
+  id: string;
+  from: 'operator' | 'ai';
+  text: string;
+  at: string;
+  /** Only meaningful for 'ai': what kind of message this is, for display. */
+  kind?: 'reply' | 'funding_request' | 'charter_suggestion';
+}
 interface TradeRecord {
   timestamp: string; pair: string; side: 'BUY' | 'SELL';
   price: number; qty: number; costBasisUsd: number;
@@ -249,6 +263,16 @@ interface BotState {
   lastStance: PortfolioStance | null;
   /** Standing request for more capital, surfaced until the operator acts on it. */
   fundingRequest: FundingRequest | null;
+  /**
+   * Two-way correspondence between the operator and the model, oldest first.
+   * The operator writes through the dashboard; the model reads unread messages
+   * in its next stance call and may reply, ask for funds, or suggest a change to
+   * its own charter — never applied automatically, only surfaced.
+   */
+  chatLog: ChatMessage[];
+  /** The account breakdown from the most recent cycle, cached for the dashboard
+   * so viewing it never triggers its own exchange call. */
+  lastAccountSnapshot: (PortfolioSnapshot & { asOf: string }) | null;
 }
 
 // --- CONFIG ---
@@ -429,7 +453,11 @@ const POSITION_QTY_TOLERANCE_PCT = 0.01;
 const IMPORTED_POSITION_STOP_PCT = 0.05;
 const IMPORTED_POSITION_TARGET_PCT = 0.10;
 const REQUEST_TIMEOUT_MS = 20_000;
+const randomId = () => crypto.randomUUID();
 const RECENT_TRADE_MEMORY = 25;
+/** Bounds state.json and prompt cost; a live correspondence, not an archive. */
+const CHAT_LOG_LIMIT = 40;
+const CHAT_MESSAGE_MAX_CHARS = 2000;
 const MAX_AI_TOKEN_BUDGET = 16_000;
 const ORDER_POLL_ATTEMPTS = 5;
 const ORDER_POLL_DELAY_MS = 1_000;
@@ -2362,7 +2390,7 @@ class Memory {
       totalPnl: 0, bestTrade: null, worstTrade: null,
       lastScan: '', lastAiDecision: '', cycleCount: 0,
       recentTrades: [], sectorStats: {}, riskDay: utcDay(), riskDayPnl: 0, paperCash: null,
-      lastStance: null, fundingRequest: null,
+      lastStance: null, fundingRequest: null, chatLog: [], lastAccountSnapshot: null,
       ...saved,
     };
     // A hand-edited or partially written state file must not leave the bot with
@@ -2376,6 +2404,9 @@ class Memory {
     this.state.paperCash = typeof saved.paperCash === 'number' && Number.isFinite(saved.paperCash) ? saved.paperCash : null;
     this.state.lastStance = saved.lastStance && typeof saved.lastStance === 'object' ? saved.lastStance : null;
     this.state.fundingRequest = saved.fundingRequest && typeof saved.fundingRequest === 'object' ? saved.fundingRequest : null;
+    this.state.chatLog = Array.isArray(saved.chatLog) ? saved.chatLog.slice(-CHAT_LOG_LIMIT) : [];
+    this.state.lastAccountSnapshot = saved.lastAccountSnapshot && typeof saved.lastAccountSnapshot === 'object'
+      ? saved.lastAccountSnapshot : null;
     for (const key of ['totalTrades', 'wins', 'losses', 'totalPnl', 'cycleCount'] as const) {
       if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
     }
@@ -2584,6 +2615,47 @@ class Memory {
       this.state.fundingRequest = null;
       this.saveState();
     }
+  }
+
+  /** Caches the account breakdown so the dashboard never has to call the exchange itself. */
+  recordAccountSnapshot(account: PortfolioSnapshot) {
+    this.state.lastAccountSnapshot = { ...account, asOf: new Date().toISOString() };
+    this.saveState();
+  }
+
+  private appendChat(message: ChatMessage) {
+    this.state.chatLog.push(message);
+    if (this.state.chatLog.length > CHAT_LOG_LIMIT)
+      this.state.chatLog = this.state.chatLog.slice(-CHAT_LOG_LIMIT);
+    this.saveState();
+  }
+
+  /** The operator's side of the correspondence, written from the dashboard. */
+  postOperatorMessage(text: string): ChatMessage {
+    const trimmed = text.trim().slice(0, CHAT_MESSAGE_MAX_CHARS);
+    const message: ChatMessage = { id: randomId(), from: 'operator', text: trimmed, at: new Date().toISOString() };
+    this.appendChat(message);
+    return message;
+  }
+
+  /** The model's side, written from a stance reply. Never invoked by the operator. */
+  postAiMessage(text: string, kind?: ChatMessage['kind']): ChatMessage {
+    const trimmed = text.trim().slice(0, CHAT_MESSAGE_MAX_CHARS);
+    const message: ChatMessage = { id: randomId(), from: 'ai', text: trimmed, at: new Date().toISOString(), kind };
+    this.appendChat(message);
+    return message;
+  }
+
+  /**
+   * Messages since the model last spoke, for inclusion in the next stance prompt.
+   * Ordered by position in the log, not by timestamp: two messages posted within
+   * the same millisecond compare equal as ISO strings, which silently dropped a
+   * message from "unread" when this used to compare `at` values directly.
+   */
+  unreadOperatorMessages(): ChatMessage[] {
+    let lastAiIndex = -1;
+    this.state.chatLog.forEach((m, i) => { if (m.from === 'ai') lastAiIndex = i; });
+    return this.state.chatLog.filter((m, i) => m.from === 'operator' && i > lastAiIndex);
   }
 
   /** Simulated cash for paper mode, seeded from PORTFOLIO_VALUE on first use. */
@@ -2976,14 +3048,27 @@ If the opportunity in front of you is larger than the account can fund, set
 funds them manually. Ask for 0 when the account is adequate. Do not ask every cycle;
 ask when it would change what you can actually do.
 
+TALKING TO THE OPERATOR:
+Anything under "OPERATOR MESSAGE" below was written by the operator since you last
+spoke. Reply in "message_to_operator" — leave it empty if there is nothing to say,
+including when there is no new message. This is not a trading field: use it for
+questions, what you are watching for, or why you want something changed. It costs
+you nothing and is read by a human, not traded on.
+
+If you think something about your own mandate should change — a threshold too
+tight, a rule you keep bumping into, guidance you would phrase differently — say so
+in "charter_suggestion". This never edits SOUL.md by itself; a human reads it and
+decides. Leave it empty unless you actually mean it.
+
 You own this call. The bot does not second-guess the stance.
 
 RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Before answering, argue the other side: put the strongest case against your own
 stance in "counter_case", then keep the stance only if it survives that.
 
-Keep "reasoning" under 25 words and "counter_case" under 20.
-{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this"}`;
+Keep "reasoning" under 25 words, "counter_case" under 20, "message_to_operator" under 60,
+and "charter_suggestion" under 40.
+{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this", "message_to_operator": "reply or empty string", "charter_suggestion": "suggested mandate change or empty string"}`;
 const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents, PLAYBOOK.contents);
 const NEWS_SYSTEM_PROMPT = composeSystemPrompt(
   'You are a crypto market-news researcher. Return the requested JSON object only.',
@@ -3005,6 +3090,8 @@ export function normalizeStance(json: any): PortfolioStance {
     counterCase: typeof json?.counter_case === 'string' && json.counter_case.trim() ? json.counter_case.trim() : '',
     cashTargetPct: Number.isFinite(cashValue) ? Math.min(1, Math.max(0, cashValue / 100)) : 0,
     requestedFundsUsd: Number.isFinite(fundsValue) && fundsValue > 0 ? fundsValue : 0,
+    messageToOperator: typeof json?.message_to_operator === 'string' ? json.message_to_operator.trim() : '',
+    charterSuggestion: typeof json?.charter_suggestion === 'string' ? json.charter_suggestion.trim() : '',
   };
 }
 
@@ -3385,9 +3472,13 @@ HOLD, SELL, or ADJUST?`, pair);
       .map(c => `${c.pair} (score ${c.score.score.toFixed(0)}, RSI ${c.ta.rsi}, 4h ${c.ta.htfTrend})`)
       .join('; ') || 'none';
     const standing = this.memory.state.fundingRequest;
+    const unread = this.memory.unreadOperatorMessages();
+    const operatorNote = unread.length > 0
+      ? `\nOPERATOR MESSAGE${unread.length > 1 ? 'S' : ''} (since you last spoke):\n${unread.map(m => `[${m.at}] ${m.text}`).join('\n')}\n`
+      : '';
 
     const prompt = `${this.memory.getContextSummary()}
-
+${operatorNote}
 ACCOUNT:
 Free cash: ${fmt(account.cashUsd)}
 Tradable value (cash + sellable crypto): ${fmt(account.tradableUsd)}
@@ -3407,11 +3498,22 @@ What is the stance for this cycle?`;
     const json = await this.requestJsonObject(CHARTERED_STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
     if (!json) {
       console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
-      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
+      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, messageToOperator: '', charterSuggestion: '' };
     }
     // Persisting is the caller's job, so the record is kept no matter which
     // implementation produced the stance.
-    return normalizeStance(json);
+    const stance = normalizeStance(json);
+    this.recordOutgoingMessages(stance);
+    return stance;
+  }
+
+  /** Turns whatever the model said back into chat-log entries the dashboard shows. */
+  private recordOutgoingMessages(stance: PortfolioStance) {
+    if (stance.messageToOperator) this.memory.postAiMessage(stance.messageToOperator, 'reply');
+    if (stance.requestedFundsUsd > 0)
+      this.memory.postAiMessage(`Requesting ${fmt(stance.requestedFundsUsd)}: ${stance.reasoning}`, 'funding_request');
+    if (stance.charterSuggestion)
+      this.memory.postAiMessage(stance.charterSuggestion, 'charter_suggestion');
   }
 
   /**
@@ -3769,6 +3871,57 @@ async function main() {
   const memory = new Memory();
   const ai = new AiBrain(memory);
 
+  const dashboardPassword = process.env.DASHBOARD_PASSWORD;
+  if (dashboardPassword) {
+    const dashboardPort = envInteger('PORT', 8080, 1);
+    const dashboardUsername = process.env.DASHBOARD_USERNAME || 'operator';
+    startDashboard({
+      port: dashboardPort,
+      username: dashboardUsername,
+      password: dashboardPassword,
+      getSnapshot: (): DashboardSnapshot => {
+        const snap = memory.state.lastAccountSnapshot;
+        const stance = memory.state.lastStance;
+        const funding = memory.state.fundingRequest;
+        return {
+          mode: CONFIG.paperMode ? 'paper' : 'live',
+          generatedAt: new Date().toISOString(),
+          account: snap ? {
+            totalUsd: snap.totalUsd, cashUsd: snap.cashUsd,
+            tradableUsd: snap.tradableUsd, stakedUsd: snap.stakedUsd, asOf: snap.asOf,
+          } : null,
+          positions: memory.getOpenPositions().map(p => ({
+            pair: p.pair, entryPrice: p.entryPrice, currentPrice: p.currentPrice,
+            qty: p.qty, costBasisUsd: p.costBasisUsd, stopLoss: p.stopLoss,
+            takeProfit: p.takeProfit, alertPrice: p.alertPrice ?? null,
+            origin: p.origin ?? 'bot', sector: p.sector, openedAt: p.openedAt,
+          })),
+          closedTrades: memory.state.recentTrades.map(t => ({
+            pair: t.pair, sector: t.sector, pnlUsd: t.pnlUsd, pnlPct: t.pnlPct,
+            closedAt: t.closedAt, closeReason: t.closeReason, holdDays: t.holdDays,
+          })),
+          totalPnl: memory.state.totalPnl, wins: memory.state.wins, losses: memory.state.losses,
+          winRatePct: memory.winRate(), cycleCount: memory.state.cycleCount,
+          lastScan: memory.state.lastScan,
+          stance: stance ? {
+            stance: stance.stance, confidence: stance.confidence, reasoning: stance.reasoning,
+            counterCase: stance.counterCase, cashTargetPct: stance.cashTargetPct,
+            recordedAt: stance.recordedAt,
+          } : null,
+          fundingRequest: funding ? {
+            usd: funding.usd, reasoning: funding.reasoning, requestedAt: funding.requestedAt,
+          } : null,
+          chat: memory.state.chatLog,
+          model: ai.activeModel(),
+          usage: { ...ai.usage },
+        };
+      },
+      onOperatorMessage: (text: string) => { memory.postOperatorMessage(text); },
+    });
+  } else {
+    console.log('  [DASHBOARD] DASHBOARD_PASSWORD not set; dashboard disabled.');
+  }
+
   // Verify against the real exchange and the real model before risking anything.
   // Trading still proceeds on a non-critical failure: deterministic stop and
   // trailing logic protects open positions even when the AI is unreachable.
@@ -3993,6 +4146,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // ── FETCH REAL BALANCE ──
   let account = await exchange.getPortfolioValue(mem);
   mem.clearFundingRequestIfFunded(account.cashUsd);
+  mem.recordAccountSnapshot(account);
   // Sizing runs off tradable value: staked balances are real money the bot cannot
   // spend, and counting them inflated every position size the AI was asked for.
   let portfolioValue = account.tradableUsd;
@@ -4403,7 +4557,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   // The model's call on the whole book comes first. It can decline to deploy
   // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
-  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0 };
+  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, messageToOperator: '', charterSuggestion: '' };
   if (!shutdownRequested) {
     const marketNote = !canOpen
       ? `NEW ENTRIES BLOCKED THIS CYCLE: ${blockers.join('; ')}.`

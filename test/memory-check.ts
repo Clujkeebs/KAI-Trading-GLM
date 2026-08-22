@@ -190,6 +190,53 @@ async function main() {
     assert.equal(cells[header.indexOf('ai_confidence')], '8');
   }
 
+  // ── Chat log: two-way correspondence, bounded and unread-tracked ──────────
+  reset();
+  {
+    const mem = fresh();
+    const posted = mem.postOperatorMessage('  Should I add more funds?  ');
+    assert.equal(posted.from, 'operator');
+    assert.equal(posted.text, 'Should I add more funds?', 'the message is trimmed');
+    assert.equal(mem.state.chatLog.length, 1);
+    assert.ok(mem.state.chatLog[0].id, 'every message gets an id');
+
+    assert.equal(mem.unreadOperatorMessages().length, 1, 'a fresh operator message is unread');
+    mem.postAiMessage('Not yet — current book is well funded.', 'reply');
+    assert.equal(mem.unreadOperatorMessages().length, 0, 'an AI reply marks prior messages read');
+
+    mem.postOperatorMessage('Ok, thanks.');
+    assert.equal(mem.unreadOperatorMessages().length, 1, 'a later message is unread again');
+    assert.equal(mem.unreadOperatorMessages()[0].text, 'Ok, thanks.');
+
+    // A restart must not lose the conversation.
+    const reloaded = fresh();
+    assert.equal(reloaded.state.chatLog.length, 3);
+    assert.equal(reloaded.unreadOperatorMessages().length, 1);
+
+    // The log is bounded so it cannot grow state.json or prompt cost forever.
+    for (let i = 0; i < 50; i++) mem.postOperatorMessage(`message ${i}`);
+    assert.ok(mem.state.chatLog.length <= 40, `chat log grew to ${mem.state.chatLog.length}`);
+    assert.equal(mem.state.chatLog[mem.state.chatLog.length - 1].text, 'message 49',
+      'the newest messages are kept, not the oldest');
+
+    // An operator message is never treated as instructions to run.
+    const huge = 'x'.repeat(5000);
+    const capped = mem.postOperatorMessage(huge);
+    assert.ok(capped.text.length <= 2000, 'message length is bounded');
+  }
+
+  // ── The account snapshot is cached, not fetched fresh by a viewer ─────────
+  reset();
+  {
+    const mem = fresh();
+    assert.equal(mem.state.lastAccountSnapshot, null, 'nothing cached before the first cycle');
+    mem.recordAccountSnapshot({ totalUsd: 1000, cashUsd: 100, tradableUsd: 400, stakedUsd: 600 });
+    assert.equal(mem.state.lastAccountSnapshot?.totalUsd, 1000);
+    assert.ok(mem.state.lastAccountSnapshot?.asOf, 'the snapshot is timestamped');
+    const reloaded = fresh();
+    assert.equal(reloaded.state.lastAccountSnapshot?.cashUsd, 100, 'the snapshot survives a restart');
+  }
+
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('memory checks passed');
 }

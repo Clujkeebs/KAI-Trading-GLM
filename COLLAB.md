@@ -37,6 +37,33 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Two-way chat channel + read-only dashboard
+
+**Changed:** Added a `ChatMessage` log to `Memory` (`postOperatorMessage`/`postAiMessage`/
+`unreadOperatorMessages`, bounded to 40, index-based unread tracking so same-millisecond
+posts can't collide). `PortfolioStance` gained `messageToOperator` and `charterSuggestion`
+fields; `reviewPortfolio()` now feeds the model any unread operator messages and posts its
+reply/funding-request/charter-suggestion back to the log automatically. Added
+`Memory.recordAccountSnapshot()`, called once per cycle in `runCycle()`, so a viewer never
+needs its own exchange call. New `src/dashboard.ts` (zero new deps, plain `http` module) is
+started from `main()` when `DASHBOARD_PASSWORD` is set — HTTP Basic Auth (timing-safe
+compare), `/health` unauthenticated for Railway, `GET /` renders account/positions/closed
+trades/stance/chat as a self-contained dark HTML page with a plain `<form>` (no client JS),
+`GET /api/state` for JSON, `POST /message` appends to the chat log. It only reads state and
+queues a message — it cannot place an order, change a stop, or touch config.
+**Why:** Operator asked for the model to be able to ask questions, request funding, or
+suggest charter changes, and for a Railway-hosted page showing portfolio/staked/trade-log
+state.
+**Verified:** `npm run build` and `npm test` both clean end to end, including a new
+`test/dashboard-check.ts` that spins up a real `http.Server` on an ephemeral port and checks
+401/200 auth behavior, `/health`, the message POST → chat-log flow, and live vs. paper
+rendering). Not yet verified against a real Railway deploy or with a real GLM stance reply —
+the `message_to_operator`/`charter_suggestion` prompt fields are new and unexercised against
+the live model.
+**Watch out:** `charterSuggestion` is surfaced only; nothing applies it to `SOUL.md`
+automatically, on purpose. The staked/reserved dashboard figure is the cached aggregate from
+the last cycle's account fetch, not a live per-asset breakdown.
+
 ### 2026-08-22 — Claude — Hunt quiet sleeper markets, not just movers
 
 **Changed:** `selectSleepers` forces the `SLEEPER_COUNT` (default 3) liquid tickers with the
