@@ -406,6 +406,8 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR?.trim() || path.join(process.
 const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
 const TRADES_FILE = path.join(DATA_DIR, 'trades.csv');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
+// Allow a slow cycle or delayed restart without letting a stale mandate linger.
+const STANCE_CLOCK_SLACK = 2;
 
 // --- HELPERS ---
 
@@ -2603,14 +2605,25 @@ export function stanceAgeCycles(stance: PortfolioStance | null, currentCycle: nu
   return Math.max(0, currentCycle - cycle);
 }
 
+export function normalizeCycleCount(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+export function nextCycleNumber(value: unknown): number {
+  return normalizeCycleCount(value) + 1;
+}
+
 export function isStanceFresh(
   stance: PortfolioStance | null, currentCycle: number, maxAgeCycles: number | null,
+  scanIntervalMs = 30 * 60 * 1000,
 ): boolean {
   if (!stance?.recordedAt || !Number.isFinite(Date.parse(stance.recordedAt)))
     return false;
   const age = stanceAgeCycles(stance, currentCycle);
   if (age === null) return false;
-  return maxAgeCycles === null || age <= maxAgeCycles;
+  if (maxAgeCycles === null) return true;
+  if (age > maxAgeCycles) return false;
+  return Date.now() - Date.parse(stance.recordedAt) <= maxAgeCycles * scanIntervalMs * STANCE_CLOCK_SLACK;
 }
 
 class AiBrain {
@@ -3303,9 +3316,16 @@ async function main() {
   process.once('SIGINT', requestShutdown);
   process.once('SIGTERM', requestShutdown);
 
-  let cycle = 0;
+  const persistedCycle = normalizeCycleCount(memory.state.cycleCount);
+  if (memory.state.cycleCount !== persistedCycle) {
+    console.warn(`  [STATE] Invalid persisted cycle count ${String(memory.state.cycleCount)}; starting from ${persistedCycle}`);
+    memory.state.cycleCount = persistedCycle;
+    memory.saveState();
+  }
+  // Keep cycle numbering monotonic across restarts so stance age remains meaningful.
+  let cycle = persistedCycle;
   while (!shutdownRequested) {
-    cycle++;
+    cycle = nextCycleNumber(cycle);
     console.log(`\n${'═'.repeat(50)}`);
     console.log(`  CYCLE #${cycle} | ${new Date().toISOString()}`);
     console.log(`${'═'.repeat(50)}`);
@@ -3488,7 +3508,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // to sell something, so the review is told how far short it is and can trim.
   const currentCycle = mem.state.cycleCount + 1;
   const savedStance = mem.state.lastStance;
-  const standingStance = isStanceFresh(savedStance, currentCycle, CONFIG.stanceMaxAgeCycles)
+  const standingStance = isStanceFresh(savedStance, currentCycle, CONFIG.stanceMaxAgeCycles, CONFIG.scanIntervalMs)
     ? savedStance
     : null;
   if (savedStance && !standingStance) {
@@ -3497,7 +3517,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.warn('  [STANCE] Ignoring saved stance without valid recordedAt/cycle metadata; it is stale');
       legacyStanceWarningLogged = true;
     } else if (age !== null) {
-      console.log(`  [STANCE] Ignoring stale stance from cycle ${savedStance.cycle} (${age} cycles old; max ${CONFIG.stanceMaxAgeCycles ?? 'disabled'})`);
+      const recordedAtMs = Date.parse(savedStance.recordedAt!);
+      const clockStale = CONFIG.stanceMaxAgeCycles !== null &&
+        Number.isFinite(recordedAtMs) &&
+        Date.now() - recordedAtMs > CONFIG.stanceMaxAgeCycles * CONFIG.scanIntervalMs * STANCE_CLOCK_SLACK;
+      console.log(`  [STANCE] Ignoring stale stance from cycle ${savedStance.cycle} (${age} cycles old${clockStale ? '; wall-clock age exceeded' : `; max ${CONFIG.stanceMaxAgeCycles} cycles`})`);
     }
   } else if (standingStance) {
     console.log(`  [STANCE] Applying ${standingStance.stance} stance from cycle ${standingStance.cycle} (age ${stanceAgeCycles(standingStance, currentCycle)} cycle${stanceAgeCycles(standingStance, currentCycle) === 1 ? '' : 's'})`);

@@ -10,7 +10,7 @@ import {
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
-  isStanceFresh, Memory,
+  isStanceFresh, normalizeCycleCount, nextCycleNumber, Memory,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -348,6 +348,11 @@ assert.equal(isStanceFresh(timestampedStance, 14, 4), true);
 assert.equal(isStanceFresh(timestampedStance, 15, 4), false);
 assert.equal(isStanceFresh({ ...timestampedStance, recordedAt: undefined }, 10, null), false);
 assert.equal(isStanceFresh(timestampedStance, 100, null), true);
+assert.equal(isStanceFresh({
+  ...timestampedStance,
+  recordedAt: new Date(Date.now() - 100_000).toISOString(),
+  cycle: 12,
+}, 13, 4, 10_000), false, 'an old timestamp expires within the cycle budget');
 
 const stanceStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kai-stance-'));
 const stanceMemory = new Memory(stanceStateDir);
@@ -358,6 +363,14 @@ assert.ok(stanceMemory.state.lastStance?.recordedAt);
 const reloadedStanceMemory = new Memory(stanceStateDir);
 assert.equal(reloadedStanceMemory.state.lastStance?.cycle, 8);
 assert.equal(reloadedStanceMemory.state.lastStance?.recordedAt, stanceMemory.state.lastStance?.recordedAt);
+reloadedStanceMemory.state.cycleCount = 56;
+reloadedStanceMemory.saveState();
+const restartedMemory = new Memory(stanceStateDir);
+assert.equal(normalizeCycleCount(restartedMemory.state.cycleCount), 56);
+assert.equal(nextCycleNumber(restartedMemory.state.cycleCount), 57);
+assert.equal(nextCycleNumber(57), 58);
+assert.equal(nextCycleNumber(-1), 1);
+assert.equal(nextCycleNumber('corrupt'), 1);
 fs.rmSync(stanceStateDir, { recursive: true, force: true });
 
 // ── The model owns the entry plan, inside the risk cap ───────────────────────

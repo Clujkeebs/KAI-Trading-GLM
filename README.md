@@ -87,9 +87,13 @@ a position that is never reviewed can never be trimmed or closed on judgement â€
 
 The portfolio stance is evaluated once every cycle, even when entries are blocked, every
 watchlist pair is already held, or no scan produces usable data. A saved stance records its
-cycle and timestamp; `STANCE_MAX_AGE_CYCLES` prevents an old cash target from continuing to
+cycle and timestamp, and the cycle counter resumes from persisted state after restarts.
+`STANCE_MAX_AGE_CYCLES` prevents an old cash target from continuing to
 reserve cash or create trim pressure indefinitely. Blank disables age expiry, while legacy
-stances without metadata are treated as stale.
+stances without metadata are treated as stale. Configured expiry also has a wall-clock
+backstop of two times the cycle budget (`STANCE_MAX_AGE_CYCLES` multiplied by the scan
+interval), allowing for a slow cycle or delayed restart without leaving a mandate active
+indefinitely.
 
 ### Positions you bought yourself
 

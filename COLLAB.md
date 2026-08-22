@@ -37,6 +37,21 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-21 — Devin — Preserve cycle continuity and add wall-clock stance expiry
+
+**Changed:** Cycle numbering now resumes from the persisted nonnegative counter across
+restarts, with corrupt values safely starting at zero. Stance freshness now also checks a
+wall-clock budget of two times `STANCE_MAX_AGE_CYCLES` times the configured scan interval.
+The two-interval slack allows for a slow cycle or delayed restart without leaving a mandate
+active indefinitely.
+**Why:** Restarting at cycle one made saved stances appear newly recorded forever, while a
+long outage could leave a counter-fresh stance applying an old cash target.
+**Verified:** `npm run build`, `npm test`, and `git diff --check` passed. Pure tests cover
+restart counter continuity, invalid counter fallback, and a timestamp-expired stance whose
+cycle age remains within budget. The prior empty-candidate paper smoke was not rerun because
+these changes do not alter its no-candidate request path.
+**Watch out:** Live Kraken balances, orders, and production model behavior remain unverified.
+
 ### 2026-08-21 — Devin — Refresh portfolio stance on empty scans and expire old mandates
 
 **Changed:** The portfolio stance is now requested on every non-shutdown cycle, including
