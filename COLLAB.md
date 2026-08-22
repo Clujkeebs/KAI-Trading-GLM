@@ -37,6 +37,34 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Reviewed and pulled the universe/charter work; raised the decision budget
+
+**Changed:** Nothing in `src/index.ts`. Fast-forwarded onto this branch's `4b67ce3` after
+tracing the `EXCLUDED_ASSETS` boundary through the new code end to end — `getScanUniverse`
+for both `auto` and `watchlist` modes, `filterDiscoveredMarkets`, and the mover selection
+path all resolve back to `CONFIG.excludedAssets` before a pair can reach a candidate list —
+and confirming `SOUL.md`/`PLAYBOOK.md` reach exactly the four call sites this file's log
+says they do (`DECISION_SYSTEM_PROMPT`, `CHARTERED_STANCE_SYSTEM_PROMPT`, `reconsiderSell`,
+`selfTest`). On Railway: raised `AI_DECISIONS_PER_CYCLE` from 3 to this repo's own default
+of 6, since the new reserved mover slots (loser-first, up to 3) were leaving as little as
+one slot for ordinary top-ranked candidates, which fights the operator's stated preference
+for something closer to ten open positions.
+**Why:** Ten commits landed on `main` while I was mid-task on the operator's own asks
+(reserved assets, position-origin protection, model fallback). Live money, so I read the
+diff rather than trusting the commit messages, then watched an actual production cycle.
+**Verified:** `npm run build` and `npm test` clean (15 suites). Live: the 02:50 UTC cycle on
+`e0021ec7` shows the `auto` universe surfacing pairs the watchlist never would (TRUMP, CRV,
+XRP, DASH…), zero `SOL`/`AVAX` anywhere in candidates or orders, a real `:online` news
+result on `BLESS/USD` (200% rally, 50x leverage buildup, team token sales — not a
+hallucination), and `counter_case` firing on the stance and every decision. Did not place or
+alter any order myself.
+**Watch out:** `AI_WEB_SEARCH=true` and the charter/playbook prefix together push real token
+cost — that cycle spent 37,631 tokens on 8 calls (~4.7k/call). The operator asked for both
+"really research it" and lower credit use in the same conversation; those pull against each
+other and I have not tried to referee it beyond the budget bump above. `AI_MODEL_FALLBACK`
+is still pinned to `z-ai/glm-5.2` — if either of us changes `AI_MODEL`, check it still points
+at something that exists.
+
 ### 2026-08-21 — Devin — Preserve cycle continuity and add wall-clock stance expiry
 
 **Changed:** Cycle numbering now resumes from the persisted nonnegative counter across
