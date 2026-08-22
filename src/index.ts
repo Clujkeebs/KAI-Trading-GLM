@@ -625,6 +625,65 @@ export function windowHighContext(
   };
 }
 
+/** Day-over-day percentage returns from a daily candle series, oldest first. */
+export function dailyReturns(candles: OhlcvCandle[]): number[] {
+  const returns: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close;
+    const curr = candles[i].close;
+    if (Number.isFinite(prev) && prev > 0 && Number.isFinite(curr)) returns.push((curr - prev) / prev);
+  }
+  return returns;
+}
+
+/** Pearson correlation of two return series over their common trailing window; null if too
+ * short to mean anything (under 10 overlapping days) or either series has zero variance. */
+export function correlateReturns(a: number[], b: number[]): number | null {
+  const n = Math.min(a.length, b.length);
+  if (n < 10) return null;
+  const av = a.slice(-n);
+  const bv = b.slice(-n);
+  const meanA = av.reduce((s, x) => s + x, 0) / n;
+  const meanB = bv.reduce((s, x) => s + x, 0) / n;
+  let cov = 0, varA = 0, varB = 0;
+  for (let i = 0; i < n; i++) {
+    const da = av[i] - meanA;
+    const db = bv[i] - meanB;
+    cov += da * db;
+    varA += da * da;
+    varB += db * db;
+  }
+  if (varA === 0 || varB === 0) return null;
+  return cov / Math.sqrt(varA * varB);
+}
+
+/**
+ * Reports the single most correlated (or most inversely correlated) pair among
+ * currently open positions, using whatever daily candle history is already on
+ * hand — this never triggers its own fetch, so it costs nothing extra and simply
+ * says less on a cycle where less history happens to be cached. Purely
+ * informational: nothing acts on this, it is context for the stance call to
+ * weigh, the same guidance-not-rules treatment as everything else it judges.
+ */
+export function portfolioCorrelationNote(
+  dailyCandlesByPair: Map<string, OhlcvCandle[]>, thresholdAbs = 0.6,
+): string {
+  const pairs = [...dailyCandlesByPair.keys()];
+  const returnsByPair = new Map(pairs.map(p => [p, dailyReturns(dailyCandlesByPair.get(p)!)]));
+  let best: { a: string; b: string; corr: number } | null = null;
+  for (let i = 0; i < pairs.length; i++) {
+    for (let j = i + 1; j < pairs.length; j++) {
+      const corr = correlateReturns(returnsByPair.get(pairs[i])!, returnsByPair.get(pairs[j])!);
+      if (corr === null) continue;
+      if (!best || Math.abs(corr) > Math.abs(best.corr)) best = { a: pairs[i], b: pairs[j], corr };
+    }
+  }
+  if (!best || Math.abs(best.corr) < thresholdAbs) return '';
+  return best.corr > 0
+    ? `PORTFOLIO CORRELATION: ${best.a} and ${best.b} have moved together over the recent daily window (correlation ${best.corr.toFixed(2)}) — this book may be more concentrated than the position count alone suggests.`
+    : `PORTFOLIO CORRELATION: ${best.a} and ${best.b} have moved in opposite directions over the recent daily window (correlation ${best.corr.toFixed(2)}) — worth understanding why before reading this as diversification.`;
+}
+
 function marketContextNote(
   relative: RelativeStrength | null | undefined,
   windowHigh: WindowHighContext | null | undefined,
@@ -2834,6 +2893,17 @@ class Memory {
     }
   }
 
+  /** The full trade ledger as CSV text, for the dashboard's export route — every
+   * fill this process has ever recorded, not just the bounded in-memory summary. */
+  readTradesCsv(): string {
+    try {
+      return fs.existsSync(this.tradesFile) ? fs.readFileSync(this.tradesFile, 'utf-8') : '';
+    } catch (e: any) {
+      console.error(`[STATE] Could not read trades.csv: ${e.message}`);
+      return '';
+    }
+  }
+
   private performanceLines(): string[] {
     const lines: string[] = [];
     const sectors = Object.entries(this.state.sectorStats)
@@ -3577,6 +3647,7 @@ HOLD, SELL, or ADJUST?`, pair);
     candidates: Array<{ pair: string; ta: TechnicalAnalysis; score: { score: number } }>,
     concentration = '',
     marketNote = '',
+    correlationNote = '',
   ): Promise<PortfolioStance> {
     const breadth = candidates.length;
     const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
@@ -3610,6 +3681,7 @@ Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (
 Best-ranked setups: ${best}
 ${concentration ? `\n${concentration}\n` : ''}
 ${marketNote ? `\n${marketNote}\n` : ''}
+${correlationNote ? `\n${correlationNote}\n` : ''}
 What is the stance for this cycle?`;
 
     const json = await this.requestJsonObject(CHARTERED_STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
@@ -4017,6 +4089,7 @@ async function main() {
       password: dashboardPassword,
       maxLoginAttempts: envInteger('DASHBOARD_MAX_LOGIN_ATTEMPTS', 8, 1),
       lockoutMinutes: envInteger('DASHBOARD_LOCKOUT_MINUTES', 15, 1),
+      getTradesCsv: () => memory.readTradesCsv(),
       getSnapshot: (): DashboardSnapshot => {
         const snap = memory.state.lastAccountSnapshot;
         const stance = memory.state.lastStance;
@@ -4750,8 +4823,17 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       : candidates.length === 0
         ? 'No watchlist pair produced a usable setup this cycle.'
         : '';
+    // Whatever daily history Phase 1's reviews already cached this cycle (or a
+    // prior one, within its freshness window) — never worth a fetch on its own.
+    const openDailyCandles = new Map<string, OhlcvCandle[]>();
+    for (const pos of mem.getOpenPositions()) {
+      const cached = dailyWindowCache.get(pos.pair);
+      if (cached) openDailyCandles.set(pos.pair, cached.candles);
+    }
+    const correlationNote = portfolioCorrelationNote(openDailyCandles);
+    if (correlationNote) console.log(`  [STANCE] ${correlationNote}`);
     stance = await ai.reviewPortfolio(account, candidates,
-      concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote);
+      concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote, correlationNote);
     if (mem.recordStance(stance))
       await notifyWebhook('funding_request', `KAI is asking for ${fmt(stance.requestedFundsUsd)} more: ${stance.reasoning}`);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);

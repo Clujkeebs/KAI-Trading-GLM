@@ -162,6 +162,12 @@ and volume as "a market order pays roughly this on entry and again on exit" — 
 context for judging execution quality on a thin market, not a gate: nothing in code refuses a
 wide-spread pair, the same guidance-not-rules approach as everything else it decides on.
 
+The portfolio stance call also gets a correlation note when two open positions' daily returns
+have moved together (or in lockstep opposite directions) beyond a 0.6 threshold — computed only
+from daily candle history Phase 1's reviews already cached this cycle, so it never costs an
+extra fetch on its own and simply says nothing on a cycle with too little cached history. Also
+informational: it names the pair, not a cap on holding both.
+
 ### Positions you bought yourself
 
 The bot distinguishes positions it opened from ones it adopted out of your exchange balance,
@@ -355,6 +361,10 @@ suggest a change to `SOUL.md` — a suggestion is only ever shown, never applied
 The staked/reserved figure is the aggregate cached from the last cycle's account fetch, not a
 live per-asset breakdown; viewing the dashboard never itself calls the exchange.
 
+The full trade ledger — every fill this process has ever recorded, not just the bounded recent
+list shown on the page — is downloadable as CSV from a link under "Recent closes" (`GET
+/export/trades.csv`, same auth as everything else), for a spreadsheet or a tax tool.
+
 There is no unauthenticated mode: `DASHBOARD_PASSWORD` gates every route except `/health`
 (so Railway's health check still works) behind HTTP Basic Auth, compared with a timing-safe
 check. `DASHBOARD_USERNAME` defaults to `operator`. It listens on `$PORT` (Railway sets this
@@ -396,9 +406,10 @@ DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli
 exits. `chat` prints the recent thread and drops into a prompt — each line you send posts to
 the same chat log the dashboard shows and wakes the loop the same way. `kill` asks for a typed
 `FLATTEN` confirmation (and an optional reason) before firing the same kill switch as the
-dashboard; `resume` lifts a pause. Nothing here talks to the exchange or state files directly;
-it is strictly a client of the dashboard's HTTP API, so `DASHBOARD_PASSWORD` must be set on the
-deployed bot for any of these to work.
+dashboard; `resume` lifts a pause. `export` writes the full trade-ledger CSV to stdout, so
+`npm run cli -- export > trades.csv` saves it locally. Nothing here talks to the exchange or
+state files directly; it is strictly a client of the dashboard's HTTP API, so
+`DASHBOARD_PASSWORD` must be set on the deployed bot for any of these to work.
 
 ## Model choice and what it costs
 

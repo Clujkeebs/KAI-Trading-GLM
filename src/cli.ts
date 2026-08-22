@@ -41,6 +41,12 @@ async function postMessage(text: string): Promise<void> {
   await postForm('/message', `text=${encodeURIComponent(text)}`);
 }
 
+async function fetchTradesCsv(): Promise<string> {
+  const res = await fetch(`${url}/export/trades.csv`, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`GET /export/trades.csv -> ${res.status} ${(await res.text()).slice(0, 200)}`);
+  return res.text();
+}
+
 function fmtUsd(n: number): string {
   if (!Number.isFinite(n)) return '$n/a';
   return `$${n.toFixed(2)}`;
@@ -76,6 +82,12 @@ function printBalance(state: any) {
 
 async function runBalance() {
   printBalance(await fetchState());
+}
+
+async function runExport() {
+  // Written straight to stdout, no other output, so "npm run cli -- export > trades.csv"
+  // captures exactly the CSV and nothing else.
+  process.stdout.write(await fetchTradesCsv());
 }
 
 async function runChat() {
@@ -167,8 +179,9 @@ async function main() {
   else if (cmd === 'chat') await runChat();
   else if (cmd === 'kill') await runKill();
   else if (cmd === 'resume') await runResume();
+  else if (cmd === 'export') await runExport();
   else {
-    console.log('Usage: npm run cli -- balance | chat | kill | resume');
+    console.log('Usage: npm run cli -- balance | chat | kill | resume | export');
     console.log('Requires DASHBOARD_URL and DASHBOARD_PASSWORD (DASHBOARD_USERNAME defaults to "operator").');
     process.exit(1);
   }

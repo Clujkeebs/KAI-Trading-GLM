@@ -188,6 +188,22 @@ async function main() {
     assert.equal(cells[header.indexOf('reason')], '"RSI=29, near support"');
     assert.equal(cells[header.indexOf('ai_verdict')], 'BUY');
     assert.equal(cells[header.indexOf('ai_confidence')], '8');
+
+    // readTradesCsv() is what the dashboard's export route serves.
+    assert.equal(mem.readTradesCsv(), fs.readFileSync(path.join(stateDir, 'trades.csv'), 'utf-8'));
+  }
+
+  // ── readTradesCsv() before any trade, and after a restart ──────────────────
+  reset();
+  {
+    assert.equal(fresh().readTradesCsv(), '', 'no trades yet means an empty export, not an error');
+    const mem = fresh();
+    mem.logTrade({
+      timestamp: '2026-01-01T00:00:00.000Z', pair: 'III/USD', side: 'BUY',
+      price: 1, qty: 1, costBasisUsd: 1, stopLoss: 0.9, takeProfit: 1.2,
+      pnlUsd: 0, pnlPct: 0, status: 'open', sector: 'ai', reason: 'seed', aiVerdict: 'BUY', aiConfidence: 5,
+    });
+    assert.ok(fresh().readTradesCsv().includes('III/USD'), 'the export survives a restart, same as the file it reads');
   }
 
   // ── Chat log: two-way correspondence, bounded and unread-tracked ──────────

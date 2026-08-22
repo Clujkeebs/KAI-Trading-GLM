@@ -17,7 +17,9 @@ import {
   shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
   formatPairHistory, isMinimumAffordable, Memory, selectSleepers,
   tickerFromRawTicker, maxDrawdown, notifyWebhook,
+  dailyReturns, correlateReturns, portfolioCorrelationNote,
 } from '../src/index';
+import type { OhlcvCandle } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
 setConfig(loadConfig());
@@ -873,6 +875,77 @@ console.log('sleeper checks passed');
 }
 
 console.log('equity and spread checks passed');
+
+// ── Portfolio correlation: informational only, never a gate ─────────────────
+{
+  const candlesFromCloses = (closes: number[]): OhlcvCandle[] =>
+    closes.map((close, i) => ({ timestamp: i * 86_400_000, open: close, high: close, low: close, close, volume: 1 }));
+  const closesFromReturns = (start: number, returns: number[]): number[] => {
+    const out = [start];
+    let price = start;
+    for (const r of returns) { price = price * (1 + r); out.push(price); }
+    return out;
+  };
+
+  assert.deepEqual(dailyReturns(candlesFromCloses([100, 110, 99])), [0.1, -0.1]);
+  assert.deepEqual(dailyReturns(candlesFromCloses([100])), [], 'one candle has no return to report');
+
+  const base = [100, 102, 101, 105, 103, 108, 107, 110, 109, 115, 113, 120];
+  const scaledUp = base.map(c => c * 2); // identical % returns, different scale
+  const returnsA = dailyReturns(candlesFromCloses(base));
+  const returnsScaled = dailyReturns(candlesFromCloses(scaledUp));
+  const corrPerfect = correlateReturns(returnsA, returnsScaled);
+  assert.ok(corrPerfect !== null && Math.abs(corrPerfect - 1) < 1e-9, `expected ~1, got ${corrPerfect}`);
+
+  const inverseCloses = closesFromReturns(100, returnsA.map(r => -r));
+  const returnsInverse = dailyReturns(candlesFromCloses(inverseCloses));
+  const corrInverse = correlateReturns(returnsA, returnsInverse);
+  assert.ok(corrInverse !== null && Math.abs(corrInverse - -1) < 1e-9, `expected ~-1, got ${corrInverse}`);
+
+  assert.equal(correlateReturns([0.01, 0.02, 0.03], [0.01, -0.02, 0.01]), null, 'too few overlapping days to mean anything');
+  const flatReturns = dailyReturns(candlesFromCloses(new Array(15).fill(100)));
+  assert.equal(correlateReturns(flatReturns, returnsA), null, 'zero variance cannot be correlated with anything');
+
+  assert.equal(portfolioCorrelationNote(new Map()), '', 'nothing to compare with zero pairs');
+  assert.equal(
+    portfolioCorrelationNote(new Map([['A/USD', candlesFromCloses(base)]])),
+    '', 'nothing to compare with only one pair',
+  );
+
+  const together = portfolioCorrelationNote(new Map([
+    ['A/USD', candlesFromCloses(base)],
+    ['B/USD', candlesFromCloses(scaledUp)],
+  ]));
+  assert.match(together, /A\/USD/);
+  assert.match(together, /B\/USD/);
+  assert.match(together, /moved together/);
+
+  const opposite = portfolioCorrelationNote(new Map([
+    ['A/USD', candlesFromCloses(base)],
+    ['D/USD', candlesFromCloses(inverseCloses)],
+  ]));
+  assert.match(opposite, /opposite directions/);
+
+  // Three positions: A and B are the strongly-correlated pair; C is unrelated noise.
+  // The note should name A and B, not get distracted by C.
+  const withNoise = portfolioCorrelationNote(new Map([
+    ['A/USD', candlesFromCloses(base)],
+    ['B/USD', candlesFromCloses(scaledUp)],
+    ['C/USD', candlesFromCloses([100, 99, 101, 100, 99.5, 100.5, 99, 101, 100, 99, 101, 100.5])],
+  ]));
+  assert.match(withNoise, /A\/USD/);
+  assert.match(withNoise, /B\/USD/);
+  assert.ok(!withNoise.includes('C/USD'), 'the weakly-correlated third pair is not the one reported');
+
+  assert.equal(
+    portfolioCorrelationNote(new Map([
+      ['A/USD', candlesFromCloses(base)],
+      ['C/USD', candlesFromCloses([100, 99, 101, 100, 99.5, 100.5, 99, 101, 100, 99, 101, 100.5])],
+    ]), 0.99),
+    '', 'a threshold nothing clears reports nothing rather than a weak coincidence',
+  );
+}
+console.log('correlation checks passed');
 
 // ── Webhook notifications: generic, opt-in, never throws ────────────────────
 (async () => {

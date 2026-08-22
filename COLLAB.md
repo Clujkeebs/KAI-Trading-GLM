@@ -37,6 +37,36 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Trade-ledger export + portfolio correlation note
+
+**Changed:** Continuing the "what's missing" pass:
+- `Memory.readTradesCsv()` reads the full `trades.csv` (every fill this process has ever
+  logged, not just the bounded in-memory `recentTrades`). Dashboard route `GET
+  /export/trades.csv` (same auth, `Content-Disposition: attachment`) and a link under "Recent
+  closes"; CLI `npm run cli -- export` writes it to stdout for `> trades.csv`.
+- New pure functions `dailyReturns()`, `correlateReturns()` (Pearson, needs 10+ overlapping
+  days, null on zero variance), and `portfolioCorrelationNote()` — reports the single most
+  correlated (or most inversely correlated) pair among open positions when |correlation| clears
+  0.6, otherwise nothing. Wired into `reviewPortfolio()`'s prompt as a new optional 5th
+  parameter. Deliberately reads only whatever daily candle history is already in
+  `dailyWindowCache` from Phase 1's reviews this cycle (or a prior one, within its 6h
+  freshness window) — never triggers its own fetch, so it costs nothing extra and just says
+  less on a cycle with less cached history. Informational only, same as the spread context
+  from the last entry: nothing caps or blocks holding two correlated positions.
+**Why:** Continuing the operator's "top 10 things this bot doesn't have" ask from earlier
+today; a downloadable trade ledger (tax/accounting) and correlation awareness were both on
+that list.
+**Verified:** `npm run build` and `npm test` clean, including new coverage: `logic-check.ts`
+(`dailyReturns` correctness, `correlateReturns` on perfectly-correlated/-anticorrelated/
+too-short/zero-variance series, `portfolioCorrelationNote` picking the right pair out of three
+and respecting a threshold), `memory-check.ts` (`readTradesCsv()` empty-before-any-trade,
+matches the file on disk, survives a restart), `dashboard-check.ts` (export route auth-gated,
+correct content-type/disposition/body). Manually smoke-tested `src/cli.ts export` end to end
+against a throwaway local dashboard.
+**Watch out:** The correlation note has never fired against real cached daily candles in
+production — it depends on `dailyWindowCache` already holding 2+ open positions' daily
+history, which needs at least two positions to have gone through a Phase 1 review recently.
+
 ### 2026-08-22 — Claude — Equity/drawdown, spread context, webhooks, kill switch
 
 **Changed:** Several additions from a "what's the bot missing" pass:

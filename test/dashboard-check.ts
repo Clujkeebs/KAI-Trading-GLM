@@ -45,7 +45,7 @@ async function main() {
   // startDashboard refuses to run without a password: this is a live-money view.
   assert.throws(() => startDashboard({
     port: 0, username: 'operator', password: '', getSnapshot: emptySnapshot,
-    onOperatorMessage: () => {}, onKillSwitch: () => {}, onResume: () => {},
+    getTradesCsv: () => '', onOperatorMessage: () => {}, onKillSwitch: () => {}, onResume: () => {},
   }), /password/);
 
   let snapshot = emptySnapshot();
@@ -55,6 +55,7 @@ async function main() {
   const server = startDashboard({
     port: 0, username: 'operator', password: 'correct-horse',
     getSnapshot: () => snapshot,
+    getTradesCsv: () => 'timestamp,pair,side\n2026-01-01T00:00:00.000Z,BTC/USD,BUY\n',
     onOperatorMessage: (text: string) => { messages.push(text); },
     onKillSwitch: (reason: string) => { killSwitchCalls.push(reason); },
     onResume: () => { resumeCalls++; },
@@ -160,6 +161,15 @@ async function main() {
     assert.ok(pausedPage.body.includes('Resume trading'));
     assert.ok(!pausedPage.body.includes('Flatten &amp; pause'), 'the flatten form is hidden while already paused');
 
+    // The trade ledger is downloadable as CSV, gated by the same auth as everything else.
+    const noAuthExport = await request(port, '/export/trades.csv');
+    assert.equal(noAuthExport.status, 401);
+    const exportCsv = await request(port, '/export/trades.csv', { auth: 'operator:correct-horse' });
+    assert.equal(exportCsv.status, 200);
+    assert.match(exportCsv.headers['content-type'] || '', /text\/csv/);
+    assert.match(exportCsv.headers['content-disposition'] || '', /attachment.*trades\.csv/);
+    assert.equal(exportCsv.body, 'timestamp,pair,side\n2026-01-01T00:00:00.000Z,BTC/USD,BUY\n');
+
     // An unknown route is a 404, not a silent 200.
     const missing = await request(port, '/nope', { auth: 'operator:correct-horse' });
     assert.equal(missing.status, 404);
@@ -172,7 +182,7 @@ async function main() {
     const throttled = startDashboard({
       port: 0, username: 'operator', password: 'correct-horse',
       maxLoginAttempts: 3, lockoutMinutes: 1,
-      getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+      getSnapshot: emptySnapshot, getTradesCsv: () => '', onOperatorMessage: () => {},
       onKillSwitch: () => {}, onResume: () => {},
     });
     await new Promise<void>(resolve => throttled.once('listening', resolve));
@@ -199,7 +209,7 @@ async function main() {
     const resettable = startDashboard({
       port: 0, username: 'operator', password: 'correct-horse',
       maxLoginAttempts: 3, lockoutMinutes: 1,
-      getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+      getSnapshot: emptySnapshot, getTradesCsv: () => '', onOperatorMessage: () => {},
       onKillSwitch: () => {}, onResume: () => {},
     });
     await new Promise<void>(resolve => resettable.once('listening', resolve));

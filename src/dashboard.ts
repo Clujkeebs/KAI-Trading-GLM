@@ -102,6 +102,8 @@ export interface DashboardOptions {
   username: string;
   password: string;
   getSnapshot: () => DashboardSnapshot;
+  /** The full trade ledger as CSV text, for the /export/trades.csv route. */
+  getTradesCsv: () => string;
   onOperatorMessage: (text: string) => void;
   /** Sells everything and pauses new entries until onResume is called. */
   onKillSwitch: (reason: string) => void;
@@ -362,7 +364,9 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
 
 <section><h2>Open positions (${snapshot.positions.length})</h2>${renderPositions(snapshot.positions)}</section>
 
-<section><h2>Recent closes</h2>${renderClosedTrades(snapshot.closedTrades)}</section>
+<section><h2>Recent closes</h2>${renderClosedTrades(snapshot.closedTrades)}
+  <div class="muted" style="margin-top:8px;"><a href="/export/trades.csv" style="color:#818cf8;">Export full trade ledger (CSV)</a></div>
+</section>
 
 <section>
   <h2>Controls</h2>
@@ -458,6 +462,15 @@ export function startDashboard(options: DashboardOptions): http.Server {
         const body = JSON.stringify(options.getSnapshot());
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(body);
+        return;
+      }
+
+      if (url.pathname === '/export/trades.csv' && req.method === 'GET') {
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="trades.csv"',
+        });
+        res.end(options.getTradesCsv());
         return;
       }
 
