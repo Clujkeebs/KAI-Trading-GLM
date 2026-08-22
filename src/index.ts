@@ -105,8 +105,8 @@ interface BuyContext {
   marketMinimumUsd: number | null;
   openPositions: number;
   exposureUsd: number;
-  sectorExposureUsd: number;
-  sectorTargetPct: number;
+  sectorExposureUsd?: number;
+  sectorTargetPct?: number;
   concentration: string;
   marketContext?: string;
 }
@@ -548,6 +548,41 @@ export function isMinimumAffordable(spendableCashUsd: number, minimumUsd: number
 
 export function shouldCheckMoverNews(enabled: boolean, isLoser: boolean, changePct: number): boolean {
   return enabled && isLoser && Number.isFinite(changePct) && changePct < 0;
+}
+
+export function shouldAttemptMoverNews(
+  enabled: boolean, supported: boolean, isLoser: boolean, changePct: number,
+): boolean {
+  return supported && shouldCheckMoverNews(enabled, isLoser, changePct);
+}
+
+interface DecisionCandidate {
+  pair: string;
+  mover?: 'gainer' | 'loser';
+  score: { score: number };
+}
+
+/**
+ * Put a few movers ahead of score-ranked candidates so unusual moves get heard.
+ */
+export function prioritizeMoverCandidates<T extends DecisionCandidate>(
+  candidates: T[], budget: number, moverSlots = Math.ceil(budget / 2),
+): T[] {
+  const slots = Math.max(0, Math.min(Math.floor(moverSlots), budget));
+  const movers = candidates
+    .filter(candidate => candidate.mover)
+    .sort((a, b) =>
+      (a.mover === 'loser' ? 0 : 1) - (b.mover === 'loser' ? 0 : 1) ||
+      b.score.score - a.score.score ||
+      a.pair.localeCompare(b.pair));
+  const reserved = movers.slice(0, slots);
+  const reservedPairs = new Set(reserved.map(candidate => candidate.pair));
+  const remainder = candidates
+    .filter(candidate => !reservedPairs.has(candidate.pair))
+    .sort((a, b) =>
+      b.score.score - a.score.score ||
+      a.pair.localeCompare(b.pair));
+  return [...reserved, ...remainder];
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -2745,6 +2780,15 @@ function isUnsupportedReasoningParam(error: unknown): boolean {
   return status === 400 && /reasoning|thinking|effort/.test(message);
 }
 
+export function isUnsupportedWebSearch(error: unknown): boolean {
+  const value = error as { message?: unknown; status?: unknown; statusCode?: unknown; response?: { status?: unknown } };
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  if (![400, 404, 422].includes(status)) return false;
+  if (/response[_ -]?format|json[_ -]?object|structured output/.test(message)) return false;
+  return /online|web search|websearch|search plugin|unsupported|not supported|unknown model|not found/.test(message);
+}
+
 /** True when the provider stopped generating because the token budget ran out. */
 export function isTruncated(finishReason: unknown): boolean {
   const reason = String(finishReason ?? '').toLowerCase();
@@ -2853,6 +2897,8 @@ class AiBrain {
   private memory: Memory;
   private responseFormatSupported = true;
   private reasoningParamSupported = true;
+  private webSearchSupported = true;
+  private webSearchUnsupportedLogged = false;
   private modelFellBack = false;
   /** Token usage since the process started, so credit burn is measurable. */
   readonly usage = { calls: 0, promptTokens: 0, completionTokens: 0 };
@@ -2896,7 +2942,7 @@ class AiBrain {
     context?: BuyContext, plan?: TradePlan | null,
   ): Promise<AiDecision> {
     return this.call(`NEW OPPORTUNITY:
-${pair} (Sector: ${sector}) | Price: ${fmt(ta.currentPrice)}
+${pair} (${sector === 'unlisted' ? 'Sector metadata unavailable; discovered market' : `Sector: ${sector}`}) | Price: ${fmt(ta.currentPrice)}
 24h Volume: ${fmt(vol24h)}
 
 RSI: ${ta.rsi} (oversold<35, overbought>70)
@@ -2914,7 +2960,9 @@ ${plan ? `Stop ${fmt(plan.stop)} (${pct(plan.riskPct)} below entry, ${plan.basis
 ACCOUNT & ORDER CONTEXT:
 Total portfolio value: ${fmt(context?.portfolioValueUsd ?? 0)}
 Currently invested: ${fmt(context?.exposureUsd ?? 0)} across ${context?.openPositions ?? 0} positions
-This sector: ${fmt(context?.sectorExposureUsd ?? 0)} held vs a ${((context?.sectorTargetPct ?? 0) * 100).toFixed(0)}% target allocation
+${context?.sectorTargetPct === undefined
+  ? ''
+  : `This sector: ${fmt(context.sectorExposureUsd ?? 0)} held vs a ${(context.sectorTargetPct * 100).toFixed(0)}% target allocation`}
 Free cash available for this pair after fee reserve: ${fmt(context?.spendableCashUsd ?? 0)}
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
@@ -3030,7 +3078,9 @@ HOLD, SELL, or ADJUST?`, pair);
       : { reasoning: { effort: CONFIG.aiReasoningEffort } };
   }
 
-  private async request(messages: any[], pair: string, modelOverride?: string): Promise<any> {
+  private async request(
+    messages: any[], pair: string, modelOverride?: string, singleAttempt = false,
+  ): Promise<any> {
     const create = (structured: boolean, reasoning: boolean) => this.client.chat.completions.create({
       model: modelOverride || this.model,
       messages,
@@ -3039,6 +3089,27 @@ HOLD, SELL, or ADJUST?`, pair);
       ...(structured ? { response_format: { type: 'json_object' } } : {}),
       ...(reasoning ? this.reasoningParam() : {}),
     } as any);
+
+    if (singleAttempt) {
+      const structured = this.responseFormatSupported;
+      const reasoning = this.reasoningParamSupported;
+      try {
+        const response: any = await create(structured, reasoning);
+        this.recordUsage(response?.usage);
+        return response;
+      } catch (e) {
+        if (modelOverride?.endsWith(':online') && isUnsupportedWebSearch(e)) {
+          this.webSearchSupported = false;
+          if (!this.webSearchUnsupportedLogged) {
+            console.warn('  [NEWS] OpenRouter web search rejected; disabling loser news checks for the rest of this process');
+            this.webSearchUnsupportedLogged = true;
+          }
+        }
+        if (structured && isUnsupportedResponseFormat(e)) this.responseFormatSupported = false;
+        if (reasoning && isUnsupportedReasoningParam(e)) this.reasoningParamSupported = false;
+        throw e;
+      }
+    }
 
     // Both extras are best-effort: a provider that rejects either is retried
     // without it, and the capability is remembered so the run stops paying for
@@ -3083,14 +3154,16 @@ HOLD, SELL, or ADJUST?`, pair);
    * One JSON object from the model, with the same truncation handling as a trade
    * decision. Returns null when nothing parseable comes back.
    */
-  private async requestJsonObject(system: string, prompt: string, label: string, modelOverride?: string): Promise<any | null> {
+  private async requestJsonObject(
+    system: string, prompt: string, label: string, modelOverride?: string, singleAttempt = false,
+  ): Promise<any | null> {
     const messages = [
       { role: 'system', content: system },
       { role: 'user', content: prompt },
     ];
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < (singleAttempt ? 1 : 3); attempt++) {
       try {
-        const res = await this.request(messages, label, modelOverride);
+        const res = await this.request(messages, label, modelOverride, singleAttempt);
         const choice = res.choices?.[0];
         const text = textContent(choice?.message?.content).trim() ||
           textContent(choice?.message?.reasoning ?? choice?.message?.reasoning_content);
@@ -3108,7 +3181,13 @@ HOLD, SELL, or ADJUST?`, pair);
   }
 
   async checkMoverNews(pair: string, changePct: number): Promise<string> {
-    if (!shouldCheckMoverNews(CONFIG.aiWebSearch, true, changePct)) return '';
+    if (!shouldAttemptMoverNews(CONFIG.aiWebSearch, this.webSearchSupported, true, changePct)) {
+      if (!this.webSearchSupported && !this.webSearchUnsupportedLogged) {
+        console.log(`  [NEWS] ${pair}: web search disabled after provider capability rejection`);
+        this.webSearchUnsupportedLogged = true;
+      }
+      return '';
+    }
     const model = this.model.endsWith(':online') ? this.model : `${this.model}:online`;
     const callsBefore = this.usage.calls;
     const tokensBefore = this.usage.promptTokens + this.usage.completionTokens;
@@ -3117,6 +3196,7 @@ HOLD, SELL, or ADJUST?`, pair);
       `Investigate ${pair}, which is down ${changePct.toFixed(1)}% in 24 hours. What happened, and is the cause transient or structural? Return {"cause":"brief summary","assessment":"transient" or "structural" or "unclear","confidence":1-10}.`,
       `${pair} news`,
       model,
+      true,
     );
     const tokens = this.usage.promptTokens + this.usage.completionTokens - tokensBefore;
     if (!json) {
@@ -3333,7 +3413,12 @@ export async function runPreflight(
   // Always measure against fresh data, never a previous cycle's snapshot.
   exchange.beginCycle();
   const preflightUniverse = await exchange.getScanUniverse(CONFIG.scanUniverse, new Set());
-  const preflightPairs = preflightUniverse.slice(0, 20);
+  const heldPairs = mem.getOpenPositions().map(position => position.pair);
+  const preferredPairs = [...new Set([...heldPairs, ...WATCHLIST_PAIRS])];
+  const preflightPairs = [...new Set([
+    ...preferredPairs.slice(0, 20),
+    ...preflightUniverse,
+  ])].slice(0, 20);
 
   // 0. The operator's reserved holdings, stated plainly every run.
   if (CONFIG.excludedAssets.size > 0) {
@@ -3348,7 +3433,7 @@ export async function runPreflight(
     const missing = await exchange.listMissingMarkets(preflightPairs);
     add('Kraken markets', missing.length === 0,
       missing.length === 0
-        ? `${preflightPairs.length}/${preflightUniverse.length} ${CONFIG.scanUniverse} markets sampled and listed`
+        ? `${preflightPairs.length} prioritized ${CONFIG.scanUniverse} markets sampled and listed`
         : `${missing.length} sampled markets are unlisted and unreachable: ${missing.join(', ')}`,
       true);
   } catch (e: any) {
@@ -4091,7 +4176,15 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   if (stance.stance === 'RISK_OFF')
     console.log('  [STANCE] RISK_OFF — no new entries this cycle; exits and stops continue as normal.');
 
-  const aiCandidates = stance.stance === 'RISK_OFF' ? [] : candidates;
+  const aiCandidates = stance.stance === 'RISK_OFF'
+    ? []
+    : prioritizeMoverCandidates(candidates, CONFIG.aiDecisionsPerCycle);
+  const moverSlotCount = Math.min(
+    Math.ceil(CONFIG.aiDecisionsPerCycle / 2),
+    aiCandidates.filter(candidate => candidate.mover).length,
+  );
+  if (moverSlotCount > 0)
+    console.log(`  [AI BUDGET] Reserving ${moverSlotCount}/${CONFIG.aiDecisionsPerCycle} decision slots for movers (losers first; remainder ranked by score)`);
   let decisionsUsed = 0;
   for (const c of aiCandidates) {
     if (shutdownRequested) break;
@@ -4138,17 +4231,20 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
     decisionsUsed++;
     console.log(`  [AI BUDGET] Decision ${decisionsUsed}/${CONFIG.aiDecisionsPerCycle}: ${c.pair} (${c.score.score.toFixed(2)})`);
-    const newsContext = c.mover === 'loser' && typeof (ai as any).checkMoverNews === 'function'
-      ? await (ai as any).checkMoverNews(c.pair, scanTickerByPair.get(c.pair)?.changePct ?? 0)
+    const newsContext = c.mover === 'loser'
+      ? await ai.checkMoverNews(c.pair, scanTickerByPair.get(c.pair)?.changePct ?? 0)
       : '';
+    const hasSectorMetadata = c.sector !== 'unlisted';
     const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
       spendableCashUsd: spendableCash,
       marketMinimumUsd: marketMinimum,
       openPositions: mem.getOpenPositions().length,
       exposureUsd: exposure,
-      sectorExposureUsd: sectorExposure[c.sector] ?? 0,
-      sectorTargetPct: SECTOR_WEIGHTS[c.sector] ?? 0.05,
+      ...(hasSectorMetadata ? {
+        sectorExposureUsd: sectorExposure[c.sector] ?? 0,
+        sectorTargetPct: SECTOR_WEIGHTS[c.sector],
+      } : {}),
       concentration: concentrationNote(portfolioValue, mem.getOpenPositions().length),
       marketContext: newsContext,
     }, c.plan);
@@ -4192,7 +4288,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxRiskPerTradePct / riskPct);
     if (CONFIG.maxPortfolioRiskPct !== null && riskPct > 0)
       configuredLimitSize = Math.min(configuredLimitSize, portfolioValue * CONFIG.maxPortfolioRiskPct / riskPct);
-    if (CONFIG.maxSectorExposurePct !== null)
+    if (CONFIG.maxSectorExposurePct !== null && c.sector !== 'unlisted')
       configuredLimitSize = Math.min(configuredLimitSize,
         Math.max(0, portfolioValue * CONFIG.maxSectorExposurePct - (sectorExposure[c.sector] ?? 0)));
 
@@ -4211,12 +4307,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       continue;
     }
 
-    const sw = SECTOR_WEIGHTS[c.sector] || 0.05;
+    const sectorLabel = c.sector === 'unlisted'
+      ? 'unclassified (no sector allocation guidance)'
+      : `${c.sector} (${((SECTOR_WEIGHTS[c.sector] ?? 0) * 100).toFixed(0)}%)`;
     console.log(`
   *** BUY: ${c.pair} ***
   Confidence: ${d.confidence}/10 | ${d.reasoning}
   Entry: ${fmt(c.ta.currentPrice)} | Stop: ${fmt(sl)} (${pct(riskPct)}, ${c.plan.basis}) | Target: ${fmt(tp)}
-  R/R: ${rr.toFixed(1)}:1 | Size: ${fmt(finalSize)} | Risk: ${fmt(finalSize * riskPct)} | Sector: ${c.sector} (${(sw * 100).toFixed(0)}%)
+  R/R: ${rr.toFixed(1)}:1 | Size: ${fmt(finalSize)} | Risk: ${fmt(finalSize * riskPct)} | Sector: ${sectorLabel}
   `);
 
     if (shutdownRequested) break;

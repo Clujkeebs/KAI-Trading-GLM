@@ -149,6 +149,9 @@ const fakeAi = (
   async reviewPortfolio() {
     return { stance: stance ?? 'NEUTRAL', confidence: 7, reasoning: 'test stance', counterCase: '', cashTargetPct, requestedFundsUsd };
   },
+  async checkMoverNews() {
+    return '';
+  },
   usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
   async reconsiderSell() {
     return { confirmed: secondLookConfirms, reasoning: 'test second look' };

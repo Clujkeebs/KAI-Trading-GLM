@@ -120,3 +120,32 @@ checks; build; all test suites; and diff whitespace checks. Existing paper cycle
 auto discovery and category/mover logging. No live Kraken calls, authenticated OpenRouter
 web-search call, or live order was performed; the `:online` capability and account entitlement
 remain unverified, and the news path is safely non-blocking.
+
+### 2026-08-22 — Devin — Reserve mover decisions and fail fast on unavailable news
+
+**Changed:** Loser/gainer movers now receive up to three dedicated slots from the default
+six-decision budget, with losers ordered before gainers; the remaining slots follow the
+normal TA score. Affordability checks still happen before a decision is spent. The
+`:online` loser-news request now makes one attempt only. A hard provider capability
+rejection is memoised for the process and disables later web-search attempts; transient
+failures simply continue without news. The production call uses the typed `AiBrain`
+method directly.
+
+Discovered markets no longer receive the misleading 5% sector target or sector exposure
+guidance. `MAX_SECTOR_EXPOSURE_PCT`, when enabled, does not block `unlisted` discovered
+entries, although reporting continues to aggregate them under that label. Preflight now
+prioritises held pairs and the watchlist, topping up from the exchange universe within
+the same bounded sample.
+
+**Why:** A low-scoring crash could be excluded from the AI budget before its news context
+was considered, while an unavailable `:online` capability was being retried repeatedly.
+Kraken supplies no sector metadata for newly discovered assets, so pretending they share a
+5% target could silently block the entire broad universe.
+
+**Verified:** Unit checks cover mover ordering and the unsupported-news capability gate;
+`npm run build`, `npm test`, and `git diff --check` pass. Paper mover/news success and
+failure smokes were rerun with the local mock provider. The failure path now makes one
+news attempt rather than the previous repeated sequence.
+
+**Watch out:** Live Kraken behavior, authenticated OpenRouter `:online` entitlement,
+real sector metadata, and live order execution remain unverified.

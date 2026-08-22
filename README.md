@@ -110,11 +110,17 @@ and holdings already in the account. A single batched ticker stage drops markets
 `SCAN_TA_LIMIT` markets, plus the configured daily gainers and losers. `SCAN_UNIVERSE=watchlist`
 retains the legacy 20-pair universe. Liquid losers may receive a separate OpenRouter
 `:online` news check before their trading decision when `AI_WEB_SEARCH=true`; failed
-searches are non-blocking. Decisions also receive compact same-pair history from
-persisted trade records.
-Preflight samples a bounded subset rather than running TA over the discovered market set.
-All discovered pairs use the shared `unlisted` sector bucket; the optional
-`MAX_SECTOR_EXPOSURE_PCT` cap, when enabled, applies to that aggregate bucket.
+searches are non-blocking, and a hard capability rejection disables further attempts for
+the rest of the process. Decisions also receive compact same-pair history from persisted
+trade records. Half of the six-decision budget is reserved for movers (losers are
+considered before gainers); the remaining slots follow TA score, so a liquid crash cannot
+be starved by ordinary setups.
+Preflight samples held pairs and the watchlist first, then tops up from the discovered
+universe, rather than taking an arbitrary slice. Known watchlist pairs receive sector
+allocation guidance. Discovered pairs have no sector metadata: their prompts omit sector
+targets and exposure guidance, and the optional `MAX_SECTOR_EXPOSURE_PCT` cap does not
+apply to them. Reporting may still aggregate them under `unlisted`, but that bucket cannot
+silently block every discovered entry.
 
 ### Positions you bought yourself
 

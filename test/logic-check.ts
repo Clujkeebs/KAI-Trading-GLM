@@ -12,6 +12,7 @@ import {
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
   isStanceFresh, normalizeCycleCount, nextCycleNumber, filterDiscoveredMarkets,
   filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
+  shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
   formatPairHistory, isMinimumAffordable, Memory,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
@@ -413,6 +414,28 @@ const movers = selectDailyMovers([
 ], 1);
 assert.deepEqual(movers.gainers.map(t => t.pair), ['UP/USD']);
 assert.deepEqual(movers.losers.map(t => t.pair), ['DOWN/USD']);
+assert.equal(shouldAttemptMoverNews(true, true, true, -15), true);
+assert.equal(shouldAttemptMoverNews(true, false, true, -15), false);
+assert.equal(shouldAttemptMoverNews(true, true, true, 15), false);
+let webSearchSupported = true;
+const capabilityRejection = { status: 400, message: 'web search unavailable' };
+assert.equal(isUnsupportedWebSearch(capabilityRejection), true);
+if (isUnsupportedWebSearch(capabilityRejection)) webSearchSupported = false;
+assert.equal(shouldAttemptMoverNews(true, webSearchSupported, true, -15), false, 'memoized unsupported search must not retry');
+assert.equal(isUnsupportedWebSearch({ status: 503, message: 'web search unavailable' }), false);
+
+const decisionOrder = prioritizeMoverCandidates([
+  { pair: 'SCORE/USD', score: { score: 99 } },
+  { pair: 'LOSER/USD', mover: 'loser' as const, score: { score: 10 } },
+  { pair: 'LOSER2/USD', mover: 'loser' as const, score: { score: 15 } },
+  { pair: 'GAINER/USD', mover: 'gainer' as const, score: { score: 20 } },
+  { pair: 'OTHER/USD', score: { score: 80 } },
+], 6);
+assert.deepEqual(
+  decisionOrder.slice(0, 3).map(candidate => candidate.pair),
+  ['LOSER2/USD', 'LOSER/USD', 'GAINER/USD'],
+  'three dedicated mover slots prioritize losers before gainers',
+);
 assert.equal(shouldCheckMoverNews(true, true, -10), true);
 assert.equal(shouldCheckMoverNews(false, true, -10), false);
 assert.equal(shouldCheckMoverNews(true, false, -10), false);
