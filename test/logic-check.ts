@@ -16,6 +16,7 @@ import {
   filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
   shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
   formatPairHistory, isMinimumAffordable, Memory, selectSleepers,
+  tickerFromRawTicker, maxDrawdown, notifyWebhook,
 } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
 
@@ -838,3 +839,75 @@ assert.ok(!noSleeperArg.slice(0, 1).some(c => c.sleeper && !c.mover),
   'a call with no sleeperSlots argument does not reserve for sleepers');
 
 console.log('sleeper checks passed');
+
+// ── Ticker parsing: spread and fallbacks ────────────────────────────────────
+{
+  const tight = tickerFromRawTicker('AAA/USD', {
+    last: 100, high: 105, low: 95, quoteVolume: 50_000, percentage: 2, bid: 99, ask: 101,
+  });
+  assert.ok(tight);
+  assert.ok(Math.abs((tight!.spreadPct ?? 0) - 2 / 101) < 1e-9, 'spread is (ask-bid)/ask');
+
+  const noBook = tickerFromRawTicker('BBB/USD', { last: 50, high: 51, low: 49, quoteVolume: 1000 });
+  assert.ok(noBook);
+  assert.equal(noBook!.spreadPct, null, 'missing bid/ask leaves spread unknown, not zero');
+
+  const crossed = tickerFromRawTicker('CCC/USD', { last: 10, high: 11, low: 9, bid: 10.5, ask: 10 });
+  assert.equal(crossed!.spreadPct, null, 'a crossed or inverted book is not trusted as a spread');
+
+  assert.equal(tickerFromRawTicker('DDD/USD', { last: 0, high: 1, low: 1 }), null, 'a non-positive price is unusable');
+}
+
+// ── Max drawdown reads the equity series peak-to-trough ─────────────────────
+{
+  assert.equal(maxDrawdown([]), 0, 'no history means no measured drawdown');
+  assert.equal(maxDrawdown([{ at: 't', totalUsd: 100 }]), 0, 'one point cannot show a decline');
+  const series = [
+    { at: '1', totalUsd: 100 }, { at: '2', totalUsd: 120 }, { at: '3', totalUsd: 90 },
+    { at: '4', totalUsd: 150 }, { at: '5', totalUsd: 100 },
+  ];
+  // Worst run: peak 150 -> trough 100 = 33.33%; the earlier 120->90 (25%) is smaller.
+  assert.ok(Math.abs(maxDrawdown(series) - 1 / 3) < 1e-9);
+  assert.equal(maxDrawdown([{ at: '1', totalUsd: 100 }, { at: '2', totalUsd: 110 }]), 0,
+    'a series that only ever rises has zero drawdown');
+}
+
+console.log('equity and spread checks passed');
+
+// ── Webhook notifications: generic, opt-in, never throws ────────────────────
+(async () => {
+  const http = await import('node:http');
+  let received: any = null;
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200);
+      res.end('ok');
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  try {
+    process.env.WEBHOOK_URL = `http://127.0.0.1:${port}/hook`;
+    await notifyWebhook('test_event', 'hello world');
+    assert.equal(received?.event, 'test_event');
+    assert.equal(received?.text, 'hello world', 'Slack-style receivers read "text"');
+    assert.equal(received?.content, 'hello world', 'Discord-style receivers read "content"');
+    assert.ok(received?.at, 'the event is timestamped');
+
+    delete process.env.WEBHOOK_URL;
+    received = null;
+    await notifyWebhook('should_not_send', 'nobody receives this');
+    assert.equal(received, null, 'a blank WEBHOOK_URL is a silent no-op');
+
+    // An unreachable endpoint must not throw or block a cycle -- swallow and log only.
+    process.env.WEBHOOK_URL = 'http://127.0.0.1:1/unreachable';
+    await notifyWebhook('unreachable', 'should not throw');
+  } finally {
+    delete process.env.WEBHOOK_URL;
+    server.close();
+  }
+  console.log('webhook checks passed');
+})().catch(e => { console.error(e); process.exit(1); });

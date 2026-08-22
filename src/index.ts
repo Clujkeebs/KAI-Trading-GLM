@@ -150,6 +150,8 @@ interface BuyContext {
   marketContext?: string;
   relativeStrength?: RelativeStrength | null;
   windowHigh?: WindowHighContext | null;
+  /** Bid/ask spread as a fraction of price; wide spreads eat a market order on entry and exit alike. */
+  spreadPct?: number | null;
 }
 export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
@@ -273,7 +275,20 @@ interface BotState {
   /** The account breakdown from the most recent cycle, cached for the dashboard
    * so viewing it never triggers its own exchange call. */
   lastAccountSnapshot: (PortfolioSnapshot & { asOf: string }) | null;
+  /** Total account value at the end of each cycle, oldest first, bounded — the
+   * record a dashboard chart or a drawdown figure is computed from. */
+  equityHistory: EquityPoint[];
+  /** Emergency stop: while true, Phase 1 exits and stops still run, but no new
+   * position is opened. Set by the kill switch; cleared only by an explicit resume. */
+  tradingPaused: boolean;
+  /** Why trading is paused, shown on the dashboard and in blocker logs. */
+  pauseReason: string;
+  /** One-shot: sell every open position at market at the start of the next cycle,
+   * then clear itself. Set together with tradingPaused by the kill switch. */
+  flattenRequested: boolean;
 }
+
+export interface EquityPoint { at: string; totalUsd: number }
 
 // --- CONFIG ---
 
@@ -458,6 +473,8 @@ const RECENT_TRADE_MEMORY = 25;
 /** Bounds state.json and prompt cost; a live correspondence, not an archive. */
 const CHAT_LOG_LIMIT = 40;
 const CHAT_MESSAGE_MAX_CHARS = 2000;
+/** ~20 days of history at the default 15-minute scan interval; small enough to stay cheap in state.json. */
+const EQUITY_HISTORY_LIMIT = 2000;
 const MAX_AI_TOKEN_BUDGET = 16_000;
 const ORDER_POLL_ATTEMPTS = 5;
 const ORDER_POLL_DELAY_MS = 1_000;
@@ -518,6 +535,33 @@ export interface ScanTicker {
   low24h: number;
   changePct: number;
   volume24h: number;
+  /** Bid/ask spread as a fraction of price (e.g. 0.01 = 1%); absent when bid/ask were unavailable. */
+  spreadPct?: number | null;
+}
+
+/** Parses a raw ccxt ticker into a ScanTicker, or null when the fields needed to trade on it are missing. */
+export function tickerFromRawTicker(pair: string, raw: any): ScanTicker | null {
+  const price = Number(raw?.last ?? raw?.close ?? 0);
+  const high24h = Number(raw?.high ?? 0);
+  const low24h = Number(raw?.low ?? 0);
+  const quoteVolume = Number(raw?.quoteVolume);
+  const baseVolume = Number(raw?.baseVolume);
+  const volume24h = Number.isFinite(quoteVolume)
+    ? quoteVolume
+    : Number.isFinite(baseVolume) && price > 0 ? baseVolume * price : 0;
+  const percentage = Number(raw?.percentage);
+  const open = Number(raw?.open);
+  const changePct = Number.isFinite(percentage)
+    ? percentage
+    : Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
+  if (!(price > 0) || !Number.isFinite(high24h) || !Number.isFinite(low24h))
+    return null;
+  const bid = Number(raw?.bid);
+  const ask = Number(raw?.ask);
+  const spreadPct = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid
+    ? (ask - bid) / ask
+    : null;
+  return { pair, price, high24h, low24h, changePct, volume24h, spreadPct };
 }
 
 export interface RelativeStrength {
@@ -531,6 +575,18 @@ export interface WindowHighContext {
   highAt: number;
   ageDays: number;
   drawdownPct: number;
+}
+
+/** Largest peak-to-trough decline across an equity series, as a fraction (0.2 = 20%). */
+export function maxDrawdown(points: EquityPoint[]): number {
+  let peak = -Infinity;
+  let worst = 0;
+  for (const p of points) {
+    if (!Number.isFinite(p.totalUsd)) continue;
+    if (p.totalUsd > peak) peak = p.totalUsd;
+    else if (peak > 0) worst = Math.max(worst, (peak - p.totalUsd) / peak);
+  }
+  return worst;
 }
 
 export function medianTickerChange(tickers: ScanTicker[]): number | null {
@@ -770,6 +826,33 @@ const fmt = (n: number) => {
   return `$${n.toFixed(Math.min(12, Math.ceil(-Math.log10(abs)) + 3))}`;
 };
 const pct = (fraction: number) => `${(fraction * 100).toFixed(2)}%`;
+
+/**
+ * Best-effort push for events worth waking up for: a funding request, the daily
+ * loss breaker tripping, a critical preflight failure, the kill switch firing.
+ * Posts a generic JSON body ({text, content, event, at}) so a single incoming
+ * webhook URL from Slack, Discord, ntfy, or a custom endpoint all work without
+ * configuration beyond WEBHOOK_URL. Blank means disabled; a delivery failure is
+ * logged and swallowed — a notification going out is never load-bearing for a
+ * cycle completing.
+ */
+export async function notifyWebhook(event: string, text: string): Promise<void> {
+  const url = process.env.WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, content: text, event, at: new Date().toISOString() }),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+    if (!res.ok) console.warn(`  [WEBHOOK] ${event} notification failed: HTTP ${res.status}`);
+  } catch (e: any) {
+    console.warn(`  [WEBHOOK] ${event} notification failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 const ASSET_ALIASES: Record<string, string> = {
   XBT: 'BTC', XXBT: 'BTC', XDG: 'DOGE', XXDG: 'DOGE', ZUSD: 'USD', ETH2: 'ETH',
 };
@@ -1518,22 +1601,7 @@ class Exchange {
   }
 
   private tickerFromRaw(pair: string, raw: any): ScanTicker | null {
-    const price = Number(raw?.last ?? raw?.close ?? 0);
-    const high24h = Number(raw?.high ?? 0);
-    const low24h = Number(raw?.low ?? 0);
-    const quoteVolume = Number(raw?.quoteVolume);
-    const baseVolume = Number(raw?.baseVolume);
-    const volume24h = Number.isFinite(quoteVolume)
-      ? quoteVolume
-      : Number.isFinite(baseVolume) && price > 0 ? baseVolume * price : 0;
-    const percentage = Number(raw?.percentage);
-    const open = Number(raw?.open);
-    const changePct = Number.isFinite(percentage)
-      ? percentage
-      : Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
-    if (!(price > 0) || !Number.isFinite(high24h) || !Number.isFinite(low24h))
-      return null;
-    return { pair, price, high24h, low24h, changePct, volume24h };
+    return tickerFromRawTicker(pair, raw);
   }
 
   async getTicker(pair: string): Promise<ScanTicker | null> {
@@ -2391,6 +2459,7 @@ class Memory {
       lastScan: '', lastAiDecision: '', cycleCount: 0,
       recentTrades: [], sectorStats: {}, riskDay: utcDay(), riskDayPnl: 0, paperCash: null,
       lastStance: null, fundingRequest: null, chatLog: [], lastAccountSnapshot: null,
+      equityHistory: [], tradingPaused: false, pauseReason: '', flattenRequested: false,
       ...saved,
     };
     // A hand-edited or partially written state file must not leave the bot with
@@ -2407,6 +2476,12 @@ class Memory {
     this.state.chatLog = Array.isArray(saved.chatLog) ? saved.chatLog.slice(-CHAT_LOG_LIMIT) : [];
     this.state.lastAccountSnapshot = saved.lastAccountSnapshot && typeof saved.lastAccountSnapshot === 'object'
       ? saved.lastAccountSnapshot : null;
+    this.state.equityHistory = Array.isArray(saved.equityHistory)
+      ? saved.equityHistory.filter(p => p && typeof p.at === 'string' && Number.isFinite(p.totalUsd)).slice(-EQUITY_HISTORY_LIMIT)
+      : [];
+    this.state.tradingPaused = saved.tradingPaused === true;
+    this.state.pauseReason = typeof saved.pauseReason === 'string' ? saved.pauseReason : '';
+    this.state.flattenRequested = saved.flattenRequested === true;
     for (const key of ['totalTrades', 'wins', 'losses', 'totalPnl', 'cycleCount'] as const) {
       if (!Number.isFinite(this.state[key] as number)) (this.state[key] as number) = 0;
     }
@@ -2591,13 +2666,17 @@ class Memory {
    * Persists the model's market call. A funding request is kept standing until the
    * operator actually adds capital, so it survives restarts and stays visible.
    */
-  recordStance(stance: PortfolioStance) {
+  /** Returns true when this call raised a funding request that was not already standing
+   * at the same amount, so the caller can decide whether it is worth a notification. */
+  recordStance(stance: PortfolioStance): boolean {
     this.state.lastStance = {
       ...stance,
       recordedAt: new Date().toISOString(),
       cycle: this.state.cycleCount + 1,
     };
+    let isNewRequest = false;
     if (stance.requestedFundsUsd > 0) {
+      isNewRequest = this.state.fundingRequest?.usd !== stance.requestedFundsUsd;
       this.state.fundingRequest = {
         usd: stance.requestedFundsUsd,
         reasoning: stance.reasoning,
@@ -2605,6 +2684,7 @@ class Memory {
       };
     }
     this.saveState();
+    return isNewRequest;
   }
 
   /** Clears a standing funding request once that much new cash has arrived. */
@@ -2617,10 +2697,47 @@ class Memory {
     }
   }
 
-  /** Caches the account breakdown so the dashboard never has to call the exchange itself. */
+  /** Caches the account breakdown so the dashboard never has to call the exchange itself,
+   * and appends to the equity history a drawdown figure and a chart are computed from. */
   recordAccountSnapshot(account: PortfolioSnapshot) {
-    this.state.lastAccountSnapshot = { ...account, asOf: new Date().toISOString() };
+    const asOf = new Date().toISOString();
+    this.state.lastAccountSnapshot = { ...account, asOf };
+    if (Number.isFinite(account.totalUsd)) {
+      this.state.equityHistory.push({ at: asOf, totalUsd: account.totalUsd });
+      if (this.state.equityHistory.length > EQUITY_HISTORY_LIMIT)
+        this.state.equityHistory = this.state.equityHistory.slice(-EQUITY_HISTORY_LIMIT);
+    }
     this.saveState();
+  }
+
+  /** Largest peak-to-trough decline in the recorded equity history, as a fraction (0.2 = 20%). */
+  maxDrawdownPct(): number {
+    return maxDrawdown(this.state.equityHistory);
+  }
+
+  /** Emergency stop: sell everything at the start of the next cycle and refuse new
+   * entries until explicitly resumed. Existing stops and exits are never affected —
+   * this only ever removes risk, and Phase 1 always keeps running regardless. */
+  triggerKillSwitch(reason: string) {
+    this.state.tradingPaused = true;
+    this.state.pauseReason = reason;
+    this.state.flattenRequested = true;
+    this.saveState();
+  }
+
+  /** Clears the pause. Does not reopen anything — it only allows new entries again. */
+  resumeTrading() {
+    this.state.tradingPaused = false;
+    this.state.pauseReason = '';
+    this.saveState();
+  }
+
+  /** Consumes the one-shot flatten flag so a single trigger only flattens once. */
+  consumeFlattenRequest(): boolean {
+    if (!this.state.flattenRequested) return false;
+    this.state.flattenRequested = false;
+    this.saveState();
+    return true;
   }
 
   private appendChat(message: ChatMessage) {
@@ -3139,7 +3256,7 @@ class AiBrain {
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
-    const model = process.env.AI_MODEL || 'z-ai/glm-5.2';
+    const model = process.env.AI_MODEL || 'z-ai/glm-5-turbo';
     const apiKey = process.env.AI_API_KEY!;
 
     const urls: Record<string, string> = {
@@ -3175,7 +3292,7 @@ class AiBrain {
   ): Promise<AiDecision> {
     return this.call(`NEW OPPORTUNITY:
 ${pair} (${sector === 'unlisted' ? 'Sector metadata unavailable; discovered market' : `Sector: ${sector}`}) | Price: ${fmt(ta.currentPrice)}
-24h Volume: ${fmt(vol24h)}
+24h Volume: ${fmt(vol24h)}${context?.spreadPct === null || context?.spreadPct === undefined ? '' : ` | Bid/ask spread: ${pct(context.spreadPct)} (a market order pays roughly this on entry and again on exit)`}
 
 RSI: ${ta.rsi} (oversold<35, overbought>70)
 Trend (1h): ${ta.trend} | Trend (4h): ${ta.htfTrend} | MA Score: ${ta.maScore}/3
@@ -3548,10 +3665,13 @@ Now argue the other side properly. Build the strongest case for KEEPING it: what
 the operator might have seen, what is still intact, what would be given up by
 selling today, what the position looks like if you are early rather than wrong.
 
-Then decide honestly. Sell only if something has actually broken and you can name
-it. Overbought is not broken. Flat is not broken. Not being your pick is not
-broken. If the case for holding is even close, hold — you can look again next
-cycle, and it is not your conviction to spend.
+Then decide honestly — manage this position the same way you would one you opened
+yourself: hold it, sell it, or say what would make you add. The operator owns it
+so you can act on it, not so you sit on it. Overbought alone, flat alone, or "not
+your pick" alone are not a broken thesis and do not justify a sell on their own.
+But if the setup has genuinely turned — the level is gone, the trend reversed,
+the reason it was worth holding no longer holds — say so and sell it. This second
+look is a fair hearing for the position, not a bias toward holding it forever.
 
 JSON ONLY:
 {"case_for_holding": "the strongest argument to keep it, under 25 words", "still_sell": true or false, "reasoning": "why, under 15 words"}`;
@@ -3827,6 +3947,9 @@ let shutdownRequested = false;
  * worth refusing outright.
  */
 let newEntriesBlocked: string | null = null;
+/** UTC day the daily-loss breaker was last notified for, so a webhook fires once
+ * per trip instead of every cycle it stays blocked. */
+let dailyLossNotifiedDay: string | null = null;
 const shutdownWaiters: Array<() => void> = [];
 /**
  * Set when the operator sends a chat message while the loop is between cycles
@@ -3862,7 +3985,7 @@ async function main() {
   console.log(`
 ┌──────────────────────────────────────────────┐
 │       AI CRYPTO TRADING BOT v2.1             │
-│  AI: GLM 5.2 via OpenRouter                  │
+│  AI: GLM via OpenRouter                      │
 │  Exchange: Kraken (${CONFIG.paperMode ? 'PAPER' : 'LIVE'})              │
 │  Strategy: AI-Powered Oversold Bounce        │
 │  Risk: ATR stops + trailing exits            │
@@ -3929,11 +4052,23 @@ async function main() {
           chat: memory.state.chatLog,
           model: ai.activeModel(),
           usage: { ...ai.usage },
+          equityHistory: memory.state.equityHistory.slice(-200),
+          maxDrawdownPct: memory.maxDrawdownPct(),
+          tradingPaused: memory.state.tradingPaused,
+          pauseReason: memory.state.pauseReason,
         };
       },
       onOperatorMessage: (text: string) => {
         memory.postOperatorMessage(text);
         requestWake('operator message received; scanning now instead of waiting for the next cycle');
+      },
+      onKillSwitch: (reason: string) => {
+        memory.triggerKillSwitch(reason);
+        requestWake(`kill switch triggered: ${reason}`);
+      },
+      onResume: () => {
+        memory.resumeTrading();
+        requestWake('trading resumed by operator');
       },
     });
   } else {
@@ -3955,10 +4090,13 @@ async function main() {
       if (!healthy) {
         newEntriesBlocked = 'preflight reported a critical failure';
         console.error('[PREFLIGHT] Critical checks failed; existing positions will still be managed and exited, but no new positions will be opened.');
+        await notifyWebhook('preflight_critical',
+          'Preflight found a critical failure at startup. Existing positions are still managed, but no new positions will open until this is resolved.');
       }
     } catch (e: any) {
       newEntriesBlocked = `preflight could not complete (${e.message})`;
       console.error(`[PREFLIGHT] Could not complete: ${e.message}; no new positions will be opened.`);
+      await notifyWebhook('preflight_critical', `Preflight could not complete at startup: ${e.message}. No new positions will open until this is resolved.`);
       if (doctorOnly) process.exit(1);
     }
   }
@@ -4175,6 +4313,22 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // Sizing runs off tradable value: staked balances are real money the bot cannot
   // spend, and counting them inflated every position size the AI was asked for.
   let portfolioValue = account.tradableUsd;
+
+  // ── KILL SWITCH: flatten everything before anything else runs this cycle ──
+  if (mem.consumeFlattenRequest()) {
+    const toFlatten = mem.getOpenPositions();
+    console.log(`\n  [KILL SWITCH] Flattening ${toFlatten.length} open position(s): ${mem.state.pauseReason}`);
+    for (const position of toFlatten) {
+      if (shutdownRequested) break;
+      try {
+        await executeExit(exchange, mem, position.pair, `Kill switch: ${mem.state.pauseReason}`, 'KILL_SWITCH', 10);
+      } catch (e) {
+        console.error(`  [KILL SWITCH] ${position.pair} failed to flatten: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    await notifyWebhook('kill_switch',
+      `Kill switch fired: ${mem.state.pauseReason}. Flattened ${toFlatten.length} position(s); new entries are paused until resumed.`);
+  }
 
   // ── PHASE 1: CHECK EXISTING POSITIONS ──
   console.log('\n── PHASE 1: Check positions ──');
@@ -4459,6 +4613,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
 
   const blockers: string[] = [];
   if (newEntriesBlocked) blockers.push(newEntriesBlocked);
+  if (mem.state.tradingPaused) blockers.push(`trading paused: ${mem.state.pauseReason}`);
   if (CONFIG.maxExposurePct !== null && exposure >= portfolioValue * CONFIG.maxExposurePct)
     blockers.push(`exposure ${fmt(exposure)} at the ${pct(CONFIG.maxExposurePct)} cap`);
   if (CONFIG.maxOpenPositions !== null && holding.size >= CONFIG.maxOpenPositions)
@@ -4466,8 +4621,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // Circuit breaker: stop opening risk on a day that has already gone badly.
   const realizedToday = mem.realizedPnlToday();
   if (CONFIG.maxDailyLossPct !== null && realizedToday < 0 &&
-      Math.abs(realizedToday) >= portfolioValue * CONFIG.maxDailyLossPct)
+      Math.abs(realizedToday) >= portfolioValue * CONFIG.maxDailyLossPct) {
     blockers.push(`daily realised loss ${fmt(realizedToday)} hit the ${pct(CONFIG.maxDailyLossPct)} circuit breaker`);
+    if (dailyLossNotifiedDay !== utcDay()) {
+      dailyLossNotifiedDay = utcDay();
+      await notifyWebhook('daily_loss_breaker',
+        `Daily loss circuit breaker tripped: realised ${fmt(realizedToday)} today, new entries blocked.`);
+    }
+  }
 
   const canOpen = blockers.length === 0;
   if (!canOpen) console.log(`  [PHASE 2] No new entries: ${blockers.join('; ')}.`);
@@ -4591,7 +4752,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         : '';
     stance = await ai.reviewPortfolio(account, candidates,
       concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote);
-    mem.recordStance(stance);
+    if (mem.recordStance(stance))
+      await notifyWebhook('funding_request', `KAI is asking for ${fmt(stance.requestedFundsUsd)} more: ${stance.reasoning}`);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
     if (stance.counterCase) console.log(`  [STANCE] against it — ${stance.counterCase}`);
     if (stance.cashTargetPct > 0)
@@ -4698,6 +4860,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       marketContext: newsContext,
       relativeStrength: relative,
       windowHigh,
+      spreadPct: candidateTicker?.spreadPct ?? null,
     }, c.plan);
 
     // The model may set its own entry stop and target. The only rule the bot

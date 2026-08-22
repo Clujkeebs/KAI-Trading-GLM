@@ -37,6 +37,58 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Equity/drawdown, spread context, webhooks, kill switch
+
+**Changed:** Several additions from a "what's the bot missing" pass:
+- `Memory.recordAccountSnapshot()` now also appends to a bounded `equityHistory` (2000 points,
+  ~20 days at the default interval); new `maxDrawdown()`/`Memory.maxDrawdownPct()` compute the
+  largest peak-to-trough decline. The dashboard renders it as an inline-SVG sparkline plus a
+  stat tile.
+- `ScanTicker` gained `spreadPct` (bid/ask spread as a fraction of price), computed in a new
+  exported `tickerFromRawTicker()` (the old private `Exchange.tickerFromRaw` now delegates to
+  it). It reaches the AI's BUY prompt as an informational line next to volume — guidance, not a
+  gate; nothing in code refuses a wide-spread pair.
+- New `notifyWebhook(event, text)`: a generic opt-in POST (`{text, content, event, at}`, so
+  Slack/Discord/ntfy/custom receivers all work off one `WEBHOOK_URL`) on a new funding request,
+  the daily-loss breaker tripping (deduped to once per UTC day via a module-level
+  `dailyLossNotifiedDay`), a critical preflight failure, and the kill switch firing. Failures
+  are logged and swallowed — never load-bearing for a cycle.
+- A kill switch: `Memory.triggerKillSwitch(reason)` sets `tradingPaused`, `pauseReason`, and a
+  one-shot `flattenRequested` flag (all persisted). `runCycle()` consumes the flatten flag right
+  after the account snapshot, before Phase 1, selling every open position via the existing
+  `executeExit()`; `tradingPaused` becomes a new Phase-2 blocker (existing stops/exits are never
+  affected — only new entries are blocked). `resumeTrading()` clears the pause without reopening
+  anything. Reachable from the dashboard (`POST /kill-switch` needs an exact `confirm=FLATTEN`
+  body field — a click alone can't fire it — plus `POST /resume`) and from the CLI (`npm run
+  cli -- kill|resume`, single-prompt confirmation).
+- `AI_MODEL`'s code default changed from `z-ai/glm-5.2` to `z-ai/glm-5-turbo` to match what was
+  already set on Railway, so the code and `.env.example` stop disagreeing with the live config.
+- Tuned the operator-position protection per direct operator feedback ("respect my positions
+  but not too much... I need it to manage my positions and portfolio"): `reconsiderSell()`'s
+  prompt previously said "if the case for holding is even close, hold," which tilted every close
+  call toward never selling. Replaced with: decide honestly, manage it like any other position
+  (hold/sell/add), the second opinion raises the bar on the *reason* to sell rather than biasing
+  the outcome. Mirrored the same clarification into `SOUL.md`'s "Who you work for" section.
+**Why:** Operator asked for a "top 10 things this bot doesn't have" pass, memorable dashboard
+credentials (set directly: username `kai`), a max login-attempt limit (separate entry below),
+and then separately flagged that operator-bought positions were being protected too heavily
+and that `AI_MODEL`'s code default was stale.
+**Verified:** `npm run build` and `npm test` clean throughout, including new coverage in
+`test/logic-check.ts` (ticker spread parsing incl. crossed-book rejection, `maxDrawdown`,
+`notifyWebhook` against a real local `http.Server` — success, blank-URL no-op, and an
+unreachable endpoint not throwing), `test/memory-check.ts` (`recordStance`'s new-request
+detection, equity history bounding/restart survival, kill-switch/resume state persistence),
+`test/dashboard-check.ts` (sparkline/drawdown rendering, kill-switch confirmation exactness,
+paused-state UI), and a full `test/cycle-check.ts` integration scenario (two open positions,
+`triggerKillSwitch`, a `BUY`-verdict AI that must still open nothing, both positions closed,
+flag consumed once, pause persists until `resumeTrading()`). Also manually smoke-tested
+`src/cli.ts kill`/`resume` end to end against a throwaway local dashboard and, doing so, found
+and fixed a real bug: a second sequential `rl.question()` never resolves once piped/non-TTY
+stdin has hit EOF, silently dropping the confirmation — collapsed to one prompt instead.
+**Watch out:** `WEBHOOK_URL` is not set on the live deploy (nothing was configured); the kill
+switch and the reconsiderSell prompt change are new behavior on a live-money bot, not yet
+observed against a real production cycle or a real sell decision.
+
 ### 2026-08-22 — Claude — Dashboard login lockout
 
 **Changed:** `src/dashboard.ts` now locks an address out after `DASHBOARD_MAX_LOGIN_ATTEMPTS`

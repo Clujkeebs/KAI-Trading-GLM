@@ -1,7 +1,8 @@
 # KAI Trading GLM
 
-AI-powered crypto trading bot with persistent memory. Uses GLM 5.2 (via OpenRouter) for trade
-decisions and Kraken for market data and execution, with live mode enabled by default.
+AI-powered crypto trading bot with persistent memory. Uses GLM (via OpenRouter, `z-ai/glm-5-turbo`
+by default) for trade decisions and Kraken for market data and execution, with live mode enabled
+by default.
 
 Risk is managed by the bot, not the model: stops and targets are sized from ATR, stops ratchet
 upward as a trade works, and they are never widened — by the AI or by anything else.
@@ -34,7 +35,7 @@ Use `LOOP_MODE=false` or `--once` for a single compiled/local cycle.
 All settings live in `.env` (see `.env.example`):
 
 - `AI_API_KEY` — OpenRouter API key (required)
-- `AI_PROVIDER` / `AI_MODEL` — defaults to `openrouter` / `z-ai/glm-5.2`
+- `AI_PROVIDER` / `AI_MODEL` — defaults to `openrouter` / `z-ai/glm-5-turbo`
 - `AI_MAX_TOKENS` — AI completion token budget (default `4000`). Reasoning models spend this on thinking before emitting content, so too small a value truncates every decision; the bot doubles it automatically, up to 16000, when it detects truncation
 - `AI_REASONING_EFFORT` — `off`, `low`, `medium` or `high` (default `low`); caps reasoning so the budget is left for the JSON
 - `AI_BASE_URL` — optional OpenAI-compatible API base URL override; blank uses the provider's configured URL
@@ -156,6 +157,11 @@ actually reviewed. Successful windows are cached per pair for six hours and reus
 cycles; a first cycle can therefore add up to `AI_REVIEWS_PER_CYCLE` daily-candle requests
 (five by default), while later cycles normally add none until the cache expires.
 
+Each candidate's ticker also carries its bid/ask spread, surfaced to the model alongside RSI
+and volume as "a market order pays roughly this on entry and again on exit" — informational
+context for judging execution quality on a thin market, not a gate: nothing in code refuses a
+wide-spread pair, the same guidance-not-rules approach as everything else it decides on.
+
 ### Positions you bought yourself
 
 The bot distinguishes positions it opened from ones it adopted out of your exchange balance,
@@ -170,9 +176,11 @@ Positions you bought are now handled differently in three ways:
   absence of a thesis on file means it lacks information, not that the position lacks merit.
   Overbought, flat, or "not my pick" are explicitly not grounds to sell.
 - A proposed sell triggers a **second opinion**: a separate call that must first build the
-  strongest case for *keeping* it, and only then confirm. The sell proceeds only if it survives
-  being argued against on purpose. If that call fails or returns nothing usable, the position is
-  kept — holding is the reversible choice.
+  strongest case for *keeping* it, and only then decide honestly — the same way it would manage
+  a position it opened itself: hold, sell, or add. The extra scrutiny raises the bar on the
+  *reason* to sell, not a bias toward holding regardless of what the setup is doing; a
+  genuinely broken thesis still gets sold. If that call fails or returns nothing usable, the
+  position is kept — holding is the reversible choice on a broken AI call specifically.
 
 Stops and alerts still apply to them, so nothing goes unprotected.
 
@@ -330,11 +338,12 @@ its settled balance before Phase 2 so the freed quote cash can fund a same-cycle
 
 ## Dashboard
 
-Set `DASHBOARD_PASSWORD` to run a small read-only web view alongside the trading loop —
-no separate process, no extra dependencies, one `http` server started from `main()`. It shows
-the current account breakdown (total / free cash / tradable / staked-or-reserved), open
-positions with a "yours"/"bot" origin badge, recent closed trades, the model's latest
-portfolio stance, any standing funding request, and a chat thread with the model.
+Set `DASHBOARD_PASSWORD` to run a small web view alongside the trading loop — no separate
+process, no extra dependencies, one `http` server started from `main()`. It shows the current
+account breakdown (total / free cash / tradable / staked-or-reserved), an equity chart with
+the largest peak-to-trough drawdown across the recorded history, open positions with a
+"yours"/"bot" origin badge, recent closed trades, the model's latest portfolio stance, any
+standing funding request, and a chat thread with the model.
 
 The chat is asynchronous, not live: a message you send is read by the model on its *next*
 portfolio review, not mid-thought. Sending one wakes the loop immediately, though — it
@@ -360,24 +369,36 @@ dashboard isn't only as strong as the password against something guessing it in 
 correct login resets the count. Tracking is in-memory per process (a redeploy clears it) and
 keyed on `X-Forwarded-For` behind Railway's proxy.
 
+### Kill switch
+
+The dashboard's Controls section can sell every open position at market immediately and pause
+new entries, for when something needs to stop right now rather than wait for the model's
+judgment. It requires typing `FLATTEN` into a text field to confirm — a click alone is not
+enough, so it cannot fire from a stray request or an auto-resubmitted form. Existing stops and
+exits are never affected by the pause; only opening new positions is blocked, and Phase 1 keeps
+managing whatever is still open every cycle regardless. Resuming does not reopen anything — it
+only allows new entries again. Firing it also posts to `WEBHOOK_URL` if configured.
+
 ### Terminal access
 
-`npm run cli -- balance` and `npm run cli -- chat` are a terminal front end for the same
-dashboard API — no browser needed. They run from your own machine (or anywhere with network
-access to the deployed URL), not on the server. Point them at the deployed dashboard with
-`DASHBOARD_URL`, `DASHBOARD_USERNAME`, and `DASHBOARD_PASSWORD` (a local `.env` works, same
-as the bot itself):
+`npm run cli -- balance | chat | kill | resume` is a terminal front end for the same dashboard
+API — no browser needed. It runs from your own machine (or anywhere with network access to the
+deployed URL), not on the server. Point it at the deployed dashboard with `DASHBOARD_URL`,
+`DASHBOARD_USERNAME`, and `DASHBOARD_PASSWORD` (a local `.env` works, same as the bot itself):
 
 ```bash
 DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli -- balance
 DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli -- chat
+DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli -- kill
 ```
 
 `balance` prints the account breakdown, open positions, P/L, and the latest stance, then
 exits. `chat` prints the recent thread and drops into a prompt — each line you send posts to
-the same chat log the dashboard shows and wakes the loop the same way. Nothing here talks to
-the exchange or state files directly; it is strictly a client of the dashboard's HTTP API, so
-`DASHBOARD_PASSWORD` must be set on the deployed bot for either command to work.
+the same chat log the dashboard shows and wakes the loop the same way. `kill` asks for a typed
+`FLATTEN` confirmation (and an optional reason) before firing the same kill switch as the
+dashboard; `resume` lifts a pause. Nothing here talks to the exchange or state files directly;
+it is strictly a client of the dashboard's HTTP API, so `DASHBOARD_PASSWORD` must be set on the
+deployed bot for any of these to work.
 
 ## Model choice and what it costs
 

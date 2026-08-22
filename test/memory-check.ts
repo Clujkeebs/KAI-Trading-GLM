@@ -237,6 +237,78 @@ async function main() {
     assert.equal(reloaded.state.lastAccountSnapshot?.cashUsd, 100, 'the snapshot survives a restart');
   }
 
+  // ── A stance's funding request is only "new" when it wasn't already standing ──
+  reset();
+  {
+    const mem = fresh();
+    const baseStance = (requestedFundsUsd: number, reasoning = 'need more capital') => ({
+      stance: 'NEUTRAL' as const, confidence: 5, reasoning, counterCase: '', cashTargetPct: 0,
+      requestedFundsUsd, messageToOperator: '', charterSuggestion: '',
+    });
+    assert.equal(mem.recordStance(baseStance(0)), false, 'no funding request is not "new"');
+    assert.equal(mem.state.fundingRequest, null);
+
+    assert.equal(mem.recordStance(baseStance(200)), true, 'a first funding request is new');
+    assert.equal(mem.state.fundingRequest?.usd, 200);
+
+    assert.equal(mem.recordStance(baseStance(200, 'still tight')), false,
+      'repeating the same amount is not a new request, even with different reasoning');
+    assert.equal(mem.recordStance(baseStance(500)), true, 'a changed amount is a new request');
+    assert.equal(mem.state.fundingRequest?.usd, 500);
+  }
+
+  // ── The kill switch's pause and one-shot flatten flag survive a restart ────
+  reset();
+  {
+    const mem = fresh();
+    assert.equal(mem.state.tradingPaused, false);
+    assert.equal(mem.state.flattenRequested, false);
+
+    mem.triggerKillSwitch('drawdown too fast');
+    assert.equal(mem.state.tradingPaused, true);
+    assert.equal(mem.state.pauseReason, 'drawdown too fast');
+    assert.equal(mem.state.flattenRequested, true);
+
+    const reloaded = fresh();
+    assert.equal(reloaded.state.tradingPaused, true, 'a pause survives a restart before it is resumed');
+    assert.equal(reloaded.state.flattenRequested, true, 'an unconsumed flatten request survives too');
+
+    assert.equal(reloaded.consumeFlattenRequest(), true);
+    assert.equal(reloaded.state.flattenRequested, false, 'consuming clears the one-shot flag');
+    assert.equal(reloaded.consumeFlattenRequest(), false, 'and it does not fire twice');
+    assert.equal(reloaded.state.tradingPaused, true, 'consuming the flatten does not itself resume trading');
+
+    reloaded.resumeTrading();
+    assert.equal(reloaded.state.tradingPaused, false);
+    assert.equal(reloaded.state.pauseReason, '');
+    assert.equal(fresh().state.tradingPaused, false, 'the resume also survives a restart');
+  }
+
+  // ── Each snapshot also extends the equity history, bounded and drawdown-ready ──
+  reset();
+  {
+    const mem = fresh();
+    assert.deepEqual(mem.state.equityHistory, []);
+    assert.equal(mem.maxDrawdownPct(), 0);
+
+    mem.recordAccountSnapshot({ totalUsd: 100, cashUsd: 0, tradableUsd: 100, stakedUsd: 0 });
+    mem.recordAccountSnapshot({ totalUsd: 150, cashUsd: 0, tradableUsd: 150, stakedUsd: 0 });
+    mem.recordAccountSnapshot({ totalUsd: 120, cashUsd: 0, tradableUsd: 120, stakedUsd: 0 });
+    assert.equal(mem.state.equityHistory.length, 3);
+    assert.equal(mem.state.equityHistory[0].totalUsd, 100);
+    assert.ok(Math.abs(mem.maxDrawdownPct() - 0.2) < 1e-9, '150 -> 120 is a 20% drawdown');
+
+    const reloaded = fresh();
+    assert.equal(reloaded.state.equityHistory.length, 3, 'equity history survives a restart');
+    assert.ok(Math.abs(reloaded.maxDrawdownPct() - 0.2) < 1e-9);
+
+    // The history is bounded so state.json cannot grow forever on a long-lived deploy.
+    for (let i = 0; i < 2100; i++) mem.recordAccountSnapshot({ totalUsd: 100 + i, cashUsd: 0, tradableUsd: 100 + i, stakedUsd: 0 });
+    assert.ok(mem.state.equityHistory.length <= 2000, `equity history grew to ${mem.state.equityHistory.length}`);
+    assert.equal(mem.state.equityHistory[mem.state.equityHistory.length - 1].totalUsd, 100 + 2099,
+      'the newest points are kept, not the oldest');
+  }
+
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log('memory checks passed');
 }

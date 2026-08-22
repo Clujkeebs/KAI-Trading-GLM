@@ -412,6 +412,37 @@ async function main() {
   assert.equal(exitMem.positions[trimPair].status, 'closed', 'trim_pct of 100 exits fully');
   assert.equal(exitMem.state.totalTrades, 1);
 
+  // ── The kill switch flattens every open position and blocks new entries ────
+  fs.rmSync(path.join(stateDir, 'positions.json'), { force: true });
+  fs.rmSync(path.join(stateDir, 'state.json'), { force: true });
+  const killMem = new Memory();
+  const killPairA = 'LINK/USD';
+  const killPairB = 'ONDO/USD';
+  killMem.openPosition(killPairA, 2, fake.prices[killPairA], fake.prices[killPairA] * 0.8, fake.prices[killPairA] * 1.5, 'l1', 'seed', 'seed');
+  killMem.openPosition(killPairB, 1, fake.prices[killPairB], fake.prices[killPairB] * 0.8, fake.prices[killPairB] * 1.5, 'l1', 'seed', 'seed');
+  killMem.triggerKillSwitch('testing the panic button');
+  assert.equal(killMem.state.flattenRequested, true);
+
+  // A BUY verdict from the AI must not open anything: the pause blocks Phase 3
+  // regardless of what the model wants, and Phase 1 must not re-trigger a review
+  // sell on something Phase 0 already flattened.
+  await runCycle(paper, killMem, fakeAi('BUY', 90, { stance: 'RISK_ON', reviewVerdict: 'HOLD' }));
+
+  assert.equal(killMem.positions[killPairA].status, 'closed', 'the kill switch sold the first position');
+  assert.equal(killMem.positions[killPairB].status, 'closed', 'and the second');
+  assert.equal(killMem.getOpenPositions().length, 0);
+  assert.equal(killMem.state.flattenRequested, false, 'the one-shot flag is consumed, not re-armed');
+  assert.equal(killMem.state.tradingPaused, true, 'the pause itself persists until an explicit resume');
+  assert.equal(killMem.state.pauseReason, 'testing the panic button');
+
+  // While paused, even an eager BUY verdict opens nothing new.
+  await runCycle(paper, killMem, fakeAi('BUY', 90, { stance: 'RISK_ON' }));
+  assert.equal(killMem.getOpenPositions().length, 0, 'no new entries open while paused');
+
+  killMem.resumeTrading();
+  assert.equal(killMem.state.tradingPaused, false);
+  assert.equal(killMem.state.pauseReason, '');
+
   // ── A position under the exchange minimum is topped up so its stop can fire ──
   // Production found MORPHO/USD holding 1.7602 units against a 2.5 minimum: the
   // bot reported a stop that Kraken would have rejected the moment it triggered.

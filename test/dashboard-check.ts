@@ -13,6 +13,8 @@ function emptySnapshot(): DashboardSnapshot {
     cycleCount: 1, lastScan: new Date().toISOString(),
     stance: null, fundingRequest: null, chat: [],
     model: 'test-model', usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
+    equityHistory: [], maxDrawdownPct: 0,
+    tradingPaused: false, pauseReason: '',
   };
 }
 
@@ -42,15 +44,20 @@ function request(
 async function main() {
   // startDashboard refuses to run without a password: this is a live-money view.
   assert.throws(() => startDashboard({
-    port: 0, username: 'operator', password: '', getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+    port: 0, username: 'operator', password: '', getSnapshot: emptySnapshot,
+    onOperatorMessage: () => {}, onKillSwitch: () => {}, onResume: () => {},
   }), /password/);
 
   let snapshot = emptySnapshot();
   const messages: string[] = [];
+  const killSwitchCalls: string[] = [];
+  let resumeCalls = 0;
   const server = startDashboard({
     port: 0, username: 'operator', password: 'correct-horse',
     getSnapshot: () => snapshot,
     onOperatorMessage: (text: string) => { messages.push(text); },
+    onKillSwitch: (reason: string) => { killSwitchCalls.push(reason); },
+    onResume: () => { resumeCalls++; },
   });
   await new Promise<void>(resolve => server.once('listening', resolve));
   const port = (server.address() as any).port;
@@ -104,12 +111,54 @@ async function main() {
         stopLoss: 90, takeProfit: 130, alertPrice: 95, origin: 'operator', sector: 'l1', openedAt: new Date().toISOString(),
       }],
       fundingRequest: { usd: 200, reasoning: 'sizing is capital constrained', requestedAt: new Date().toISOString() },
+      equityHistory: [
+        { at: '2026-08-01T00:00:00.000Z', totalUsd: 1000 },
+        { at: '2026-08-02T00:00:00.000Z', totalUsd: 1200 },
+        { at: '2026-08-03T00:00:00.000Z', totalUsd: 900 },
+      ],
+      maxDrawdownPct: 0.25,
     };
     const live = await request(port, '/', { auth: 'operator:correct-horse' });
     assert.ok(live.body.includes('LIVE'));
     assert.ok(live.body.includes('BTC/USD'));
     assert.ok(live.body.includes('yours'), 'operator-opened positions are badged');
     assert.ok(live.body.includes('Funding request'));
+    assert.ok(live.body.includes('<polyline'), 'the equity history renders a sparkline');
+    assert.ok(live.body.includes('25.0%'), 'the max drawdown stat is shown');
+
+    // Fewer than two equity points is not enough for a chart; say so instead of drawing garbage.
+    const noHistory = await request(port, '/api/state', { auth: 'operator:correct-horse' });
+    const parsedLive = JSON.parse(noHistory.body);
+    assert.equal(parsedLive.equityHistory.length, 3);
+
+    // The kill switch needs a typed confirmation, not just a click.
+    const badConfirm = await request(port, '/kill-switch', {
+      auth: 'operator:correct-horse', method: 'POST', body: 'confirm=' + encodeURIComponent('flatten'),
+    });
+    assert.equal(badConfirm.status, 303, 'a bad confirmation still redirects, quietly doing nothing');
+    assert.deepEqual(killSwitchCalls, [], 'a lowercase or missing confirmation does not fire the kill switch');
+
+    const goodConfirm = await request(port, '/kill-switch', {
+      auth: 'operator:correct-horse', method: 'POST',
+      body: 'confirm=FLATTEN&reason=' + encodeURIComponent('testing the panic button'),
+    });
+    assert.equal(goodConfirm.status, 303);
+    assert.deepEqual(killSwitchCalls, ['testing the panic button'], 'an exact FLATTEN confirmation fires it once, with the reason');
+
+    // A blank reason falls back to a sensible default rather than an empty string.
+    await request(port, '/kill-switch', { auth: 'operator:correct-horse', method: 'POST', body: 'confirm=FLATTEN' });
+    assert.equal(killSwitchCalls[1], 'operator triggered via dashboard');
+
+    const resumed = await request(port, '/resume', { auth: 'operator:correct-horse', method: 'POST' });
+    assert.equal(resumed.status, 303);
+    assert.equal(resumeCalls, 1);
+
+    // Paused-state rendering: a banner and a resume control instead of the flatten form.
+    snapshot = { ...emptySnapshot(), tradingPaused: true, pauseReason: 'operator triggered via dashboard' };
+    const pausedPage = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(pausedPage.body.includes('Trading paused'));
+    assert.ok(pausedPage.body.includes('Resume trading'));
+    assert.ok(!pausedPage.body.includes('Flatten &amp; pause'), 'the flatten form is hidden while already paused');
 
     // An unknown route is a 404, not a silent 200.
     const missing = await request(port, '/nope', { auth: 'operator:correct-horse' });
@@ -124,6 +173,7 @@ async function main() {
       port: 0, username: 'operator', password: 'correct-horse',
       maxLoginAttempts: 3, lockoutMinutes: 1,
       getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+      onKillSwitch: () => {}, onResume: () => {},
     });
     await new Promise<void>(resolve => throttled.once('listening', resolve));
     const tPort = (throttled.address() as any).port;
@@ -150,6 +200,7 @@ async function main() {
       port: 0, username: 'operator', password: 'correct-horse',
       maxLoginAttempts: 3, lockoutMinutes: 1,
       getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+      onKillSwitch: () => {}, onResume: () => {},
     });
     await new Promise<void>(resolve => resettable.once('listening', resolve));
     const rPort = (resettable.address() as any).port;

@@ -26,15 +26,19 @@ async function fetchState(): Promise<any> {
   return res.json();
 }
 
-async function postMessage(text: string): Promise<void> {
-  const res = await fetch(`${url}/message`, {
+async function postForm(path: string, body: string): Promise<void> {
+  const res = await fetch(`${url}${path}`, {
     method: 'POST',
     headers: { Authorization: authHeader(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `text=${encodeURIComponent(text)}`,
+    body,
     redirect: 'manual',
   });
   // A successful POST redirects (303) back to "/"; anything else is a real failure.
-  if (res.status !== 303 && !res.ok) throw new Error(`POST /message -> ${res.status} ${(await res.text()).slice(0, 200)}`);
+  if (res.status !== 303 && !res.ok) throw new Error(`POST ${path} -> ${res.status} ${(await res.text()).slice(0, 200)}`);
+}
+
+async function postMessage(text: string): Promise<void> {
+  await postForm('/message', `text=${encodeURIComponent(text)}`);
 }
 
 function fmtUsd(n: number): string {
@@ -108,6 +112,46 @@ async function runChat() {
   rl.on('close', () => { pending.then(() => process.exit(0)); });
 }
 
+function ask(rl: readline.Interface, question: string): Promise<string> {
+  return new Promise(resolve => rl.question(question, resolve));
+}
+
+async function runKill() {
+  const state = await fetchState();
+  if (state.tradingPaused) {
+    console.log(`Trading is already paused: ${state.pauseReason}`);
+    console.log('Run "npm run cli -- resume" to lift it.');
+    return;
+  }
+  console.log(`This sells every open position (${state.positions.length}) at market right now`);
+  console.log('and pauses new entries until you explicitly resume. This is not reversible —');
+  console.log('the sales happen immediately.\n');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // A single prompt, not two in sequence: a second rl.question() after the first
+  // never resolves once piped/non-TTY stdin has already hit EOF, silently
+  // swallowing the reason and leaving the process to exit without confirming.
+  const line = await ask(rl, 'Type FLATTEN to confirm (optionally followed by a reason), anything else to cancel: ');
+  rl.close();
+  const trimmed = line.trim();
+  if (trimmed !== 'FLATTEN' && !trimmed.startsWith('FLATTEN ')) {
+    console.log('Not confirmed; nothing was done.');
+    return;
+  }
+  const reason = trimmed.slice('FLATTEN'.length).trim();
+  await postForm('/kill-switch', `confirm=FLATTEN&reason=${encodeURIComponent(reason)}`);
+  console.log('Kill switch fired. The bot is flattening positions and pausing new entries.');
+}
+
+async function runResume() {
+  const state = await fetchState();
+  if (!state.tradingPaused) {
+    console.log('Trading is not paused; nothing to resume.');
+    return;
+  }
+  await postForm('/resume', '');
+  console.log(`Resumed. New entries are allowed again (was paused: ${state.pauseReason}).`);
+}
+
 async function main() {
   if (!url) {
     console.error('Missing DASHBOARD_URL, e.g. https://your-app.up.railway.app');
@@ -121,8 +165,10 @@ async function main() {
   const cmd = process.argv[2];
   if (cmd === 'balance') await runBalance();
   else if (cmd === 'chat') await runChat();
+  else if (cmd === 'kill') await runKill();
+  else if (cmd === 'resume') await runResume();
   else {
-    console.log('Usage: npm run cli -- balance | chat');
+    console.log('Usage: npm run cli -- balance | chat | kill | resume');
     console.log('Requires DASHBOARD_URL and DASHBOARD_PASSWORD (DASHBOARD_USERNAME defaults to "operator").');
     process.exit(1);
   }

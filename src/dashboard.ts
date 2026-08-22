@@ -65,6 +65,11 @@ export interface DashboardFundingRequest {
   requestedAt: string;
 }
 
+export interface DashboardEquityPoint {
+  at: string;
+  totalUsd: number;
+}
+
 export interface DashboardSnapshot {
   mode: 'paper' | 'live';
   generatedAt: string;
@@ -82,6 +87,14 @@ export interface DashboardSnapshot {
   chat: DashboardChatMessage[];
   model: string;
   usage: { calls: number; promptTokens: number; completionTokens: number };
+  /** Recent total-account-value points, oldest first, for the equity chart. */
+  equityHistory: DashboardEquityPoint[];
+  /** Largest peak-to-trough decline across the full recorded history, as a fraction. */
+  maxDrawdownPct: number;
+  /** True while the kill switch has paused new entries. */
+  tradingPaused: boolean;
+  /** Why trading is paused, shown next to the resume control. */
+  pauseReason: string;
 }
 
 export interface DashboardOptions {
@@ -90,6 +103,10 @@ export interface DashboardOptions {
   password: string;
   getSnapshot: () => DashboardSnapshot;
   onOperatorMessage: (text: string) => void;
+  /** Sells everything and pauses new entries until onResume is called. */
+  onKillSwitch: (reason: string) => void;
+  /** Clears the pause set by the kill switch (or by any other pause). */
+  onResume: () => void;
   /** Failed logins from one address before it is locked out (default 8). */
   maxLoginAttempts?: number;
   /** How long a lockout lasts, in minutes (default 15). */
@@ -248,6 +265,25 @@ function renderChat(chat: DashboardChatMessage[]): string {
   }).join('');
 }
 
+function renderEquitySparkline(points: DashboardEquityPoint[]): string {
+  if (points.length < 2) return '<p class="muted">Not enough history yet for a chart.</p>';
+  const width = 600, height = 80, pad = 4;
+  const values = points.map(p => p.totalUsd);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const stepX = (width - pad * 2) / (points.length - 1);
+  const coords = points.map((p, i) => {
+    const x = pad + i * stepX;
+    const y = pad + (height - pad * 2) * (1 - (p.totalUsd - min) / range);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const color = values[values.length - 1] >= values[0] ? '#4ade80' : '#f87171';
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%;height:80px;display:block;">` +
+    `<polyline points="${coords}" fill="none" stroke="${color}" stroke-width="2" /></svg>` +
+    `<div class="muted" style="margin-top:4px;">${escapeHtml(points[0].at.slice(0, 16).replace('T', ' '))} → ${escapeHtml(points[points.length - 1].at.slice(0, 16).replace('T', ' '))} · ${fmtUsd(min)}–${fmtUsd(max)}</div>`;
+}
+
 function renderPage(snapshot: DashboardSnapshot): string {
   const a = snapshot.account;
   const stance = snapshot.stance;
@@ -290,11 +326,18 @@ function renderPage(snapshot: DashboardSnapshot): string {
   .stance-box { background: #131826; border: 1px solid #232b3d; border-radius: 10px; padding: 14px; }
   .mode-live { color: #f87171; font-weight: 600; }
   .mode-paper { color: #94a3b8; }
+  .banner-danger { background: #450a0a; border: 1px solid #b91c1c; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; }
+  .danger-box { background: #1c0a0a; border: 1px solid #7f1d1d; border-radius: 10px; padding: 14px; }
+  .btn-danger { background: #b91c1c; }
+  .btn-safe { background: #15803d; }
+  input[type=text] { background: #0b0e14; border: 1px solid #232b3d; border-radius: 8px; color: #e6e9ef; padding: 8px 10px; font-family: inherit; font-size: 13px; }
 </style>
 </head>
 <body>
 <h1>KAI Trading — <span class="${snapshot.mode === 'live' ? 'mode-live' : 'mode-paper'}">${snapshot.mode.toUpperCase()}</span></h1>
 <div class="sub">Generated ${escapeHtml(snapshot.generatedAt)} · cycle ${snapshot.cycleCount} · last scan ${escapeHtml(snapshot.lastScan || 'n/a')} · ${escapeHtml(snapshot.model)} (${snapshot.usage.calls} calls, ${(snapshot.usage.promptTokens + snapshot.usage.completionTokens).toLocaleString()} tokens since start)</div>
+
+${snapshot.tradingPaused ? `<div class="banner-danger"><strong>Trading paused:</strong> ${escapeHtml(snapshot.pauseReason)} — no new positions will open until resumed.</div>` : ''}
 
 ${snapshot.fundingRequest ? `<div class="banner"><strong>Funding request:</strong> ${fmtUsd(snapshot.fundingRequest.usd)} — ${escapeHtml(snapshot.fundingRequest.reasoning)} <span class="muted">(${escapeHtml(snapshot.fundingRequest.requestedAt)})</span></div>` : ''}
 
@@ -305,7 +348,10 @@ ${snapshot.fundingRequest ? `<div class="banner"><strong>Funding request:</stron
   <div class="tile"><div class="label">Staked / reserved</div><div class="value">${a ? fmtUsd(a.stakedUsd) : '—'}</div></div>
   <div class="tile"><div class="label">Realised P/L</div><div class="value ${snapshot.totalPnl >= 0 ? 'pos' : 'neg'}">${fmtUsd(snapshot.totalPnl)}</div></div>
   <div class="tile"><div class="label">Win rate</div><div class="value">${snapshot.winRatePct.toFixed(0)}% <span class="muted">(${snapshot.wins}/${snapshot.wins + snapshot.losses})</span></div></div>
+  <div class="tile"><div class="label">Max drawdown</div><div class="value ${snapshot.maxDrawdownPct > 0 ? 'neg' : ''}">${(snapshot.maxDrawdownPct * 100).toFixed(1)}%</div></div>
 </div>
+
+<section><h2>Equity</h2>${renderEquitySparkline(snapshot.equityHistory)}</section>
 
 ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
   <strong>${escapeHtml(stance.stance)}</strong> (${stance.confidence}/10) — ${escapeHtml(stance.reasoning)}
@@ -317,6 +363,21 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
 <section><h2>Open positions (${snapshot.positions.length})</h2>${renderPositions(snapshot.positions)}</section>
 
 <section><h2>Recent closes</h2>${renderClosedTrades(snapshot.closedTrades)}</section>
+
+<section>
+  <h2>Controls</h2>
+  <div class="danger-box">
+  ${snapshot.tradingPaused
+    ? `<p>Trading is paused: ${escapeHtml(snapshot.pauseReason)}</p>
+       <form method="POST" action="/resume"><button type="submit" class="btn-safe">Resume trading</button></form>`
+    : `<p>Sells every open position at market right now and pauses new entries until you resume. Type <strong>FLATTEN</strong> to confirm.</p>
+       <form method="POST" action="/kill-switch">
+         <input type="text" name="confirm" placeholder="FLATTEN" autocomplete="off">
+         <input type="text" name="reason" placeholder="reason (optional)" autocomplete="off" style="flex:1;">
+         <button type="submit" class="btn-danger">Flatten &amp; pause</button>
+       </form>`}
+  </div>
+</section>
 
 <section>
   <h2>Chat with GLM</h2>
@@ -405,6 +466,27 @@ export function startDashboard(options: DashboardOptions): http.Server {
         const params = new URLSearchParams(body);
         const text = (params.get('text') || '').trim();
         if (text) options.onOperatorMessage(text);
+        res.writeHead(303, { Location: '/' });
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/kill-switch' && req.method === 'POST') {
+        const body = await readBody(req);
+        const params = new URLSearchParams(body);
+        // A typed confirmation, not just a click, so this can't fire from a stray
+        // request or a form auto-resubmitted by the browser.
+        if (params.get('confirm') === 'FLATTEN') {
+          const reason = (params.get('reason') || '').trim() || 'operator triggered via dashboard';
+          options.onKillSwitch(reason);
+        }
+        res.writeHead(303, { Location: '/' });
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/resume' && req.method === 'POST') {
+        options.onResume();
         res.writeHead(303, { Location: '/' });
         res.end();
         return;
