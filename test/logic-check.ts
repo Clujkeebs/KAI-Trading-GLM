@@ -10,6 +10,7 @@ import {
   normalizeStance, applyEntryPlan, normalizeTrimFraction, rankReviewPositions,
   concentrationNote, selectReviews, defaultAlertPrice, alertTriggered, rebasePlanToFill,
   isExcludedPair, composeSystemPrompt, loadSoulCharter, resolveSoulFilePath,
+  resolvePlaybookFilePath, medianTickerChange, relativeStrength, windowHighContext,
   isStanceFresh, normalizeCycleCount, nextCycleNumber, filterDiscoveredMarkets,
   filterLiquidTickers, coarseRankTickers, selectDailyMovers, shouldCheckMoverNews,
   shouldAttemptMoverNews, prioritizeMoverCandidates, isUnsupportedWebSearch,
@@ -298,6 +299,37 @@ assert.equal(composeSystemPrompt(existingPrompt, null), existingPrompt);
 assert.equal(resolveSoulFilePath('/repo/src'), '/repo/SOUL.md');
 assert.equal(resolveSoulFilePath('/repo/dist'), '/repo/SOUL.md');
 assert.equal(loadSoulCharter('/home/ubuntu/does-not-exist/SOUL.md').contents, null);
+const playbookPrompt = composeSystemPrompt(existingPrompt, 'Charter text.', 'Playbook text.');
+assert.ok(playbookPrompt.indexOf('Charter text.') < playbookPrompt.indexOf('Playbook text.'));
+assert.ok(playbookPrompt.includes("operator's method; the trading charter above outranks it"));
+assert.ok(playbookPrompt.endsWith(existingPrompt));
+assert.equal(resolvePlaybookFilePath('/repo/src'), '/repo/PLAYBOOK.md');
+assert.equal(resolvePlaybookFilePath('/repo/dist'), '/repo/PLAYBOOK.md');
+assert.equal(resolvePlaybookFilePath('/repo/src', 'config/custom-playbook.md'), '/repo/config/custom-playbook.md');
+assert.equal(resolvePlaybookFilePath('/repo/src', '/tmp/custom-playbook.md'), '/tmp/custom-playbook.md');
+assert.equal(loadSoulCharter('/home/ubuntu/does-not-exist/PLAYBOOK.md').contents, null);
+
+const tickerSample = [
+  { pair: 'A/USD', price: 1, high24h: 1.2, low24h: 0.8, changePct: -4, volume24h: 1 },
+  { pair: 'B/USD', price: 1, high24h: 1.2, low24h: 0.8, changePct: 2, volume24h: 1 },
+  { pair: 'C/USD', price: 1, high24h: 1.2, low24h: 0.8, changePct: 8, volume24h: 1 },
+];
+assert.equal(medianTickerChange(tickerSample), 2);
+assert.equal(medianTickerChange([]), null);
+assert.deepEqual(relativeStrength(tickerSample[2], 2), {
+  pairChangePct: 8, universeMedianChangePct: 2, deltaPct: 6,
+});
+assert.equal(relativeStrength(tickerSample[0], null), null);
+const windowCandles = [
+  { timestamp: 1_700_000_000_000, open: 1, high: 10, low: 1, close: 5, volume: 1 },
+  { timestamp: 1_700_086_400_000, open: 5, high: 20, low: 4, close: 10, volume: 1 },
+  { timestamp: 1_700_172_800_000, open: 10, high: 15, low: 8, close: 12, volume: 1 },
+];
+assert.deepEqual(windowHighContext(windowCandles, 10, 1_700_259_200_000), {
+  high: 20, highAt: 1_700_086_400_000, ageDays: 2, drawdownPct: 0.5,
+});
+assert.equal(windowHighContext([], 10), null);
+assert.equal(windowHighContext(windowCandles, 0), null);
 
 const reviewPositions = [
   { ...position, pair: 'URGENT/USD', entryPrice: 90, currentPrice: 100, stopLoss: 99, takeProfit: 130 },

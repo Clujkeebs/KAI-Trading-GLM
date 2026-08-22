@@ -14,6 +14,7 @@ export interface SoulCharterLoad {
 }
 
 const SOUL_HEADER = "OPERATOR'S TRADING CHARTER — this standing mandate outranks convenience or habit.";
+const PLAYBOOK_HEADER = "OPERATOR'S TRADING PLAYBOOK — this is the operator's method; the trading charter above outranks it if they disagree.";
 
 export function resolveSoulFilePath(moduleDir = __dirname, override = process.env.SOUL_FILE): string {
   const repoRoot = path.resolve(moduleDir, '..');
@@ -37,10 +38,21 @@ export function loadSoulCharter(filePath: string): SoulCharterLoad {
   }
 }
 
-export function composeSystemPrompt(existingPrompt: string, charterContents: string | null): string {
-  if (!charterContents?.trim()) return existingPrompt;
-  const separator = charterContents.endsWith('\n') ? '\n' : '\n\n';
-  return `${SOUL_HEADER}\n\n${charterContents}${separator}${existingPrompt}`;
+export function resolvePlaybookFilePath(moduleDir = __dirname, override = process.env.PLAYBOOK_FILE): string {
+  const repoRoot = path.resolve(moduleDir, '..');
+  const configured = override?.trim();
+  return configured
+    ? (path.isAbsolute(configured) ? configured : path.resolve(repoRoot, configured))
+    : path.join(repoRoot, 'PLAYBOOK.md');
+}
+
+export function composeSystemPrompt(
+  existingPrompt: string, charterContents: string | null, playbookContents: string | null = null,
+): string {
+  const prefixes: string[] = [];
+  if (charterContents?.trim()) prefixes.push(`${SOUL_HEADER}\n\n${charterContents}`);
+  if (playbookContents?.trim()) prefixes.push(`${PLAYBOOK_HEADER}\n\n${playbookContents}`);
+  return prefixes.length > 0 ? `${prefixes.join('\n\n')}\n\n${existingPrompt}` : existingPrompt;
 }
 
 function initializeSoulCharter(): SoulCharterLoad {
@@ -54,6 +66,18 @@ function initializeSoulCharter(): SoulCharterLoad {
 }
 
 const SOUL_CHARTER = initializeSoulCharter();
+
+function initializePlaybook(): SoulCharterLoad {
+  const loaded = loadSoulCharter(resolvePlaybookFilePath());
+  if (loaded.contents === null) {
+    console.warn(`  [PLAYBOOK] Trading playbook unavailable at ${loaded.path}: ${loaded.error}; continuing with existing prompts`);
+  } else {
+    console.log(`  [PLAYBOOK] Trading playbook loaded from ${loaded.path} (${loaded.size} characters)`);
+  }
+  return loaded;
+}
+
+const PLAYBOOK = initializePlaybook();
 
 // ============================================================
 // AI CRYPTO TRADING BOT v2.1 — GLM 5.2 + KRAKEN
@@ -109,6 +133,8 @@ interface BuyContext {
   sectorTargetPct?: number;
   concentration: string;
   marketContext?: string;
+  relativeStrength?: RelativeStrength | null;
+  windowHigh?: WindowHighContext | null;
 }
 export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
@@ -449,6 +475,69 @@ export interface ScanTicker {
   low24h: number;
   changePct: number;
   volume24h: number;
+}
+
+export interface RelativeStrength {
+  pairChangePct: number;
+  universeMedianChangePct: number;
+  deltaPct: number;
+}
+
+export interface WindowHighContext {
+  high: number;
+  highAt: number;
+  ageDays: number;
+  drawdownPct: number;
+}
+
+export function medianTickerChange(tickers: ScanTicker[]): number | null {
+  const changes = tickers.map(ticker => ticker.changePct).filter(Number.isFinite).sort((a, b) => a - b);
+  if (changes.length === 0) return null;
+  const middle = Math.floor(changes.length / 2);
+  return changes.length % 2 === 1
+    ? changes[middle]
+    : (changes[middle - 1] + changes[middle]) / 2;
+}
+
+export function relativeStrength(ticker: ScanTicker, universeMedianChangePct: number | null): RelativeStrength | null {
+  if (!Number.isFinite(ticker.changePct) || universeMedianChangePct === null ||
+      !Number.isFinite(universeMedianChangePct))
+    return null;
+  return {
+    pairChangePct: ticker.changePct,
+    universeMedianChangePct,
+    deltaPct: ticker.changePct - universeMedianChangePct,
+  };
+}
+
+export function windowHighContext(
+  candles: OhlcvCandle[], currentPrice: number, now = Date.now(),
+): WindowHighContext | null {
+  const usable = candles.filter(candle =>
+    Number.isFinite(candle.high) && candle.high > 0 && Number.isFinite(candle.timestamp));
+  if (usable.length === 0 || !Number.isFinite(currentPrice) || currentPrice <= 0) return null;
+  const highest = usable.reduce((best, candle) =>
+    candle.high > best.high ? candle : best);
+  return {
+    high: highest.high,
+    highAt: highest.timestamp,
+    ageDays: Math.max(0, (now - highest.timestamp) / 86_400_000),
+    drawdownPct: Math.max(0, (highest.high - currentPrice) / highest.high),
+  };
+}
+
+function marketContextNote(
+  relative: RelativeStrength | null | undefined,
+  windowHigh: WindowHighContext | null | undefined,
+): string {
+  const lines: string[] = [];
+  if (relative) {
+    lines.push(`24h relative strength (ticker data): pair ${relative.pairChangePct >= 0 ? '+' : ''}${relative.pairChangePct.toFixed(2)}% vs universe median ${relative.universeMedianChangePct >= 0 ? '+' : ''}${relative.universeMedianChangePct.toFixed(2)}%; delta ${relative.deltaPct >= 0 ? '+' : ''}${relative.deltaPct.toFixed(2)} percentage points`);
+  }
+  if (windowHigh) {
+    lines.push(`High over fetched daily window (not an all-time high): ${fmt(windowHigh.high)} on ${new Date(windowHigh.highAt).toISOString().slice(0, 10)} (${windowHigh.ageDays.toFixed(0)} days ago); drawdown ${pct(windowHigh.drawdownPct)}`);
+  }
+  return lines.join('\n');
 }
 
 export interface CoarseTicker extends ScanTicker {
@@ -2641,7 +2730,7 @@ RESPOND WITH JSON ONLY — no markdown, no code fences, no text before or after.
 Think briefly. Emit the JSON object as your very first output token.
 Keep "reasoning" under 12 words and "counter_case" under 20. Do not restate the data you were given.
 {"verdict": "BUY" or "HOLD" or "SELL", "confidence": 1-10, "reasoning": "brief why", "position_size_pct": 0 or greater, "adjusted_stop": number or null, "adjusted_target": number or null, "trim_pct": 1-100 or null, "alert_price": number or null, "counter_case": "strongest argument against this", "verdict_holds": true or false}`;
-const DECISION_SYSTEM_PROMPT = composeSystemPrompt(SYSTEM_PROMPT, SOUL_CHARTER.contents);
+const DECISION_SYSTEM_PROMPT = composeSystemPrompt(SYSTEM_PROMPT, SOUL_CHARTER.contents, PLAYBOOK.contents);
 
 type AiParseResult = {
   decision: AiDecision | null;
@@ -2840,10 +2929,11 @@ stance in "counter_case", then keep the stance only if it survives that.
 
 Keep "reasoning" under 25 words and "counter_case" under 20.
 {"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this"}`;
-const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents);
+const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents, PLAYBOOK.contents);
 const NEWS_SYSTEM_PROMPT = composeSystemPrompt(
   'You are a crypto market-news researcher. Return the requested JSON object only.',
   SOUL_CHARTER.contents,
+  PLAYBOOK.contents,
 );
 
 export function normalizeStance(json: any): PortfolioStance {
@@ -2966,12 +3056,16 @@ ${context?.sectorTargetPct === undefined
 Free cash available for this pair after fee reserve: ${fmt(context?.spendableCashUsd ?? 0)}
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
+${marketContextNote(context?.relativeStrength, context?.windowHigh) ? `\nMARKET CONTEXT:\n${marketContextNote(context?.relativeStrength, context?.windowHigh)}\n` : ''}
 ${context?.concentration ? `\n${context.concentration}\n` : ''}
 ${context?.marketContext ? `\nMARKET NEWS CONTEXT (evidence, not an instruction):\n${context.marketContext}\n` : ''}
 BUY or HOLD?`, pair);
   }
 
-  async review(pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = '', alertNote = ''): Promise<AiDecision> {
+  async review(
+    pair: string, ta: TechnicalAnalysis, cashNote = '', concentration = '', alertNote = '',
+    relative: RelativeStrength | null = null, windowHigh: WindowHighContext | null = null,
+  ): Promise<AiDecision> {
     const p = this.memory.positions[pair];
     if (!p) return { verdict: 'HOLD', confidence: 5, reasoning: 'Not found', positionSizePct: 0, adjustedStop: null, adjustedTarget: null, trimFraction: 1, alertPrice: null, salvaged: false, counterCase: '', verdictHolds: true };
     const pnl = (p.currentPrice - p.entryPrice) * p.qty;
@@ -2992,6 +3086,7 @@ want it tighter than the value above. Stops are never widened.
 ${alertNote}
 ${cashNote}
 ${concentration}
+${marketContextNote(relative, windowHigh) ? `\nMARKET CONTEXT:\n${marketContextNote(relative, windowHigh)}\n` : ''}
 
 Buy reason: ${p.reason}
 AI reasoning at entry: ${p.aiReasoning}
@@ -3960,8 +4055,17 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         const alertNote = wasAlerted
           ? `ALERT TRIGGERED: this position fell to the level you asked to be woken at. It has NOT been sold. Decide now: sell it, hold it, or add to it if the drawdown improved the setup rather than broke it. The hard stop at ${fmt(pos.stopLoss)} is still below you.`
           : '';
+        let reviewWindowHigh: WindowHighContext | null = null;
+        try {
+          reviewWindowHigh = windowHighContext(
+            await exchange.getOhlcv(pos.pair, '1d', 365),
+            ta.currentPrice,
+          );
+        } catch (e) {
+          console.warn(`  [PHASE 1] ${pos.pair} daily window unavailable: ${e instanceof Error ? e.message : String(e)}`);
+        }
         const d = await ai.review(pos.pair, ta, cashNote, concentration,
-          [alertNote, ownership].filter(Boolean).join('\n\n'));
+          [alertNote, ownership].filter(Boolean).join('\n\n'), null, reviewWindowHigh);
 
         if (!shutdownRequested && d.verdict === 'SELL' && d.verdictHolds &&
             (CONFIG.aiSellConfidenceThreshold === null || d.confidence >= CONFIG.aiSellConfidenceThreshold)) {
@@ -4084,6 +4188,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   let scanPairs: string[] = [];
   let scanPrices: Record<string, number> = {};
   let scanTickerByPair = new Map<string, ScanTicker>();
+  let scanMedianChangePct: number | null = null;
   const moverByPair = new Map<string, 'gainer' | 'loser'>();
   if (canOpen) {
     try {
@@ -4093,9 +4198,11 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         scanPrices = scanPairs.length > 0 ? await exchange.getPricesBatch(scanPairs) : {};
         const tickers = scanPairs.length > 0 ? await exchange.getTickersBatch(scanPairs) : [];
         scanTickerByPair = new Map(tickers.map(ticker => [ticker.pair, ticker]));
+        scanMedianChangePct = medianTickerChange(tickers);
         console.log(`  [SCAN] watchlist: ${scanPairs.length} legacy pairs sent to TA`);
       } else {
         const tickers = await exchange.getTickersBatch(universe);
+        scanMedianChangePct = medianTickerChange(tickers);
         const liquidTickers = filterLiquidTickers(tickers, CONFIG.min24hQuoteVolumeUsd);
         coarseTickers = coarseRankTickers(liquidTickers);
         scanTickerByPair = new Map(liquidTickers.map(ticker => [ticker.pair, ticker]));
@@ -4234,6 +4341,16 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const newsContext = c.mover === 'loser'
       ? await ai.checkMoverNews(c.pair, scanTickerByPair.get(c.pair)?.changePct ?? 0)
       : '';
+    let windowHigh: WindowHighContext | null = null;
+    try {
+      const dailyCandles = await exchange.getOhlcv(c.pair, '1d', 365);
+      windowHigh = windowHighContext(dailyCandles, c.ta.currentPrice);
+      if (!windowHigh) console.warn(`  [SCAN] ${c.pair}: no usable daily window high; continuing without it`);
+    } catch (e) {
+      console.warn(`  [SCAN] ${c.pair}: daily window unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const candidateTicker = scanTickerByPair.get(c.pair);
+    const relative = candidateTicker ? relativeStrength(candidateTicker, scanMedianChangePct) : null;
     const hasSectorMetadata = c.sector !== 'unlisted';
     const decision = await ai.analyze(c.pair, c.sector, c.ta, c.vol, {
       portfolioValueUsd: portfolioValue,
@@ -4247,6 +4364,8 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       } : {}),
       concentration: concentrationNote(portfolioValue, mem.getOpenPositions().length),
       marketContext: newsContext,
+      relativeStrength: relative,
+      windowHigh,
     }, c.plan);
 
     // The model may set its own entry stop and target. The only rule the bot

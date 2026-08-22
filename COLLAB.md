@@ -149,3 +149,33 @@ news attempt rather than the previous repeated sequence.
 
 **Watch out:** Live Kraken behavior, authenticated OpenRouter `:online` entitlement,
 real sector metadata, and live order execution remain unverified.
+
+### 2026-08-22 — Devin — Supply the operator playbook and window context to decisions
+
+**Changed:** Archived the supplied seven-chapter Crypto Playbook at
+`docs/the-crypto-playbook.md`, preserving its source text and all table rows as Markdown;
+the source `.docx` is not tracked. `PLAYBOOK.md` is loaded once at startup through the
+existing charter path pattern, with `PLAYBOOK_FILE` as an override. Prompts place the
+operator's charter first and the playbook second, explicitly stating that the charter wins
+conflicts; an unavailable playbook warns once and leaves the existing prompt unchanged.
+The charter and playbook currently contain 2,788 and 2,884 characters respectively;
+their headers and separators bring the combined prompt prefix to 5,877 characters on each
+applicable system prompt.
+
+Candidate decisions now receive the Stage 1 universe median 24-hour ticker move and each
+pair's delta from it, plus the drawdown and age of the highest high in a fetched one-year
+daily window. The latter is labelled as a high over the fetched window, not an all-time
+high. These are model context, not hard filters or automatic rules. Position reviews
+receive the window-high context when daily data is available; a daily-data failure remains
+isolated to that pair.
+
+**Why:** The playbook's relative-performance and recovery categories need explicit market
+comparison and long-window context that the existing hourly technical snapshot did not
+provide, without changing the operator-authored prompt text or broadening API calls to the
+whole TA set.
+
+**Verified:** Added pure tests for prompt ordering and fallback, ticker median and relative
+strength, and window-high/drawdown edge cases. Build, all test suites, and whitespace checks
+are run before shipment; a local paper/mock request-body smoke will verify charter/playbook
+presence and the new fields. No live Kraken candles, authenticated model behavior, or live
+orders are verified.

@@ -7,9 +7,10 @@ Risk is managed by the bot, not the model: stops and targets are sized from ATR,
 upward as a trade works, and they are never widened — by the AI or by anything else.
 
 Working on this with an AI agent? [SOUL.md](SOUL.md) is the trading model's mandate and
-part of its prompt; [AGENTS.md](AGENTS.md) contains rules for coding agents;
-[CLAUDE.md](CLAUDE.md) is the Claude Code entry point; and [COLLAB.md](COLLAB.md) is the
-shared change log between Devin and Claude Code.
+part of its prompt; [PLAYBOOK.md](PLAYBOOK.md) is the operator's additional trading method;
+[AGENTS.md](AGENTS.md) contains rules for coding agents; [CLAUDE.md](CLAUDE.md) is the
+Claude Code entry point; and [COLLAB.md](COLLAB.md) is the shared change log between Devin
+and Claude Code. The complete source archive is [docs/the-crypto-playbook.md](docs/the-crypto-playbook.md).
 
 ## Setup
 
@@ -38,6 +39,7 @@ All settings live in `.env` (see `.env.example`):
 - `AI_REASONING_EFFORT` — `off`, `low`, `medium` or `high` (default `low`); caps reasoning so the budget is left for the JSON
 - `AI_BASE_URL` — optional OpenAI-compatible API base URL override; blank uses the provider's configured URL
 - `SOUL_FILE` — optional path override for the trading model's charter (relative paths use the repository root); loaded once at startup and prepended to every decision prompt. Missing or unreadable files warn and leave existing prompts unchanged
+- `PLAYBOOK_FILE` — optional path override for the operator's playbook (relative paths use the repository root); loaded once at startup after the charter. Missing or unreadable files warn and leave existing prompts unchanged
 - `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` — required to run (Trade permission only)
 - `PAPER_MODE` — `false` by default for real money; set `true` for simulated trades
 - `PORTFOLIO_VALUE` — starting balance for paper mode, and the fallback when the Kraken balance is unavailable; live mode fetches portfolio value from Kraken each cycle. Paper mode tracks simulated cash from here on, so paper results compound
@@ -99,6 +101,21 @@ stances without metadata are treated as stale. Configured expiry also has a wall
 backstop of two times the cycle budget (`STANCE_MAX_AGE_CYCLES` multiplied by the scan
 interval), allowing for a slow cycle or delayed restart without leaving a mandate active
 indefinitely.
+
+### Trading playbook context
+
+`PLAYBOOK.md` is the operator's method, loaded once at startup and supplied after
+`SOUL.md` in the per-pair decision, position-review, portfolio-stance, and related model
+prompts. The charter is the standing mandate and outranks the playbook if they disagree.
+The full source archive, including its tables, is kept at
+`docs/the-crypto-playbook.md`; the archive is not prompt input. The playbook is context for
+the model, not a hard filter or automatic trading rule.
+
+Decision prompts also receive two model inputs: each candidate's 24-hour move relative to
+the median 24-hour move across the usable Stage 1 ticker universe, and its drawdown from
+the highest high in an approximately one-year fetched daily window, including the date and
+age of that window high. These are labelled as ticker relative performance and a
+window-high drawdown, never as an all-time high, and neither input is an automatic rule.
 
 ### Scan funnel
 
