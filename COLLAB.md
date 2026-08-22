@@ -37,6 +37,36 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Wake-on-message loop + terminal CLI
+
+**Changed:** An operator chat message now wakes the trading loop immediately instead of
+waiting out `SCAN_INTERVAL_MINUTES`: `main()` gained a module-level `wakeRequested` flag and
+`wakeWaiters` array (same shape as the existing `shutdownWaiters`), and the dashboard's
+`onOperatorMessage` calls `requestWake()` after posting. The inter-cycle sleep races against
+a wake waiter the same way it already races against shutdown; a wake mid-cycle (waiter queue
+empty) is caught by the flag check right before the *next* sleep, so it is never lost. Also
+added `src/cli.ts` (`npm run cli -- balance` / `npm run cli -- chat`) — a terminal client of
+the dashboard's existing `/api/state` and `/message` HTTP routes, run locally against the
+deployed URL via `DASHBOARD_URL`/`DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD`. It is a second
+door onto the same API the web dashboard uses, not a new surface: no direct exchange, config,
+or state-file access. Generated a Railway service domain
+(`kai-trading-glm-production.up.railway.app`) and set `DASHBOARD_PASSWORD`/
+`DASHBOARD_USERNAME` on the live service.
+**Why:** Operator asked for the AI to scan right after a chat reply rather than waiting for
+the clock, and for both chat and balance-checking to work from a terminal.
+**Verified:** `npm run build` and `npm test` clean. Manually smoke-tested `src/cli.ts` end to
+end against a throwaway local dashboard instance (not committed) — `balance` renders account/
+positions/stance correctly, `chat` posts a message and the server-side `onOperatorMessage`
+callback receives it, output ordering fixed so the "(sent — ...)" confirmation always prints
+before the process exits even when stdin closes right after (piped input). The wake-loop
+control flow itself has no automated test — same as the pre-existing `shutdownWaiters`
+mechanism it mirrors — because exercising it needs the real `main()` loop timing, not a fake;
+reasoned through by hand instead. Not verified: an actual message sent through the deployed
+Railway dashboard reaching a live cycle (this sandbox cannot reach `*.up.railway.app` — its
+egress proxy allowlists specific hosts only, confirmed via `403 connect_rejected`).
+**Watch out:** `src/cli.ts` needed adding to `tsconfig.json`'s `include` (previously only
+`src/index.ts`) since it's a second entry point, not something `index.ts` imports.
+
 ### 2026-08-22 — Claude — Two-way chat channel + read-only dashboard
 
 **Changed:** Added a `ChatMessage` log to `Memory` (`postOperatorMessage`/`postAiMessage`/

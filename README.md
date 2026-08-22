@@ -337,11 +337,14 @@ positions with a "yours"/"bot" origin badge, recent closed trades, the model's l
 portfolio stance, any standing funding request, and a chat thread with the model.
 
 The chat is asynchronous, not live: a message you send is read by the model on its *next*
-portfolio review, so replies land on the next scan cycle rather than instantly. The model can
-reply, ask for more capital (surfaced as the funding-request banner), or suggest a change to
-`SOUL.md` — a suggestion is only ever shown, never applied automatically. The staked/reserved
-figure is the aggregate cached from the last cycle's account fetch, not a live per-asset
-breakdown; viewing the dashboard never itself calls the exchange.
+portfolio review, not mid-thought. Sending one wakes the loop immediately, though — it
+interrupts the wait between cycles (or, if a cycle is already running, skips the wait right
+after it finishes) rather than sitting until the scan interval comes around on its own, so a
+message gets a fresh look within the time one cycle takes, not up to `SCAN_INTERVAL_MINUTES`.
+The model can reply, ask for more capital (surfaced as the funding-request banner), or
+suggest a change to `SOUL.md` — a suggestion is only ever shown, never applied automatically.
+The staked/reserved figure is the aggregate cached from the last cycle's account fetch, not a
+live per-asset breakdown; viewing the dashboard never itself calls the exchange.
 
 There is no unauthenticated mode: `DASHBOARD_PASSWORD` gates every route except `/health`
 (so Railway's health check still works) behind HTTP Basic Auth, compared with a timing-safe
@@ -349,6 +352,25 @@ check. `DASHBOARD_USERNAME` defaults to `operator`. It listens on `$PORT` (Railw
 automatically); the page itself ships zero client-side JavaScript — the message box is a
 plain HTML form. It can only read state and queue a text message for the model to see; it
 cannot place an order, change a stop, or touch config.
+
+### Terminal access
+
+`npm run cli -- balance` and `npm run cli -- chat` are a terminal front end for the same
+dashboard API — no browser needed. They run from your own machine (or anywhere with network
+access to the deployed URL), not on the server. Point them at the deployed dashboard with
+`DASHBOARD_URL`, `DASHBOARD_USERNAME`, and `DASHBOARD_PASSWORD` (a local `.env` works, same
+as the bot itself):
+
+```bash
+DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli -- balance
+DASHBOARD_URL=https://your-app.up.railway.app DASHBOARD_PASSWORD=... npm run cli -- chat
+```
+
+`balance` prints the account breakdown, open positions, P/L, and the latest stance, then
+exits. `chat` prints the recent thread and drops into a prompt — each line you send posts to
+the same chat log the dashboard shows and wakes the loop the same way. Nothing here talks to
+the exchange or state files directly; it is strictly a client of the dashboard's HTTP API, so
+`DASHBOARD_PASSWORD` must be set on the deployed bot for either command to work.
 
 ## Model choice and what it costs
 

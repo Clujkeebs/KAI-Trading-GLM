@@ -3828,6 +3828,19 @@ let shutdownRequested = false;
  */
 let newEntriesBlocked: string | null = null;
 const shutdownWaiters: Array<() => void> = [];
+/**
+ * Set when the operator sends a chat message while the loop is between cycles
+ * (or mid-cycle, where a waiter would be missed) so the next cycle starts
+ * immediately instead of waiting out the scan interval — a message deserves a
+ * fresh look now, not whenever the clock happens to come around.
+ */
+let wakeRequested = false;
+const wakeWaiters: Array<() => void> = [];
+function requestWake(reason: string) {
+  wakeRequested = true;
+  console.log(`  [WAKE] ${reason}`);
+  while (wakeWaiters.length) wakeWaiters.shift()?.();
+}
 
 async function main() {
   setConfig(loadConfig());
@@ -3916,7 +3929,10 @@ async function main() {
           usage: { ...ai.usage },
         };
       },
-      onOperatorMessage: (text: string) => { memory.postOperatorMessage(text); },
+      onOperatorMessage: (text: string) => {
+        memory.postOperatorMessage(text);
+        requestWake('operator message received; scanning now instead of waiting for the next cycle');
+      },
     });
   } else {
     console.log('  [DASHBOARD] DASHBOARD_PASSWORD not set; dashboard disabled.');
@@ -3977,12 +3993,19 @@ async function main() {
     memory.saveState();
 
     if (!loopMode || shutdownRequested) break;
-    const interval = fastMode ? 300_000 : CONFIG.scanIntervalMs;
-    console.log(`\nNext cycle in ${interval / 60000}min... (Ctrl+C to stop)`);
-    await Promise.race([
-      sleep(interval),
-      new Promise<void>(resolve => shutdownWaiters.push(resolve)),
-    ]);
+    if (wakeRequested) {
+      wakeRequested = false;
+      console.log('\n[WAKE] Skipping the wait; scanning again now.');
+    } else {
+      const interval = fastMode ? 300_000 : CONFIG.scanIntervalMs;
+      console.log(`\nNext cycle in ${interval / 60000}min... (Ctrl+C to stop)`);
+      await Promise.race([
+        sleep(interval),
+        new Promise<void>(resolve => shutdownWaiters.push(resolve)),
+        new Promise<void>(resolve => wakeWaiters.push(resolve)),
+      ]);
+      wakeRequested = false;
+    }
   }
   memory.savePositions();
   memory.saveState();
