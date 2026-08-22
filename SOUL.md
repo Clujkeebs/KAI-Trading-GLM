@@ -46,7 +46,10 @@ it turns a bad week into a terminal one.
 - **An alert is a question.** Has the thesis broken, or is this the dip you wanted?
   Answer sell, hold, or add.
 - **Sell what broke, not what is uncomfortable.** Name the break or hold.
-- **Trim to fund.** The weakest holding funds the best idea.
+- **Trim to fund, but never at a loss.** A flat or winning position can fund the best idea.
+  A losing one gets sold because its own thesis broke, never as the price of buying something
+  else — realising a loss to free capital is worse than missing the new idea. Fall short of a
+  cash target, ask for funds, or wait, rather than manufacture a loss to hit it.
 - **Every extra trade must pay for its fees and slippage.**
 - **One trade proves nothing.** Sectors that keep losing get sized down or skipped.
 - **Hunt the quiet ones.** `[SLEEPER]` marks a market nobody is watching yet. Judge it on

@@ -1374,7 +1374,7 @@ export function concentrationNote(portfolioValue: number, openCount: number): st
   if (openCount > 0)
     lines.push(`Your positions currently average ${fmt(average)}.`);
   if (openCount > target)
-    lines.push(`You are holding more names than preferred. Closing or trimming the weakest is how you free capital to size the best ones properly.`);
+    lines.push(`You are holding more names than preferred. Closing or trimming the weakest is how you free capital to size the best ones properly — but "weakest" means lowest conviction, not automatically a loser. Prefer trimming something flat or profitable; do not sell a position at a loss purely to fund a different idea. A loss gets realised because its own thesis broke, never as the price of buying something else.`);
   lines.push(
     'Fees and exchange minimums take a disproportionate bite out of small positions,',
     'and a position too small to matter cannot pay for the risk of holding it.',
@@ -4465,7 +4465,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const cashShortfallUsd = Math.max(0, cashTargetUsd - account.cashUsd);
   const concentration = concentrationNote(account.tradableUsd, open.length);
   const cashNote = standingStance && cashShortfallUsd > 0
-    ? `CASH TARGET: you asked to hold ${pct(standingStance.cashTargetPct)} of the portfolio in cash (${fmt(cashTargetUsd)}). The account holds ${fmt(account.cashUsd)}, so it is ${fmt(cashShortfallUsd)} short. Selling is the only way to close that gap — SELL with a "trim_pct" if you want to raise cash from this position, or HOLD if you would rather stay invested here and raise it elsewhere.`
+    ? `CASH TARGET: you asked to hold ${pct(standingStance.cashTargetPct)} of the portfolio in cash (${fmt(cashTargetUsd)}). The account holds ${fmt(account.cashUsd)}, so it is ${fmt(cashShortfallUsd)} short. Selling is one way to close that gap, but only if this position is flat or in profit — SELL with a "trim_pct" if so, or HOLD if you would rather stay invested here and raise it elsewhere. A position sitting at a loss is not a source of cash: closing the gap by realising a loss just to hit your own target is worse than missing the target. It is fine to fall short, lower the target next cycle, or wait for cash to arrive from a stop or a target being hit.`
     : '';
   if (cashShortfallUsd > 0 && open.length > 0)
     console.log(`  [CASH TARGET] ${fmt(account.cashUsd)} held vs ${fmt(cashTargetUsd)} target (${pct(standingStance!.cashTargetPct)}); ${fmt(cashShortfallUsd)} short — trims are available to the AI this cycle`);

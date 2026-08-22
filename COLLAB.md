@@ -37,6 +37,35 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Stop trimming positions at a loss to fund a new idea
+
+**Changed:** Three prompt-guidance edits, no new code gate:
+- `concentrationNote()`'s "holding more names than preferred" line now says "weakest means
+  lowest conviction, not automatically a loser," and explicitly: don't sell at a loss to fund a
+  different idea, a loss gets realised only because its own thesis broke.
+- The `CASH TARGET` note in Phase 1 reviews (told when the account is short of the stance's
+  self-set cash target) previously said "selling is the only way to close that gap" with no
+  caveat. Now: selling only helps if the position is flat or in profit; a position at a loss is
+  not a source of cash, and falling short of the target (or asking for funds, or waiting) beats
+  manufacturing a loss to hit it.
+- `SOUL.md`'s "Trim to fund" bullet gained the same caveat directly in the charter.
+**Why:** Direct operator complaint: "I am buying good things... managing and finding net
+invest[ments] means it is just selling my investment for a loss when I buy good things. I need
+it to find things to buy." Traced to the cash-target and concentration-trim prompts, which
+pushed toward selling *any* position — including operator-bought ones — to fund reallocation,
+with no distinction between a flat/winning trim and realising a loss. The existing
+`reconsiderSell()` second opinion (tuned in an earlier entry today) still applies on top of
+this for operator-bought positions specifically; this fix addresses the root prompt that was
+proposing the loss-realizing sell/trim in the first place, for bot-owned positions too.
+**Verified:** `npm run build` and `npm test` clean; no test asserts the changed prompt strings
+verbatim (same as the earlier `reconsiderSell()` wording change), since this is AI judgment
+guidance, not new deterministic code — the existing `trim`/`cycle` test suites (which use a
+fake AI that ignores prompt content) still pass unchanged.
+**Watch out:** This is guidance, not a gate — deliberately, per the operator's own earlier
+explicit instruction against hard rules on trading judgment. It has not been observed against
+a real cash-target-shortfall cycle with a losing position in play; watch real logs for a
+`[CASH TARGET]`/trim on a position that's underwater to confirm the model actually follows it.
+
 ### 2026-08-22 — Claude — Trade-ledger export + portfolio correlation note
 
 **Changed:** Continuing the "what's missing" pass:
