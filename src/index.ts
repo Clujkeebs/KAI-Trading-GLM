@@ -3892,6 +3892,8 @@ async function main() {
       port: dashboardPort,
       username: dashboardUsername,
       password: dashboardPassword,
+      maxLoginAttempts: envInteger('DASHBOARD_MAX_LOGIN_ATTEMPTS', 8, 1),
+      lockoutMinutes: envInteger('DASHBOARD_LOCKOUT_MINUTES', 15, 1),
       getSnapshot: (): DashboardSnapshot => {
         const snap = memory.state.lastAccountSnapshot;
         const stance = memory.state.lastStance;

@@ -118,6 +118,56 @@ async function main() {
     server.close();
   }
 
+  // ── Repeated wrong logins lock the address out, even from the right password ──
+  {
+    const throttled = startDashboard({
+      port: 0, username: 'operator', password: 'correct-horse',
+      maxLoginAttempts: 3, lockoutMinutes: 1,
+      getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+    });
+    await new Promise<void>(resolve => throttled.once('listening', resolve));
+    const tPort = (throttled.address() as any).port;
+    try {
+      for (let i = 0; i < 3; i++) {
+        const res = await request(tPort, '/', { auth: 'operator:nope' });
+        assert.equal(res.status, 401, `attempt ${i + 1} should be a plain auth failure, not yet locked`);
+      }
+      const locked = await request(tPort, '/', { auth: 'operator:correct-horse' });
+      assert.equal(locked.status, 429, 'the correct password no longer works once the address is locked out');
+      assert.ok(locked.headers['retry-after'], 'a locked response names when to retry');
+
+      // /health stays reachable throughout — it never touches auth or the throttle.
+      const health = await request(tPort, '/health');
+      assert.equal(health.status, 200);
+    } finally {
+      throttled.close();
+    }
+  }
+
+  // ── A successful login clears any prior failures for that address ─────────
+  {
+    const resettable = startDashboard({
+      port: 0, username: 'operator', password: 'correct-horse',
+      maxLoginAttempts: 3, lockoutMinutes: 1,
+      getSnapshot: emptySnapshot, onOperatorMessage: () => {},
+    });
+    await new Promise<void>(resolve => resettable.once('listening', resolve));
+    const rPort = (resettable.address() as any).port;
+    try {
+      await request(rPort, '/', { auth: 'operator:nope' });
+      await request(rPort, '/', { auth: 'operator:nope' });
+      const ok = await request(rPort, '/', { auth: 'operator:correct-horse' });
+      assert.equal(ok.status, 200, 'a correct login before the threshold is not blocked');
+      // The two prior failures should be forgotten now, not carried toward the next lockout.
+      await request(rPort, '/', { auth: 'operator:nope' });
+      await request(rPort, '/', { auth: 'operator:nope' });
+      const stillOk = await request(rPort, '/', { auth: 'operator:correct-horse' });
+      assert.equal(stillOk.status, 200, 'a success resets the failure count');
+    } finally {
+      resettable.close();
+    }
+  }
+
   console.log('dashboard checks passed');
 }
 

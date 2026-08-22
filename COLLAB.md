@@ -37,6 +37,27 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-22 — Claude — Dashboard login lockout
+
+**Changed:** `src/dashboard.ts` now locks an address out after `DASHBOARD_MAX_LOGIN_ATTEMPTS`
+(default 8) failed logins within `DASHBOARD_LOCKOUT_MINUTES` (default 15): further requests
+get `429` with a `Retry-After` header, even with the correct password, until the lockout
+expires. Tracking is an in-memory `Map` keyed on `X-Forwarded-For` (falling back to the
+socket address), reset on any successful login, capped at 500 tracked addresses with FIFO
+eviction so a flood of distinct source IPs can't grow it unbounded. `/health` stays exempt,
+same as it's exempt from auth.
+**Why:** Operator asked for a max sign-in attempt limit on the live-money dashboard.
+**Verified:** `npm run build` and `npm test` clean, including new lockout tests in
+`test/dashboard-check.ts` (3 failures lock an address out, a locked address gets 429 even
+with the right password, `/health` stays reachable throughout, a success before the threshold
+resets the failure count).
+**Watch out:** Also checked live production logs on this deploy: sleeper detection is
+confirmed firing for real (`[SCAN] Sleepers forced into TA: SKY/USD +0.1%, ETH/USD +0.1%,
+AUT/USD -0.1%`), win rate is 71% over 14 closes with +$7.15 realised P/L, and a RISK_OFF
+stance correctly parked ~60% of tradable cash and skipped new entries in an overbought
+market — the charter working as intended, not a bug. Nothing else looked wrong; no code
+change followed from the log review.
+
 ### 2026-08-22 — Claude — Wake-on-message loop + terminal CLI
 
 **Changed:** An operator chat message now wakes the trading loop immediately instead of

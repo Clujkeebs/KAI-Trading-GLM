@@ -90,9 +90,15 @@ export interface DashboardOptions {
   password: string;
   getSnapshot: () => DashboardSnapshot;
   onOperatorMessage: (text: string) => void;
+  /** Failed logins from one address before it is locked out (default 8). */
+  maxLoginAttempts?: number;
+  /** How long a lockout lasts, in minutes (default 15). */
+  lockoutMinutes?: number;
 }
 
 const MAX_BODY_BYTES = 10_000;
+/** Bound on tracked addresses, so a flood of forged source IPs can't grow this forever. */
+const MAX_TRACKED_ADDRESSES = 500;
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
@@ -148,6 +154,48 @@ function requireAuth(res: http.ServerResponse) {
     'Content-Type': 'text/plain',
   });
   res.end('Authentication required.');
+}
+
+/** Railway terminates TLS in front of this process, so the real client sits behind
+ * X-Forwarded-For; fall back to the socket address for a direct connection (e.g. tests). */
+function clientAddress(req: http.IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  const ip = first?.split(',')[0]?.trim();
+  return ip || req.socket.remoteAddress || 'unknown';
+}
+
+/**
+ * Locks an address out after too many failed logins, so a live-money dashboard
+ * isn't just as strong as its password against a script trying every guess.
+ * In-memory and per-process by design: a redeploy is a fresh slate, which is
+ * an acceptable trade for not needing a datastore over this.
+ */
+class LoginThrottle {
+  private readonly attempts = new Map<string, { failures: number; lockedUntil: number }>();
+  constructor(private readonly maxAttempts: number, private readonly lockoutMs: number) {}
+
+  /** Seconds remaining before this address may try again, or 0 if it is not locked out. */
+  lockedForSeconds(address: string): number {
+    const entry = this.attempts.get(address);
+    if (!entry || entry.lockedUntil <= Date.now()) return 0;
+    return Math.ceil((entry.lockedUntil - Date.now()) / 1000);
+  }
+
+  recordFailure(address: string) {
+    const entry = this.attempts.get(address) ?? { failures: 0, lockedUntil: 0 };
+    entry.failures++;
+    if (entry.failures >= this.maxAttempts) entry.lockedUntil = Date.now() + this.lockoutMs;
+    this.attempts.set(address, entry);
+    if (this.attempts.size > MAX_TRACKED_ADDRESSES) {
+      const oldest = this.attempts.keys().next().value;
+      if (oldest !== undefined) this.attempts.delete(oldest);
+    }
+  }
+
+  recordSuccess(address: string) {
+    this.attempts.delete(address);
+  }
 }
 
 function renderPositions(positions: DashboardPosition[]): string {
@@ -308,6 +356,10 @@ function readBody(req: http.IncomingMessage): Promise<string> {
  */
 export function startDashboard(options: DashboardOptions): http.Server {
   if (!options.password) throw new Error('startDashboard requires a non-empty password');
+  const throttle = new LoginThrottle(
+    Math.max(1, options.maxLoginAttempts ?? 8),
+    Math.max(1, options.lockoutMinutes ?? 15) * 60_000,
+  );
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -319,10 +371,20 @@ export function startDashboard(options: DashboardOptions): http.Server {
         return;
       }
 
+      const address = clientAddress(req);
+      const lockedFor = throttle.lockedForSeconds(address);
+      if (lockedFor > 0) {
+        res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': String(lockedFor) });
+        res.end(`Too many failed logins. Try again in ${Math.ceil(lockedFor / 60)} minute(s).`);
+        return;
+      }
+
       if (!checkAuth(req, options.username, options.password)) {
+        throttle.recordFailure(address);
         requireAuth(res);
         return;
       }
+      throttle.recordSuccess(address);
 
       if (url.pathname === '/' && req.method === 'GET') {
         const html = renderPage(options.getSnapshot());

@@ -353,6 +353,13 @@ automatically); the page itself ships zero client-side JavaScript — the messag
 plain HTML form. It can only read state and queue a text message for the model to see; it
 cannot place an order, change a stop, or touch config.
 
+Repeated wrong logins from one address lock it out — `DASHBOARD_MAX_LOGIN_ATTEMPTS` (default
+8) failures within the lockout window return `429` with a `Retry-After` header for
+`DASHBOARD_LOCKOUT_MINUTES` (default 15), even to the correct password, so a live-money
+dashboard isn't only as strong as the password against something guessing it in a loop. A
+correct login resets the count. Tracking is in-memory per process (a redeploy clears it) and
+keyed on `X-Forwarded-For` behind Railway's proxy.
+
 ### Terminal access
 
 `npm run cli -- balance` and `npm run cli -- chat` are a terminal front end for the same
