@@ -37,6 +37,31 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — Size the position count to the capital that can fund it
+
+**Changed:** New `fundablePositionCount(portfolioValue, preferredCount)` narrows the preferred
+concentration to what the tradable balance can actually fund at a viable size (a new
+`VIABLE_POSITION_USD = 20`, floored at 1, never above the operator's preference).
+`concentrationNote()` uses it, and when it narrows says so explicitly — naming the standing
+preference and why it cannot be met — so the model does not read it as the operator changing
+their mind.
+**Why:** With the AI restored (previous entry) it immediately produced a real, correct refusal:
+`[STANCE] RISK_OFF (7/10) — Recent edge unproven—7 of last 10 lost. $6.37 positions get eaten
+by fees.` $63.66 tradable across the configured `TARGET_POSITION_COUNT=10` is $6.37 a position.
+The model was right, and was applying `SOUL.md`'s own rung table ("Under ~$500 → nine $5
+positions is a fee grinder"). But the preference was stated as a flat number regardless of
+balance, so correct reasoning presented to the operator as the bot refusing to trade. The count
+now bends to the capital: ~3 meaningful positions at $21 rather than 10 unviable ones at $6.
+**Verified:** `npm run build` and `npm test` clean (22 suites). New coverage in
+`logic-check.ts` for `fundablePositionCount` (ample capital keeps the full preference; $63.66
+yields 3; never below 1; never above the preference; a zero/negative/NaN balance falls back
+rather than collapsing to 1) and for `concentrationNote` both narrowing with an explanation and
+leaving the note untouched when the preference fits.
+**Watch out:** `VIABLE_POSITION_USD` is a judgement call, not a measured figure — $20 is roughly
+where Kraken minimums plus round-trip fees stop dominating, but it is worth revisiting against
+real fill data. This only reshapes *guidance*; nothing here forces a trade, so the model can
+still legitimately answer RISK_OFF.
+
 ### 2026-08-23 — Claude — ROOT CAUSE of "not trading": the AI was out of credit
 
 **The bug:** The operator reported for several turns that the bot "isn't trading" and is "just

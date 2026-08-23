@@ -483,6 +483,13 @@ const MAX_AI_TOKEN_BUDGET = 16_000;
  * unparseable fragments that look like the model having no opinion.
  */
 const MIN_AI_TOKEN_BUDGET = 900;
+/**
+ * Roughly the smallest position worth opening once round-trip fees and exchange
+ * minimums are paid. Not a hard floor anywhere — it only sizes the *preferred
+ * position count* to the capital actually available, so a small account is told
+ * to hold a few meaningful positions instead of many unviable ones.
+ */
+const VIABLE_POSITION_USD = 20;
 const ORDER_POLL_ATTEMPTS = 5;
 const ORDER_POLL_DELAY_MS = 1_000;
 const TIMEFRAME_MS: Record<string, number> = {
@@ -1368,9 +1375,31 @@ export function alertTriggered(position: Position, price: number): boolean {
  * matter. This is deliberately advisory: it tells the model what is preferred and
  * what a full-size position looks like, and lets it disagree with a reason.
  */
+/**
+ * The position count a given amount of tradable capital can actually support.
+ *
+ * The preferred count is a preference about diversification, not a promise the
+ * account can fund it. Spread $63 across ten names and each is $6 — small enough
+ * that fees and exchange minimums eat the trade, which is exactly the "nine $5
+ * positions is a fee grinder" rung the charter warns about. Production hit this
+ * for real: the model kept answering RISK_OFF with "$6.37 positions get eaten by
+ * fees" — correct reasoning that read as the bot refusing to trade.
+ *
+ * So the count bends to the capital: hold fewer, meaningful positions rather than
+ * many unviable ones. Never below one, and never above what the operator asked for.
+ */
+export function fundablePositionCount(
+  portfolioValue: number, preferredCount: number, viablePositionUsd = VIABLE_POSITION_USD,
+): number {
+  if (!Number.isFinite(portfolioValue) || portfolioValue <= 0) return preferredCount;
+  const affordable = Math.floor(portfolioValue / viablePositionUsd);
+  return Math.max(1, Math.min(preferredCount, affordable));
+}
+
 export function concentrationNote(portfolioValue: number, openCount: number): string {
-  const target = CONFIG.targetPositionCount;
-  if (target === null) return '';
+  const preferred = CONFIG.targetPositionCount;
+  if (preferred === null) return '';
+  const target = fundablePositionCount(portfolioValue, preferred);
   const fullSize = portfolioValue / target;
   const average = openCount > 0 ? portfolioValue / openCount : 0;
   const reserved = CONFIG.excludedAssets.size > 0
@@ -1380,6 +1409,9 @@ export function concentrationNote(portfolioValue: number, openCount: number): st
     ...reserved,
     'CONCENTRATION PREFERENCE:',
     `The operator prefers a concentrated book — around ${target} positions rather than many small ones.`,
+    ...(target < preferred
+      ? [`(The operator's standing preference is ${preferred}, but ${fmt(portfolioValue)} of tradable capital cannot fund that many positions at a size worth trading. Hold about ${target} meaningful position${target === 1 ? '' : 's'} instead of ${preferred} that fees would eat. This is the small-account rung: concentrate, do not spread.)`]
+      : []),
     `You currently hold ${openCount}.`,
     `At that concentration a full-size position is about ${fmt(fullSize)}.`,
     'A position worth only a few dollars is not worth holding: fees and the exchange minimums',

@@ -18,7 +18,7 @@ import {
   formatPairHistory, isMinimumAffordable, Memory, selectSleepers,
   tickerFromRawTicker, maxDrawdown, notifyWebhook,
   dailyReturns, correlateReturns, portfolioCorrelationNote,
-  isCreditExhausted, affordableTokensFromError,
+  isCreditExhausted, affordableTokensFromError, fundablePositionCount,
 } from '../src/index';
 import type { OhlcvCandle } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
@@ -580,6 +580,37 @@ assert.match(focused, /You currently hold 3/);
 const empty = concentrationNote(800, 0);
 assert.match(empty, /full-size position is about \$200\.00/);
 assert.ok(!/average/.test(empty), 'no positions means no average to quote');
+
+// ── The preferred count bends to the capital that can actually fund it ──────
+// Production reasoning, verbatim: "RISK_OFF — $6.37 positions get eaten by fees."
+// $63.66 across the preferred 10 names is $6.37 each, so the model was correctly
+// refusing to trade — which read as the bot doing nothing.
+assert.equal(fundablePositionCount(1000, 10), 10, 'ample capital funds the full preference');
+assert.equal(fundablePositionCount(63.66, 10), 3, '$63.66 supports 3 viable positions, not 10');
+assert.equal(fundablePositionCount(63.66, 10, 20), 3);
+assert.equal(fundablePositionCount(200, 10), 10, '$200 across 10 is $20 each — still viable');
+assert.equal(fundablePositionCount(15, 10), 1, 'never below one position');
+assert.equal(fundablePositionCount(0, 10), 10, 'an unknown balance falls back to the preference');
+assert.equal(fundablePositionCount(-5, 10), 10);
+assert.equal(fundablePositionCount(Number.NaN, 10), 10);
+assert.equal(fundablePositionCount(10_000, 4), 4, 'it never exceeds what the operator asked for');
+
+{
+  // The prompt must both narrow the target AND explain why, so the model is not
+  // left thinking the operator changed their mind.
+  setConfig({ ...loadConfig(), targetPositionCount: 10 });
+  const thin = concentrationNote(63.66, 0);
+  assert.match(thin, /around 3 positions/, 'the target narrows to what the capital funds');
+  assert.match(thin, /standing preference is 10/, 'the operator preference is still stated');
+  assert.match(thin, /full-size position is about \$21\.22/, '$63.66 split 3 ways, not 10');
+  assert.match(thin, /concentrate, do not spread/);
+
+  // With enough capital the note is unchanged — no narrowing, no explanation.
+  const ample = concentrationNote(1000, 0);
+  assert.match(ample, /around 10 positions/);
+  assert.ok(!/standing preference is/.test(ample), 'nothing to explain when the preference fits');
+  assert.match(ample, /full-size position is about \$100\.00/);
+}
 
 setConfig(loadConfig());
 console.log('concentration checks passed');
