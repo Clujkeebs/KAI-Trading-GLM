@@ -37,6 +37,30 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — Free-model fallback takes a LIST, not one id
+
+**Changed:** `AI_FREE_MODEL` is now comma-separated and tried in order. New exported
+`isModelUnavailable()` (broader than `isUnknownModel`: also matches "unavailable" / "no longer"
+/ "deprecated" / "use this slug", which name no unknown model) advances to the next candidate
+when a free slug has been withdrawn, and is excluded from `withRetry` so a dead slug is not
+retried three times first.
+**Why:** The single-id version from the previous entry deployed and worked *mechanically* — it
+switched on credit exhaustion exactly as designed — but the id itself was dead:
+`[FAIL] AI decisions: 0/2 clean | model z-ai/glm-4.5-air:free | last error: 404 This model is
+unavailable for free. The paid version is available now - use this slug instead: z-ai/glm-4.5-air`.
+That is the risk flagged in the previous entry, realised within minutes. Guessing a better
+single id would just repeat it, and this sandbox has no egress to openrouter.ai to look up the
+live list (`curl` → `403 CONNECT tunnel failed`), so the design changed instead of the guess.
+**Verified:** `npm run build` and `npm test` clean (22 suites). New `ai-check.ts` coverage
+reproducing the production sequence: 402 → first free slug → 404 "unavailable for free" →
+second slug → real BUY, asserting each model id in order; plus an all-candidates-withdrawn case
+asserting an honest HOLD without spinning.
+**Watch out:** **The four slugs now in `.env.example` and on Railway are still unverified from
+here** — same egress limitation. The list makes a wrong guess survivable rather than fatal, but
+if *all four* are dead the bot falls back to HOLD and preflight correctly blocks new entries.
+Confirm against https://openrouter.ai/models?max_price=0. Free tiers are heavily rate limited,
+so expect 429s. This is a stopgap for a spent balance, not a substitute for topping up.
+
 ### 2026-08-23 — Claude — Fall back to a free model when the paid balance is spent
 
 **Changed:** New `AI_FREE_MODEL` config and `AiBrain.switchToFreeModel()`. When a credit

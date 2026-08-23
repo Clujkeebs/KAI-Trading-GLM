@@ -206,6 +206,34 @@ async function main() {
     assert.equal(brain.activeModel(), 'z-ai/glm-4.5-air:free');
     assert.equal(client.sent[1].max_tokens, 1000, 'the budget resets: it was fitted to a paid balance');
   }
+  // A withdrawn free slug moves to the next candidate rather than giving up on
+  // the free tier. Production hit exactly this: "z-ai/glm-4.5-air:free" answered
+  // 404 "This model is unavailable for free" the moment it was needed.
+  process.env.AI_FREE_MODEL = 'gone/model:free, second/model:free ,third/model:free';
+  setConfig(loadConfig());
+  {
+    const { brain, client } = brainWith([
+      { throws: { status: 402, message: 'requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+      { throws: { status: 404, message: 'This model is unavailable for free. The paid version is available now' } },
+      { content: VALID },
+    ]);
+    const d = await (brain as any).call('probe', 'CHURN/USD');
+    assert.equal(d.verdict, 'BUY', 'the second free candidate lands the decision');
+    assert.equal(client.sent[1].model, 'gone/model:free', 'the first candidate is tried');
+    assert.equal(client.sent[2].model, 'second/model:free', 'a withdrawn slug advances to the next');
+    assert.equal(brain.activeModel(), 'second/model:free');
+  }
+  // Every candidate withdrawn → an honest fallback, not an infinite retry loop.
+  {
+    const { brain, client } = brainWith([
+      { throws: { status: 402, message: 'requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+      { throws: { status: 404, message: 'This model is unavailable for free' } },
+    ]);
+    const d = await (brain as any).call('probe', 'ALLGONE/USD');
+    assert.equal(d.verdict, 'HOLD');
+    assert.ok(client.sent.length < 12, `exhausting the free list should not spin: ${client.sent.length} calls`);
+  }
+
   // Without one configured it still fails honestly rather than pretending.
   delete process.env.AI_FREE_MODEL;
   setConfig(loadConfig());

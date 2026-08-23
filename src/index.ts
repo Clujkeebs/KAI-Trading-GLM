@@ -328,6 +328,7 @@ type TradingConfig = {
   aiBaseUrl: string | null;
   /** Model to fall back to if the configured one is unavailable. */
   aiModelFallback: string | null;
+  /** Comma-separated no-cost model ids, tried in order when the paid balance is spent. */
   aiFreeModel: string | null;
   loopMode: boolean;
   atrStopMult: number;
@@ -3226,6 +3227,23 @@ function isUnknownModel(error: unknown): boolean {
     /(not found|not exist|unknown|invalid|unsupported|no endpoints|not a valid)/.test(message);
 }
 
+/**
+ * True when a model was rejected in a way another model id could satisfy.
+ *
+ * Broader than `isUnknownModel` on purpose: a withdrawn free tier answers
+ * "This model is unavailable for free. The paid version is available now" —
+ * which names no unknown model, so the stricter check misses it. Production hit
+ * exactly that the first time the free-tier fallback was needed.
+ */
+export function isModelUnavailable(error: unknown): boolean {
+  if (isUnknownModel(error)) return true;
+  const value = error as any;
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  if (status !== 400 && status !== 404) return false;
+  return /model/.test(message) && /unavailable|no longer|deprecated|retired|use this slug/.test(message);
+}
+
 function isUnsupportedReasoningParam(error: unknown): boolean {
   const value = error as any;
   const message = String(value?.message || error || '').toLowerCase();
@@ -3418,8 +3436,13 @@ class AiBrain {
   };
   /** Set once per process so a dead-AI alert is not repeated every single call. */
   private creditAlertSent = false;
-  /** Set once the run has switched to the no-cost model, so it is not attempted repeatedly. */
-  private switchedToFreeModel = false;
+  /**
+   * No-cost models still untried this run. Free-tier slugs are withdrawn without
+   * notice — `z-ai/glm-4.5-air:free` 404'd in production with "This model is
+   * unavailable for free" the moment it was needed — so this is a list, tried in
+   * order, rather than a single id that has to be right.
+   */
+  private freeModelCandidates: string[] = [];
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -3449,6 +3472,8 @@ class AiBrain {
     });
     this.model = model;
     this.tokenBudget = CONFIG.aiMaxTokens;
+    this.freeModelCandidates = (CONFIG.aiFreeModel ?? '')
+      .split(',').map(id => id.trim()).filter(Boolean);
     this.memory = memory;
     console.log(`[AI] ${provider} (${model})${CONFIG.aiModelFallback ? ` | fallback ${CONFIG.aiModelFallback}` : ''}${CONFIG.aiFreeModel ? ` | free-tier fallback ${CONFIG.aiFreeModel}` : ''} | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
   }
@@ -3618,12 +3643,14 @@ HOLD, SELL, or ADJUST?`, pair);
    * balance that no longer applies.
    */
   private switchToFreeModel(): boolean {
-    const free = CONFIG.aiFreeModel;
-    if (!free || this.switchedToFreeModel || free === this.model) return false;
-    this.switchedToFreeModel = true;
-    console.error(`  [AI] Paid balance is spent; switching to the no-cost model "${free}" for the rest of this run.`);
+    const free = this.freeModelCandidates.shift();
+    if (!free) return false;
+    if (free === this.model) return this.switchToFreeModel();
+    const remaining = this.freeModelCandidates.length;
+    console.error(`  [AI] Paid balance is spent; switching to the no-cost model "${free}" for the rest of this run${remaining > 0 ? ` (${remaining} more to try if it is unavailable)` : ''}.`);
     console.error('  [AI] Decision quality will be lower than the paid model. Top up to restore it.');
     this.model = free;
+    // The shrunken budget was fitted to a paid balance that no longer applies.
     this.tokenBudget = CONFIG.aiMaxTokens;
     void notifyWebhook('ai_free_model_fallback',
       `KAI ran out of paid AI credit and has switched to the free model "${free}" so it keeps trading. Decisions will be lower quality until the balance is topped up.`);
@@ -3716,7 +3743,7 @@ HOLD, SELL, or ADJUST?`, pair);
         const response: any = await withRetry(`AI request ${pair}`, () => create(structured, reasoning), RETRY_ATTEMPTS,
           // Retrying a 402 unchanged just burns attempts: the balance will not
           // refill mid-loop. It is handled below by shrinking the budget instead.
-          error => isRetryableError(error) && !isUnknownModel(error) && !isCreditExhausted(error) &&
+          error => isRetryableError(error) && !isModelUnavailable(error) && !isCreditExhausted(error) &&
             !(structured && isUnsupportedResponseFormat(error)) &&
             !(reasoning && isUnsupportedReasoningParam(error)));
         this.recordUsage(response?.usage);
@@ -3732,6 +3759,9 @@ HOLD, SELL, or ADJUST?`, pair);
         // worse than the paid one, but a worse decision beats no decision at all:
         // the alternative is answering HOLD to everything until someone notices.
         if (isCreditExhausted(e) && this.switchToFreeModel()) continue;
+        // A free slug that has been withdrawn ("unavailable for free") is not a
+        // reason to give up on the free tier — try the next candidate instead.
+        if (isModelUnavailable(e) && this.freeModelCandidates.length > 0 && this.switchToFreeModel()) continue;
         // A model the provider does not recognise is fatal to every later call,
         // so switch to the fallback once rather than failing the whole run.
         if (isUnknownModel(e) && !this.modelFellBack && CONFIG.aiModelFallback &&
