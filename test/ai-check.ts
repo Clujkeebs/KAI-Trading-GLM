@@ -188,6 +188,36 @@ async function main() {
     assert.match(brain.health.lastError, /credits/i);
   }
 
+  // ── A spent balance falls back to the free tier rather than trading nothing ─
+  // Production reached exactly this: shrinking bottomed out (1052 requested vs
+  // 794 affordable) and every decision was a fallback HOLD. A weaker model that
+  // actually decides beats a better one that never runs.
+  process.env.AI_FREE_MODEL = 'z-ai/glm-4.5-air:free';
+  setConfig(loadConfig());
+  {
+    const { brain, client } = brainWith([
+      // Unaffordable even after shrinking: the figure is below the usable floor.
+      { throws: { status: 402, message: 'This request requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+      { content: VALID },
+    ]);
+    const d = await (brain as any).call('probe', 'FREE/USD');
+    assert.equal(d.verdict, 'BUY', 'the decision lands on the free model');
+    assert.equal(client.sent[1].model, 'z-ai/glm-4.5-air:free', 'the no-cost model is used');
+    assert.equal(brain.activeModel(), 'z-ai/glm-4.5-air:free');
+    assert.equal(client.sent[1].max_tokens, 1000, 'the budget resets: it was fitted to a paid balance');
+  }
+  // Without one configured it still fails honestly rather than pretending.
+  delete process.env.AI_FREE_MODEL;
+  setConfig(loadConfig());
+  {
+    const { brain } = brainWith([
+      { throws: { status: 402, message: 'This request requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+    ]);
+    const d = await (brain as any).call('probe', 'NOFREE/USD');
+    assert.equal(d.verdict, 'HOLD');
+    assert.equal(brain.health.creditExhausted, true);
+  }
+
   // ── The self-test reports what production is actually doing ───────────────
   {
     const { brain } = brainWith([{ content: VALID }, { content: VALID }]);

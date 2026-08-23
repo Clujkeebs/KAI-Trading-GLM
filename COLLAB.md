@@ -37,6 +37,31 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — Fall back to a free model when the paid balance is spent
+
+**Changed:** New `AI_FREE_MODEL` config and `AiBrain.switchToFreeModel()`. When a credit
+refusal cannot be solved by shrinking the token budget (the balance affords less than
+`MIN_AI_TOKEN_BUDGET`), the run switches once to the configured no-cost model, resets the token
+budget (the shrunken one was fitted to a paid balance that no longer applies), logs it loudly,
+and fires a `ai_free_model_fallback` webhook.
+**Why:** The operator has ruled out unstaking SOL/AVAX, so ~$63 is the working capital and the
+instruction is simply "make it work". Live logs showed the shrink bottoming out — `requested up
+to 1052 tokens, but can only afford 794` — every cycle for four hours, so every decision was a
+fallback HOLD. The paid balance is effectively zero and no budget fits. A free-tier model is
+slower, rate limited and a weaker trader, but a worse decision that happens beats a better one
+that never runs.
+**Verified:** `npm run build` and `npm test` clean (22 suites). New `ai-check.ts` coverage: an
+unaffordable 402 switches to the free model, lands a real BUY, uses that model id, and resets
+`max_tokens`; with no `AI_FREE_MODEL` configured it still falls back to HOLD honestly and sets
+`creditExhausted` rather than pretending.
+**Watch out:** **The `z-ai/glm-4.5-air:free` id is NOT verified from here** — this sandbox has no
+egress to openrouter.ai. It is the id this repo's own `.env.example` already documented, but
+free-tier ids change and are withdrawn. If it is wrong the existing unknown-model handling
+catches it and `AI_MODEL_FALLBACK` applies, so the failure is graceful, but the free tier will
+not actually engage. Confirm against https://openrouter.ai/models?max_price=0 and correct the
+Railway variable if needed. Free tiers are also aggressively rate limited, so expect 429s and
+slower cycles.
+
 ### 2026-08-23 — Claude — Size the position count to the capital that can fund it
 
 **Changed:** New `fundablePositionCount(portfolioValue, preferredCount)` narrows the preferred

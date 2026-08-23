@@ -328,6 +328,7 @@ type TradingConfig = {
   aiBaseUrl: string | null;
   /** Model to fall back to if the configured one is unavailable. */
   aiModelFallback: string | null;
+  aiFreeModel: string | null;
   loopMode: boolean;
   atrStopMult: number;
   atrTargetMult: number;
@@ -446,6 +447,7 @@ function loadConfig(): TradingConfig {
     aiMaxTokens: envInteger('AI_MAX_TOKENS', 4000, 1),
     aiBaseUrl: process.env.AI_BASE_URL?.trim() || null,
     aiModelFallback: process.env.AI_MODEL_FALLBACK?.trim() || null,
+    aiFreeModel: process.env.AI_FREE_MODEL?.trim() || null,
     loopMode,
     atrStopMult: envNumber('ATR_STOP_MULT', 2, 0.1, 20),
     atrTargetMult: envNumber('ATR_TARGET_MULT', 4, 0.1, 50),
@@ -3416,6 +3418,8 @@ class AiBrain {
   };
   /** Set once per process so a dead-AI alert is not repeated every single call. */
   private creditAlertSent = false;
+  /** Set once the run has switched to the no-cost model, so it is not attempted repeatedly. */
+  private switchedToFreeModel = false;
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -3446,7 +3450,7 @@ class AiBrain {
     this.model = model;
     this.tokenBudget = CONFIG.aiMaxTokens;
     this.memory = memory;
-    console.log(`[AI] ${provider} (${model})${CONFIG.aiModelFallback ? ` | fallback ${CONFIG.aiModelFallback}` : ''} | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
+    console.log(`[AI] ${provider} (${model})${CONFIG.aiModelFallback ? ` | fallback ${CONFIG.aiModelFallback}` : ''}${CONFIG.aiFreeModel ? ` | free-tier fallback ${CONFIG.aiFreeModel}` : ''} | budget ${this.tokenBudget} tokens | reasoning ${CONFIG.aiReasoningEffort}`);
   }
 
   async analyze(
@@ -3603,6 +3607,29 @@ HOLD, SELL, or ADJUST?`, pair);
     return true;
   }
 
+  /**
+   * Switches to the configured no-cost model once the paid balance is spent.
+   *
+   * Deliberately a fallback and not a default: the free tier is slower, rate
+   * limited, and generally a weaker trader. But an account that cannot pay is
+   * otherwise a bot that answers HOLD to everything, and a weaker decision that
+   * actually happens is worth more than a better one that never runs. The token
+   * budget is reset on the way in, since the shrunken one was fitted to a paid
+   * balance that no longer applies.
+   */
+  private switchToFreeModel(): boolean {
+    const free = CONFIG.aiFreeModel;
+    if (!free || this.switchedToFreeModel || free === this.model) return false;
+    this.switchedToFreeModel = true;
+    console.error(`  [AI] Paid balance is spent; switching to the no-cost model "${free}" for the rest of this run.`);
+    console.error('  [AI] Decision quality will be lower than the paid model. Top up to restore it.');
+    this.model = free;
+    this.tokenBudget = CONFIG.aiMaxTokens;
+    void notifyWebhook('ai_free_model_fallback',
+      `KAI ran out of paid AI credit and has switched to the free model "${free}" so it keeps trading. Decisions will be lower quality until the balance is topped up.`);
+    return true;
+  }
+
   /** Records that a call came back usable, clearing any standing failure streak. */
   private recordAiSuccess() {
     if (this.health.consecutiveFailures > 0)
@@ -3701,6 +3728,10 @@ HOLD, SELL, or ADJUST?`, pair);
         // budget to it keeps the bot deciding rather than answering HOLD to
         // everything on the way to zero.
         if (isCreditExhausted(e) && this.shrinkTokenBudgetToAfford(e, pair)) continue;
+        // Past that the balance is spent and no budget fits. A no-cost model is
+        // worse than the paid one, but a worse decision beats no decision at all:
+        // the alternative is answering HOLD to everything until someone notices.
+        if (isCreditExhausted(e) && this.switchToFreeModel()) continue;
         // A model the provider does not recognise is fatal to every later call,
         // so switch to the fallback once rather than failing the whole run.
         if (isUnknownModel(e) && !this.modelFellBack && CONFIG.aiModelFallback &&
