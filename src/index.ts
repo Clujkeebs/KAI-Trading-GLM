@@ -3735,8 +3735,11 @@ HOLD, SELL, or ADJUST?`, pair);
 
     // Both extras are best-effort: a provider that rejects either is retried
     // without it, and the capability is remembered so the run stops paying for
-    // the discovery.
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // the discovery. The budget also has to cover walking the free-model list,
+    // otherwise a long list is truncated mid-walk and a live slug further down
+    // is never reached.
+    const attempts = 3 + this.freeModelCandidates.length;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       const structured = this.responseFormatSupported;
       const reasoning = this.reasoningParamSupported;
       try {

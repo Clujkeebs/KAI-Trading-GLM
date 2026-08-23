@@ -223,6 +223,26 @@ async function main() {
     assert.equal(client.sent[2].model, 'second/model:free', 'a withdrawn slug advances to the next');
     assert.equal(brain.activeModel(), 'second/model:free');
   }
+  // A long list is walked to the end: the attempt budget must cover it, or a
+  // live slug further down is never reached. Production had five candidates and
+  // a fixed 3-attempt loop, which stopped at the third.
+  process.env.AI_FREE_MODEL = 'a/x:free,b/x:free,c/x:free,d/x:free,live/x:free';
+  setConfig(loadConfig());
+  {
+    const dead = { throws: { status: 404, message: 'No endpoints found for this model' } };
+    const { brain, client } = brainWith([
+      { throws: { status: 402, message: 'requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+      dead, dead, dead, dead,
+      { content: VALID },
+    ]);
+    const d = await (brain as any).call('probe', 'DEEP/USD');
+    assert.equal(d.verdict, 'BUY', 'the fifth candidate is still reached');
+    assert.equal(brain.activeModel(), 'live/x:free');
+    assert.equal(client.sent[client.sent.length - 1].model, 'live/x:free');
+  }
+  process.env.AI_FREE_MODEL = 'gone/model:free, second/model:free ,third/model:free';
+  setConfig(loadConfig());
+
   // Every candidate withdrawn → an honest fallback, not an infinite retry loop.
   {
     const { brain, client } = brainWith([

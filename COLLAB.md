@@ -37,6 +37,25 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — Attempt budget must cover walking the free-model list
+
+**Changed:** The retry loop in `AiBrain.request()` was a fixed `attempt < 3`. With five free
+candidates configured it stopped after the third, so a live slug further down the list was never
+reached. The bound is now `3 + freeModelCandidates.length`.
+**Why:** Caught in production immediately after deploying the list: the log shows it correctly
+walking `deepseek/deepseek-chat-v3-0324:free` → `meta-llama/llama-3.3-70b-instruct:free` →
+`google/gemma-2-9b-it:free` and then stopping with two candidates still untried, because the
+loop budget was spent. My own defect in the previous entry.
+**Verified:** `npm run build` and `npm test` clean (22 suites). New `ai-check.ts` case with five
+candidates where only the fifth is live, asserting it is still reached and becomes the active
+model.
+**Watch out:** All three slugs tried in production were dead (`404 No endpoints found` /
+`unavailable for free`). The remaining two are equally unverified — this sandbox cannot reach
+openrouter.ai to check. The mechanism is now correct and well tested; whether *any* free slug in
+the list is live is unknown, and I have stopped guessing rather than burn more deploys on it.
+The real fix remains topping up the paid balance. Preflight correctly marks the AI check CRITICAL
+and blocks new entries while this is unresolved, so the failure is safe, just unproductive.
+
 ### 2026-08-23 — Claude — Free-model fallback takes a LIST, not one id
 
 **Changed:** `AI_FREE_MODEL` is now comma-separated and tried in order. New exported
