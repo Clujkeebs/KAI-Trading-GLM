@@ -95,6 +95,14 @@ export interface DashboardSnapshot {
   tradingPaused: boolean;
   /** Why trading is paused, shown next to the resume control. */
   pauseReason: string;
+  /** Whether the model is actually answering — a bot whose every decision is a
+   * fallback HOLD is broken, not cautious, and must not look healthy here. */
+  aiHealth: {
+    consecutiveFailures: number;
+    lastError: string;
+    creditExhausted: boolean;
+    lastSuccessAt: string;
+  };
 }
 
 export interface DashboardOptions {
@@ -338,6 +346,12 @@ function renderPage(snapshot: DashboardSnapshot): string {
 <body>
 <h1>KAI Trading — <span class="${snapshot.mode === 'live' ? 'mode-live' : 'mode-paper'}">${snapshot.mode.toUpperCase()}</span></h1>
 <div class="sub">Generated ${escapeHtml(snapshot.generatedAt)} · cycle ${snapshot.cycleCount} · last scan ${escapeHtml(snapshot.lastScan || 'n/a')} · ${escapeHtml(snapshot.model)} (${snapshot.usage.calls} calls, ${(snapshot.usage.promptTokens + snapshot.usage.completionTokens).toLocaleString()} tokens since start)</div>
+
+${snapshot.aiHealth?.creditExhausted
+  ? `<div class="banner-danger"><strong>NOT TRADING — the AI provider is out of credit.</strong> Every decision is falling back to HOLD until the balance is topped up. Nothing here is a real trading judgment right now. <span class="muted">${escapeHtml(snapshot.aiHealth.lastError)}</span></div>`
+  : (snapshot.aiHealth?.consecutiveFailures ?? 0) >= 3
+    ? `<div class="banner-danger"><strong>NOT TRADING — ${snapshot.aiHealth.consecutiveFailures} consecutive AI failures.</strong> Decisions are falling back to HOLD. <span class="muted">${escapeHtml(snapshot.aiHealth.lastError)}</span></div>`
+    : ''}
 
 ${snapshot.tradingPaused ? `<div class="banner-danger"><strong>Trading paused:</strong> ${escapeHtml(snapshot.pauseReason)} — no new positions will open until resumed.</div>` : ''}
 

@@ -58,6 +58,15 @@ function fmtPct(n: number): string {
 
 function printBalance(state: any) {
   console.log(`\n${String(state.mode).toUpperCase()} | cycle ${state.cycleCount} | last scan ${state.lastScan || 'n/a'} | ${state.model}`);
+  const health = state.aiHealth;
+  if (health?.creditExhausted) {
+    console.log('\n*** NOT TRADING: the AI provider is out of credit. ***');
+    console.log('Every decision is falling back to HOLD until the balance is topped up.');
+    console.log(`Provider said: ${health.lastError}\n`);
+  } else if ((health?.consecutiveFailures ?? 0) >= 3) {
+    console.log(`\n*** NOT TRADING: ${health.consecutiveFailures} consecutive AI failures. ***`);
+    console.log(`Last error: ${health.lastError}\n`);
+  }
   if (state.account) {
     console.log(`Total: ${fmtUsd(state.account.totalUsd)}  Cash: ${fmtUsd(state.account.cashUsd)}  Tradable: ${fmtUsd(state.account.tradableUsd)}  Staked/reserved: ${fmtUsd(state.account.stakedUsd)}`);
     console.log(`  (as of ${state.account.asOf})`);

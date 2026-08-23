@@ -157,6 +157,37 @@ async function main() {
     assert.ok(client.sent.length <= 3, `bad credentials retried ${client.sent.length} times`);
   }
 
+  // ── A nearly-empty balance shrinks the budget instead of going dark ───────
+  // Production hit this for real: OpenRouter answered 402 to every call, every
+  // decision fell back to HOLD, the stance read "AI unavailable", and the bot
+  // looked perfectly healthy while trading nothing for hours.
+  {
+    const { brain, client } = brainWith([
+      { throws: { status: 402, message: 'This request requires more credits, or fewer max_tokens. You requested up to 1000 tokens, but can only afford 1100.' } },
+      { content: VALID },
+    ]);
+    const d = await (brain as any).call('probe', 'CREDIT/USD');
+    assert.equal(d.verdict, 'BUY', 'the decision still lands after fitting the budget to the balance');
+    assert.equal(client.sent[0].max_tokens, 1000);
+    assert.equal(client.sent[1].max_tokens, 990, 'the budget is fitted just under what the balance affords');
+    assert.equal(brain.health.creditExhausted, false, 'a recovered call is not left flagged as broken');
+    assert.equal(brain.health.consecutiveFailures, 0);
+  }
+
+  // A 402 is never retried unchanged: the balance will not refill mid-loop, so
+  // burning the retry budget on identical requests just wastes the cycle.
+  {
+    const { brain, client } = brainWith([
+      { throws: { status: 402, message: 'This request requires more credits. You requested up to 1000 tokens, but can only afford 20.' } },
+    ]);
+    const d = await (brain as any).call('probe', 'BROKE/USD');
+    assert.equal(d.verdict, 'HOLD', 'a genuinely spent balance still falls back');
+    assert.ok(client.sent.length <= 3, `an unaffordable 402 was retried ${client.sent.length} times`);
+    assert.equal(brain.health.creditExhausted, true, 'the operator-visible flag is set');
+    assert.ok(brain.health.consecutiveFailures > 0);
+    assert.match(brain.health.lastError, /credits/i);
+  }
+
   // ── The self-test reports what production is actually doing ───────────────
   {
     const { brain } = brainWith([{ content: VALID }, { content: VALID }]);

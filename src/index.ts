@@ -476,6 +476,13 @@ const CHAT_MESSAGE_MAX_CHARS = 2000;
 /** ~20 days of history at the default 15-minute scan interval; small enough to stay cheap in state.json. */
 const EQUITY_HISTORY_LIMIT = 2000;
 const MAX_AI_TOKEN_BUDGET = 16_000;
+/**
+ * Floor for the completion budget when shrinking to fit a low credit balance.
+ * Below this a reasoning model cannot reliably emit the decision JSON at all, so
+ * squeezing further would trade a clean "out of credit" failure for a stream of
+ * unparseable fragments that look like the model having no opinion.
+ */
+const MIN_AI_TOKEN_BUDGET = 900;
 const ORDER_POLL_ATTEMPTS = 5;
 const ORDER_POLL_DELAY_MS = 1_000;
 const TIMEFRAME_MS: Record<string, number> = {
@@ -3201,6 +3208,37 @@ export function isUnsupportedWebSearch(error: unknown): boolean {
   return /online|web search|websearch|search plugin|unsupported|not supported|unknown model|not found/.test(message);
 }
 
+/**
+ * True when the provider refused because the account is out of credit.
+ *
+ * This is the failure that quietly killed a live account: OpenRouter answers 402
+ * to every call, every decision falls back to HOLD, every stance reads "AI
+ * unavailable", and the bot looks perfectly healthy while being brain-dead. It
+ * must never be treated as an ordinary transient error.
+ */
+export function isCreditExhausted(error: unknown): boolean {
+  const value = error as any;
+  const message = String(value?.message || error || '').toLowerCase();
+  const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  if (status === 402) return true;
+  return /requires more credits|insufficient (credit|balance|funds|quota)|add more credits|payment required/.test(message);
+}
+
+/**
+ * The token ceiling a 402 says the account can still afford, if it names one.
+ *
+ * OpenRouter's message is literally "You requested up to 4000 tokens, but can
+ * only afford 3755" — a budget the request *would* have succeeded at. Shrinking
+ * to it keeps the bot deciding on a nearly-empty balance instead of going dark.
+ */
+export function affordableTokensFromError(error: unknown): number | null {
+  const message = String((error as any)?.message || error || '');
+  const match = /can only afford\s+([\d,]+)/i.exec(message);
+  if (!match) return null;
+  const value = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
+}
+
 /** True when the provider stopped generating because the token budget ran out. */
 export function isTruncated(finishReason: unknown): boolean {
   const reason = String(finishReason ?? '').toLowerCase();
@@ -3332,6 +3370,20 @@ class AiBrain {
   readonly usage = { calls: 0, promptTokens: 0, completionTokens: 0 };
   /** Grows for the rest of the run once a model proves it needs more headroom. */
   private tokenBudget = 0;
+  /**
+   * Whether the model is actually answering. A bot whose every decision is the
+   * HOLD fallback is not being cautious, it is broken — and it used to look
+   * identical to a healthy one in the logs and on the dashboard.
+   */
+  readonly health = {
+    consecutiveFailures: 0,
+    lastError: '',
+    lastErrorAt: '',
+    creditExhausted: false,
+    lastSuccessAt: '',
+  };
+  /** Set once per process so a dead-AI alert is not repeated every single call. */
+  private creditAlertSent = false;
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -3501,6 +3553,55 @@ HOLD, SELL, or ADJUST?`, pair);
   }
 
   /**
+   * Shrinks the completion budget to what a 402 says the balance can still
+   * afford, so a nearly-empty account keeps trading instead of failing every
+   * call. Returns false when the error names no figure, or the figure is too
+   * small to carry a decision — at which point the balance is genuinely spent.
+   */
+  private shrinkTokenBudgetToAfford(error: unknown, pair: string): boolean {
+    const affordable = affordableTokensFromError(error);
+    if (affordable === null) return false;
+    // Leave a little headroom under the stated ceiling: the balance keeps
+    // draining, so requesting exactly what was affordable a moment ago fails again.
+    const target = Math.floor(affordable * 0.9);
+    if (target < MIN_AI_TOKEN_BUDGET || target >= this.tokenBudget) return false;
+    const previous = this.tokenBudget;
+    this.tokenBudget = target;
+    console.warn(`  [AI] ${pair}: low credit balance; lowering the token budget ${previous} → ${this.tokenBudget} to keep deciding`);
+    return true;
+  }
+
+  /** Records that a call came back usable, clearing any standing failure streak. */
+  private recordAiSuccess() {
+    if (this.health.consecutiveFailures > 0)
+      console.log(`  [AI] Recovered after ${this.health.consecutiveFailures} consecutive failure(s)`);
+    this.health.consecutiveFailures = 0;
+    this.health.creditExhausted = false;
+    this.health.lastError = '';
+    this.health.lastSuccessAt = new Date().toISOString();
+  }
+
+  /**
+   * Records a failed call and, on credit exhaustion, says so once — loudly, and
+   * through the webhook. Silent failure here is the single most expensive bug
+   * this bot can have: it trades nothing while reporting a clean bill of health.
+   */
+  private recordAiFailure(error: unknown) {
+    this.health.consecutiveFailures++;
+    this.health.lastError = String((error as any)?.message || error || 'unknown error').slice(0, 300);
+    this.health.lastErrorAt = new Date().toISOString();
+    if (!isCreditExhausted(error)) return;
+    this.health.creditExhausted = true;
+    if (this.creditAlertSent) return;
+    this.creditAlertSent = true;
+    console.error('  [AI] *** OUT OF CREDIT *** The provider is refusing every request for lack of funds.');
+    console.error('  [AI] Until this is topped up, every decision falls back to HOLD and NOTHING WILL TRADE.');
+    console.error(`  [AI] Provider said: ${this.health.lastError}`);
+    void notifyWebhook('ai_credit_exhausted',
+      `KAI cannot trade: the AI provider is out of credit and is refusing every request. Every decision is falling back to HOLD until the balance is topped up. Provider said: ${this.health.lastError}`);
+  }
+
+  /**
    * OpenRouter-style reasoning control. Capping reasoning effort leaves the
    * completion budget for the JSON that actually carries the decision.
    */
@@ -3529,8 +3630,10 @@ HOLD, SELL, or ADJUST?`, pair);
       try {
         const response: any = await create(structured, reasoning);
         this.recordUsage(response?.usage);
+        this.recordAiSuccess();
         return response;
       } catch (e) {
+        this.recordAiFailure(e);
         if (modelOverride?.endsWith(':online') && isUnsupportedWebSearch(e)) {
           this.webSearchSupported = false;
           if (!this.webSearchUnsupportedLogged) {
@@ -3552,12 +3655,20 @@ HOLD, SELL, or ADJUST?`, pair);
       const reasoning = this.reasoningParamSupported;
       try {
         const response: any = await withRetry(`AI request ${pair}`, () => create(structured, reasoning), RETRY_ATTEMPTS,
-          error => isRetryableError(error) && !isUnknownModel(error) &&
+          // Retrying a 402 unchanged just burns attempts: the balance will not
+          // refill mid-loop. It is handled below by shrinking the budget instead.
+          error => isRetryableError(error) && !isUnknownModel(error) && !isCreditExhausted(error) &&
             !(structured && isUnsupportedResponseFormat(error)) &&
             !(reasoning && isUnsupportedReasoningParam(error)));
         this.recordUsage(response?.usage);
+        this.recordAiSuccess();
         return response;
       } catch (e) {
+        this.recordAiFailure(e);
+        // A nearly-empty balance still affords a smaller completion. Fitting the
+        // budget to it keeps the bot deciding rather than answering HOLD to
+        // everything on the way to zero.
+        if (isCreditExhausted(e) && this.shrinkTokenBudgetToAfford(e, pair)) continue;
         // A model the provider does not recognise is fatal to every later call,
         // so switch to the fallback once rather than failing the whole run.
         if (isUnknownModel(e) && !this.modelFellBack && CONFIG.aiModelFallback &&
@@ -4138,6 +4249,12 @@ async function main() {
           maxDrawdownPct: memory.maxDrawdownPct(),
           tradingPaused: memory.state.tradingPaused,
           pauseReason: memory.state.pauseReason,
+          aiHealth: {
+            consecutiveFailures: ai.health.consecutiveFailures,
+            lastError: ai.health.lastError,
+            creditExhausted: ai.health.creditExhausted,
+            lastSuccessAt: ai.health.lastSuccessAt,
+          },
         };
       },
       onOperatorMessage: (text: string) => {
@@ -5073,6 +5190,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const cycleTokens = (spend.promptTokens + spend.completionTokens) -
     (callsAtCycleStart.promptTokens + callsAtCycleStart.completionTokens);
   console.log(`  AI cost: ${cycleCalls} calls / ${cycleTokens.toLocaleString()} tokens this cycle | ${spend.calls} calls / ${(spend.promptTokens + spend.completionTokens).toLocaleString()} tokens since start (${ai.activeModel?.() ?? 'unknown model'})`);
+  // A dead AI is the one failure that makes every other number meaningless: the
+  // book looks calm because nothing is deciding, not because nothing is worth doing.
+  const health = ai.health;
+  if (health?.creditExhausted) {
+    console.error('  [AI HEALTH] *** NOT TRADING: the AI provider is out of credit. *** Top up the balance; until then every decision is a fallback HOLD.');
+  } else if ((health?.consecutiveFailures ?? 0) >= 3) {
+    console.error(`  [AI HEALTH] *** NOT TRADING: ${health.consecutiveFailures} consecutive AI failures. *** Last error: ${health.lastError}`);
+  }
   const funding = mem.state.fundingRequest;
   if (funding)
     console.log(`  [FUNDING] Outstanding request: ${fmt(funding.usd)} since ${funding.requestedAt} — "${funding.reasoning}"`);

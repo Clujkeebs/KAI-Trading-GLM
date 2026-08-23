@@ -37,6 +37,59 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — ROOT CAUSE of "not trading": the AI was out of credit
+
+**The bug:** The operator reported for several turns that the bot "isn't trading" and is "just
+sitting still." Earlier explanations (small tradable capital, cash-target conservatism, fiat
+pairs crowding the scan) were all real but were *not* the cause. Pulling the live logs and
+grouping the errors found it immediately:
+
+```
+402 This request requires more credits, or fewer max_tokens. You requested up to 4000 tokens,
+but can only afford 3755. To increase, visit https://openrouter.ai/settings/credits
+```
+
+Every single AI call was failing. Every decision was the `HOLD (5/10)` fallback; every stance
+read `NEUTRAL (5/10) — AI unavailable`. The bot was brain-dead, not indecisive — and looked
+completely healthy doing it. This is the same class of silent failure the preflight self-test
+was built for, except preflight only runs at startup and the balance drained mid-run.
+
+**Changed:**
+- `isCreditExhausted(error)` — recognises a 402 / "requires more credits" / "insufficient
+  balance" refusal, deliberately narrow so a 429 or 401 is not swallowed by it.
+- `affordableTokensFromError(error)` — parses the "can only afford N" figure the provider
+  helpfully includes.
+- `AiBrain.shrinkTokenBudgetToAfford()` — on a credit refusal, refits `max_tokens` to 90% of
+  what the balance still affords (floored at a new `MIN_AI_TOKEN_BUDGET = 900`, below which a
+  reasoning model cannot emit the decision JSON anyway) and retries. A nearly-empty balance now
+  keeps deciding instead of going dark on the way to zero.
+- A 402 is excluded from `withRetry`'s retry predicate: the balance will not refill mid-loop,
+  so retrying unchanged just burns attempts.
+- `AiBrain.health` — `consecutiveFailures`, `lastError`, `creditExhausted`, `lastSuccessAt`.
+  Surfaced in the cycle summary (`[AI HEALTH] *** NOT TRADING ***`), as a red dashboard banner,
+  in `npm run cli -- balance`, and once per process through `notifyWebhook`. A dead AI can
+  never again look like a calm book.
+
+**Verified:** `npm run build` and `npm test` clean. New coverage in `logic-check.ts` (the exact
+production 402 string parsed; 429/401/404/network errors explicitly NOT treated as credit
+exhaustion; missing/zero/comma-separated figures), `ai-check.ts` (a shrinkable 402 recovers and
+lands a real BUY at `max_tokens` 990 with health cleared; an unaffordable 402 falls back, is not
+retried to death, and sets `creditExhausted`), and `dashboard-check.ts` (banner for credit
+exhaustion, banner for ≥3 consecutive failures, and NO banner at 2 — it must not cry wolf).
+**Regression-checked properly:** temporarily disabled the shrink-and-retry line and confirmed
+`ai-check.ts` fails with `actual: 1000, expected: 990`, then restored it and confirmed green.
+
+**Watch out:**
+- The code fix makes the bot *survive* a low balance; it cannot conjure credit. The operator
+  must top up OpenRouter or nothing trades regardless.
+- Noticed while working: `tsconfig.json` only includes `src/`, so **test files are never
+  typechecked** (tsx transpiles without checking). A `tsconfig.test.json` over `src/ + test/`
+  reports ~11 pre-existing errors — test fixtures passing partial object literals where
+  `PortfolioStance` / `AiDecision` are expected. Harmless at runtime (the code under test reads
+  only the fields present) but it means a test can silently drift from a changed interface —
+  my own `aiHealth` addition slipped through untypechecked this way. Not fixed here to keep this
+  change focused; worth a dedicated pass.
+
 ### 2026-08-22 — Claude — Exclude fiat currency pairs from the scan universe
 
 **Changed:** `filterDiscoveredMarkets()` now also excludes a new `FIAT_BASES` set (EUR, GBP,

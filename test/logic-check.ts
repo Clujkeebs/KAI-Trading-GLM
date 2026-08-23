@@ -18,6 +18,7 @@ import {
   formatPairHistory, isMinimumAffordable, Memory, selectSleepers,
   tickerFromRawTicker, maxDrawdown, notifyWebhook,
   dailyReturns, correlateReturns, portfolioCorrelationNote,
+  isCreditExhausted, affordableTokensFromError,
 } from '../src/index';
 import type { OhlcvCandle } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
@@ -950,6 +951,41 @@ console.log('equity and spread checks passed');
   );
 }
 console.log('correlation checks passed');
+
+// ── Credit exhaustion: the failure that silently killed a live account ──────
+{
+  // The exact message OpenRouter returned in production while the bot answered
+  // HOLD to everything for hours and reported a clean bill of health.
+  const real = Object.assign(new Error(
+    '402 This request requires more credits, or fewer max_tokens. You requested up to 4000 tokens, ' +
+    'but can only afford 3755. To increase, visit https://openrouter.ai/settings/credits and add more credits',
+  ), { status: 402 });
+
+  assert.equal(isCreditExhausted(real), true, 'the production 402 must be recognised');
+  assert.equal(affordableTokensFromError(real), 3755, 'the affordable ceiling is parsed out');
+
+  // Status alone is enough, even with an unhelpful body.
+  assert.equal(isCreditExhausted(Object.assign(new Error('Payment Required'), { status: 402 })), true);
+  // And the message alone is enough, even when the status is missing or wrapped.
+  assert.equal(isCreditExhausted(new Error('Insufficient credits on this account')), true);
+  assert.equal(isCreditExhausted(new Error('please add more credits to continue')), true);
+
+  // Ordinary failures must NOT be mistaken for it: treating a rate limit as
+  // "out of money" would suppress the retry that actually recovers.
+  assert.equal(isCreditExhausted(Object.assign(new Error('429 rate limit exceeded'), { status: 429 })), false);
+  assert.equal(isCreditExhausted(Object.assign(new Error('invalid api key'), { status: 401 })), false);
+  assert.equal(isCreditExhausted(Object.assign(new Error('model not found'), { status: 404 })), false);
+  assert.equal(isCreditExhausted(new Error('connection reset')), false);
+
+  // No figure named → nothing to shrink to, so the caller must not guess one.
+  assert.equal(affordableTokensFromError(new Error('Insufficient credits')), null);
+  assert.equal(affordableTokensFromError(Object.assign(new Error('402 Payment Required'), { status: 402 })), null);
+  // Thousands separators appear in larger balances.
+  assert.equal(affordableTokensFromError(new Error('but can only afford 12,500 tokens')), 12_500);
+  // A nonsense or zero figure is not a budget worth trying.
+  assert.equal(affordableTokensFromError(new Error('can only afford 0')), null);
+}
+console.log('credit-exhaustion checks passed');
 
 // ── Webhook notifications: generic, opt-in, never throws ────────────────────
 (async () => {

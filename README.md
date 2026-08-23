@@ -414,6 +414,24 @@ dashboard; `resume` lifts a pause. `export` writes the full trade-ledger CSV to 
 state files directly; it is strictly a client of the dashboard's HTTP API, so
 `DASHBOARD_PASSWORD` must be set on the deployed bot for any of these to work.
 
+### When the AI stops answering
+
+A bot whose every decision is the fallback `HOLD` is broken, not cautious — and it used to look
+identical to a healthy one. Production hit exactly this: the OpenRouter balance ran out, every
+call returned `402`, every stance read "AI unavailable", and nothing traded for hours while the
+logs and dashboard looked calm.
+
+Two things now prevent that. First, a credit refusal that names what the balance *can* still
+afford ("you requested 4000 tokens, but can only afford 3755") refits `max_tokens` just under
+that figure and retries, so a nearly-empty balance keeps deciding instead of going dark on the
+way to zero — down to a floor below which a reasoning model cannot emit the decision JSON at
+all. A `402` is never retried unchanged, since the balance will not refill mid-loop.
+
+Second, it says so, loudly: a red banner on the dashboard, a `[AI HEALTH] *** NOT TRADING ***`
+line in the cycle summary, a warning from `npm run cli -- balance`, and one `WEBHOOK_URL` alert
+per process. The same applies to three or more consecutive AI failures for any other reason.
+None of this can create credit — if the balance is genuinely spent, top it up or nothing trades.
+
 ## Model choice and what it costs
 
 `AI_MODEL` picks the model; `AI_MODEL_FALLBACK` names one to fall back to if the provider

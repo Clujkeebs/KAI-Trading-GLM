@@ -15,6 +15,7 @@ function emptySnapshot(): DashboardSnapshot {
     model: 'test-model', usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
     equityHistory: [], maxDrawdownPct: 0,
     tradingPaused: false, pauseReason: '',
+    aiHealth: { consecutiveFailures: 0, lastError: '', creditExhausted: false, lastSuccessAt: '' },
   };
 }
 
@@ -169,6 +170,34 @@ async function main() {
     assert.match(exportCsv.headers['content-type'] || '', /text\/csv/);
     assert.match(exportCsv.headers['content-disposition'] || '', /attachment.*trades\.csv/);
     assert.equal(exportCsv.body, 'timestamp,pair,side\n2026-01-01T00:00:00.000Z,BTC/USD,BUY\n');
+
+    // A dead AI must be impossible to miss: the page previously looked perfectly
+    // healthy while every decision was a fallback HOLD.
+    snapshot = {
+      ...emptySnapshot(),
+      aiHealth: { consecutiveFailures: 12, lastError: '402 requires more credits', creditExhausted: true, lastSuccessAt: '' },
+    };
+    const brokeAi = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.match(brokeAi.body, /NOT TRADING/, 'an out-of-credit provider is stated outright');
+    assert.match(brokeAi.body, /out of credit/i);
+    assert.match(brokeAi.body, /402 requires more credits/, 'the provider message is shown verbatim');
+
+    // Repeated failures for any other reason warn just as loudly.
+    snapshot = {
+      ...emptySnapshot(),
+      aiHealth: { consecutiveFailures: 5, lastError: 'connection reset', creditExhausted: false, lastSuccessAt: '' },
+    };
+    const failingAi = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.match(failingAi.body, /NOT TRADING/);
+    assert.match(failingAi.body, /5 consecutive AI failures/);
+
+    // A couple of blips is not an outage — no alarm for transient noise.
+    snapshot = {
+      ...emptySnapshot(),
+      aiHealth: { consecutiveFailures: 2, lastError: 'timeout', creditExhausted: false, lastSuccessAt: '' },
+    };
+    const blip = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(!blip.body.includes('NOT TRADING'), 'a brief blip does not cry wolf');
 
     // An unknown route is a 404, not a silent 200.
     const missing = await request(port, '/nope', { auth: 'operator:correct-horse' });
