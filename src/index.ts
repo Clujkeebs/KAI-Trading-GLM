@@ -486,6 +486,8 @@ const MAX_AI_TOKEN_BUDGET = 16_000;
  * unparseable fragments that look like the model having no opinion.
  */
 const MIN_AI_TOKEN_BUDGET = 900;
+/** Extra request attempts reserved for walking a free list discovered mid-call. */
+const FREE_MODEL_DISCOVERY_SLOTS = 8;
 /**
  * Roughly the smallest position worth opening once round-trip fees and exchange
  * minimums are paid. Not a hard floor anywhere — it only sizes the *preferred
@@ -3291,6 +3293,39 @@ export function affordableTokensFromError(error: unknown): number | null {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
 }
 
+/**
+ * Zero-cost model ids from an OpenRouter `/models` payload, best first.
+ *
+ * Hard-coding free slugs does not survive contact with reality: every one tried
+ * in production had been withdrawn ("unavailable for free", "no endpoints
+ * found") within days. Asking the provider which models are actually free right
+ * now is the only version of this that keeps working, so the list is discovered
+ * rather than guessed.
+ *
+ * "Best" is approximated by context length, which correlates with capability
+ * well enough to order candidates and is the only quality signal in the payload.
+ */
+export function freeModelsFromCatalog(payload: unknown, limit = 8): string[] {
+  const data = (payload as any)?.data;
+  if (!Array.isArray(data)) return [];
+  const isZero = (value: unknown) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n === 0;
+  };
+  return data
+    .filter(entry => {
+      const id = typeof entry?.id === 'string' ? entry.id : '';
+      if (!id) return false;
+      const pricing = entry?.pricing;
+      // Both sides must be free: a model with free prompts but paid completions
+      // still fails on a spent balance, which is the whole case being handled.
+      return isZero(pricing?.prompt) && isZero(pricing?.completion);
+    })
+    .sort((a, b) => (Number(b?.context_length) || 0) - (Number(a?.context_length) || 0))
+    .map(entry => String(entry.id))
+    .slice(0, Math.max(0, limit));
+}
+
 /** True when the provider stopped generating because the token budget ran out. */
 export function isTruncated(finishReason: unknown): boolean {
   const reason = String(finishReason ?? '').toLowerCase();
@@ -3443,6 +3478,12 @@ class AiBrain {
    * order, rather than a single id that has to be right.
    */
   private freeModelCandidates: string[] = [];
+  /** Set once the live catalog has been consulted, so it is fetched at most once per run. */
+  private freeModelsDiscovered = false;
+  /** True once the run has left the paid model behind. */
+  private switchedToFreeTier = false;
+  private apiKey = '';
+  private baseUrl = '';
 
   constructor(memory: Memory) {
     const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -3471,6 +3512,8 @@ class AiBrain {
       maxRetries: 0,
     });
     this.model = model;
+    this.apiKey = apiKey;
+    this.baseUrl = CONFIG.aiBaseUrl || urls[provider] || urls.openrouter;
     this.tokenBudget = CONFIG.aiMaxTokens;
     this.freeModelCandidates = (CONFIG.aiFreeModel ?? '')
       .split(',').map(id => id.trim()).filter(Boolean);
@@ -3642,6 +3685,39 @@ HOLD, SELL, or ADJUST?`, pair);
    * budget is reset on the way in, since the shrunken one was fitted to a paid
    * balance that no longer applies.
    */
+  /**
+   * Asks the provider which models are free right now and queues them.
+   *
+   * Every hard-coded free slug tried in production was already withdrawn, and
+   * the environment this was written in cannot reach the provider to check. The
+   * bot itself can, so it looks the list up at the moment it needs one. Failure
+   * is not fatal: it simply leaves the configured candidates as the only option.
+   */
+  private async discoverFreeModels(): Promise<void> {
+    if (this.freeModelsDiscovered) return;
+    this.freeModelsDiscovered = true;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      const res = await fetch(`${this.baseUrl.replace(/\/+$/, '')}/models`, {
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timeout));
+      if (!res.ok) {
+        console.warn(`  [AI] Could not list free models: HTTP ${res.status}`);
+        return;
+      }
+      const discovered = freeModelsFromCatalog(await res.json());
+      // Anything the operator configured stays ahead of a discovered id.
+      const known = new Set(this.freeModelCandidates);
+      const added = discovered.filter(id => !known.has(id));
+      this.freeModelCandidates.push(...added);
+      console.log(`  [AI] Provider lists ${added.length} free model(s) right now: ${added.slice(0, 5).join(', ')}${added.length > 5 ? ', …' : ''}`);
+    } catch (e: any) {
+      console.warn(`  [AI] Could not list free models: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   private switchToFreeModel(): boolean {
     const free = this.freeModelCandidates.shift();
     if (!free) return false;
@@ -3650,6 +3726,7 @@ HOLD, SELL, or ADJUST?`, pair);
     console.error(`  [AI] Paid balance is spent; switching to the no-cost model "${free}" for the rest of this run${remaining > 0 ? ` (${remaining} more to try if it is unavailable)` : ''}.`);
     console.error('  [AI] Decision quality will be lower than the paid model. Top up to restore it.');
     this.model = free;
+    this.switchedToFreeTier = true;
     // The shrunken budget was fitted to a paid balance that no longer applies.
     this.tokenBudget = CONFIG.aiMaxTokens;
     void notifyWebhook('ai_free_model_fallback',
@@ -3738,7 +3815,7 @@ HOLD, SELL, or ADJUST?`, pair);
     // the discovery. The budget also has to cover walking the free-model list,
     // otherwise a long list is truncated mid-walk and a live slug further down
     // is never reached.
-    const attempts = 3 + this.freeModelCandidates.length;
+    const attempts = 3 + this.freeModelCandidates.length + (this.freeModelsDiscovered ? 0 : FREE_MODEL_DISCOVERY_SLOTS);
     for (let attempt = 0; attempt < attempts; attempt++) {
       const structured = this.responseFormatSupported;
       const reasoning = this.reasoningParamSupported;
@@ -3761,10 +3838,19 @@ HOLD, SELL, or ADJUST?`, pair);
         // Past that the balance is spent and no budget fits. A no-cost model is
         // worse than the paid one, but a worse decision beats no decision at all:
         // the alternative is answering HOLD to everything until someone notices.
-        if (isCreditExhausted(e) && this.switchToFreeModel()) continue;
+        if (isCreditExhausted(e)) {
+          // Ask the provider for a live free list before concluding there is none.
+          await this.discoverFreeModels();
+          if (this.switchToFreeModel()) continue;
+        }
         // A free slug that has been withdrawn ("unavailable for free") is not a
         // reason to give up on the free tier — try the next candidate instead.
-        if (isModelUnavailable(e) && this.freeModelCandidates.length > 0 && this.switchToFreeModel()) continue;
+        if (isModelUnavailable(e) && this.switchedToFreeTier) {
+          // A withdrawn free slug: top up from the live catalog if not done yet,
+          // then try the next candidate rather than abandoning the free tier.
+          await this.discoverFreeModels();
+          if (this.switchToFreeModel()) continue;
+        }
         // A model the provider does not recognise is fatal to every later call,
         // so switch to the fallback once rather than failing the whole run.
         if (isUnknownModel(e) && !this.modelFellBack && CONFIG.aiModelFallback &&

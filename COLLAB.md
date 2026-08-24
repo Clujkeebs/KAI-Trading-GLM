@@ -37,6 +37,32 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-23 — Claude — Discover free models from the provider instead of guessing
+
+**Changed:** New exported `freeModelsFromCatalog(payload)` (pure: keeps only models where BOTH
+prompt and completion price are zero, orders by context length as the one capability signal the
+payload carries) and `AiBrain.discoverFreeModels()`, which GETs `<baseUrl>/models` once per run
+when the paid balance is spent and queues what it finds behind anything the operator configured.
+`AI_FREE_MODEL` is now documented as "usually leave blank".
+**Why:** Three hard-coded free slugs were tried in production and all three were already dead
+(`404 No endpoints found`, `unavailable for free`). Guessing a fourth would repeat the failure,
+and this environment cannot reach openrouter.ai to check (`curl` → `403 CONNECT tunnel failed`).
+The bot *can* reach it, so it now looks the list up at the moment it needs one. The operator has
+only OpenRouter and no paid balance, so this is the only remaining path to a working decision.
+**Verified:** `npm run build` and `npm test` clean (23 suites). `logic-check.ts` covers the
+parser: fully-free only (a free-prompt/paid-completion model is excluded — it still fails on a
+spent balance), longest-context-first ordering, the limit, numeric and string zeros, and junk
+payloads (null / `{}` / non-array / missing pricing / non-numeric price) returning `[]` rather
+than throwing. `ai-check.ts` covers the path end to end with a stubbed `fetch`: a 402 with no
+configured list consults `/models`, authenticates with a Bearer token, switches to the
+discovered free model, lands a real BUY, and never queues a paid id; plus a catalog fetch that
+throws, asserting an honest HOLD instead of a crashed cycle.
+**Watch out:** Whether OpenRouter currently exposes ANY zero-price model to this account is still
+unverified from here — that is now a question the bot answers at runtime rather than one I have
+to guess. If the catalog returns no free models the bot falls back to HOLD and preflight blocks
+new entries, which is safe but still not trading; the real fix remains a paid balance. Free tiers
+are heavily rate limited, so expect 429s and slower cycles even on success.
+
 ### 2026-08-23 — Claude — Attempt budget must cover walking the free-model list
 
 **Changed:** The retry loop in `AiBrain.request()` was a fixed `attempt < 3`. With five free

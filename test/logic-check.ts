@@ -19,6 +19,7 @@ import {
   tickerFromRawTicker, maxDrawdown, notifyWebhook,
   dailyReturns, correlateReturns, portfolioCorrelationNote,
   isCreditExhausted, affordableTokensFromError, fundablePositionCount,
+  freeModelsFromCatalog,
 } from '../src/index';
 import type { OhlcvCandle } from '../src/index';
 import type { TechnicalAnalysis } from '../src/index';
@@ -1016,6 +1017,39 @@ console.log('correlation checks passed');
   // A nonsense or zero figure is not a budget worth trying.
   assert.equal(affordableTokensFromError(new Error('can only afford 0')), null);
 }
+// ── Free models are discovered from the provider, not guessed ───────────────
+{
+  // Shaped like a real OpenRouter /models payload.
+  const catalog = {
+    data: [
+      { id: 'paid/big', pricing: { prompt: '0.000003', completion: '0.000015' }, context_length: 200000 },
+      { id: 'free/small', pricing: { prompt: '0', completion: '0' }, context_length: 8192 },
+      { id: 'free/large', pricing: { prompt: '0', completion: '0' }, context_length: 131072 },
+      // Free prompts but paid completions still fails on a spent balance.
+      { id: 'half/free', pricing: { prompt: '0', completion: '0.0000002' }, context_length: 99999 },
+      { id: 'free/medium', pricing: { prompt: '0', completion: '0' }, context_length: 32768 },
+      { id: '', pricing: { prompt: '0', completion: '0' }, context_length: 1 },
+    ],
+  };
+  assert.deepEqual(freeModelsFromCatalog(catalog), ['free/large', 'free/medium', 'free/small'],
+    'only fully-free models, best (longest context) first');
+  assert.deepEqual(freeModelsFromCatalog(catalog, 2), ['free/large', 'free/medium'], 'the limit is respected');
+
+  // Numeric zero as well as string zero.
+  assert.deepEqual(
+    freeModelsFromCatalog({ data: [{ id: 'n/free', pricing: { prompt: 0, completion: 0 }, context_length: 10 }] }),
+    ['n/free']);
+
+  // Junk must never throw — this runs while the bot is already failing.
+  assert.deepEqual(freeModelsFromCatalog(null), []);
+  assert.deepEqual(freeModelsFromCatalog({}), []);
+  assert.deepEqual(freeModelsFromCatalog({ data: 'nope' }), []);
+  assert.deepEqual(freeModelsFromCatalog({ data: [{ id: 'no/pricing' }] }), []);
+  assert.deepEqual(freeModelsFromCatalog({ data: [{ id: 'bad', pricing: { prompt: 'free', completion: 'free' } }] }), [],
+    'a non-numeric price is not treated as zero');
+}
+console.log('free-model discovery checks passed');
+
 console.log('credit-exhaustion checks passed');
 
 // ── Webhook notifications: generic, opt-in, never throws ────────────────────

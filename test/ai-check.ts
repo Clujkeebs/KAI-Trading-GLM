@@ -254,6 +254,58 @@ async function main() {
     assert.ok(client.sent.length < 12, `exhausting the free list should not spin: ${client.sent.length} calls`);
   }
 
+  // ── With NO free list configured, it asks the provider for one ────────────
+  // This is the case that matters: every hard-coded slug tried in production was
+  // already withdrawn, so the live catalog is the only source that stays true.
+  delete process.env.AI_FREE_MODEL;
+  setConfig(loadConfig());
+  {
+    const realFetch = globalThis.fetch;
+    let askedFor = '';
+    (globalThis as any).fetch = async (url: any, init: any) => {
+      askedFor = String(url);
+      assert.match(String(init?.headers?.Authorization ?? ''), /^Bearer /, 'the catalog call is authenticated');
+      return {
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'paid/one', pricing: { prompt: '0.001', completion: '0.002' }, context_length: 900000 },
+            { id: 'discovered/free', pricing: { prompt: '0', completion: '0' }, context_length: 65536 },
+          ],
+        }),
+      };
+    };
+    try {
+      const { brain, client } = brainWith([
+        { throws: { status: 402, message: 'requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+        { content: VALID },
+      ]);
+      const d = await (brain as any).call('probe', 'DISCOVER/USD');
+      assert.match(askedFor, /\/models$/, 'the provider catalog is consulted');
+      assert.equal(d.verdict, 'BUY', 'a discovered free model lands the decision');
+      assert.equal(brain.activeModel(), 'discovered/free');
+      assert.ok(!/paid\/one/.test(client.sent.map((c: any) => c.model).join(',')), 'a paid model is never queued as free');
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+  }
+
+  // A catalog that cannot be reached must not throw — the bot is already failing.
+  {
+    const realFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () => { throw new Error('network down'); };
+    try {
+      const { brain } = brainWith([
+        { throws: { status: 402, message: 'requires more credits. You requested up to 1000 tokens, but can only afford 40.' } },
+      ]);
+      const d = await (brain as any).call('probe', 'NOCATALOG/USD');
+      assert.equal(d.verdict, 'HOLD', 'it falls back honestly rather than crashing the cycle');
+      assert.equal(brain.health.creditExhausted, true);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+  }
+
   // Without one configured it still fails honestly rather than pretending.
   delete process.env.AI_FREE_MODEL;
   setConfig(loadConfig());
