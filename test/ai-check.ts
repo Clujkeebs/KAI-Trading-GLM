@@ -50,6 +50,11 @@ const VALID = '{"verdict":"BUY","confidence":7,"reasoning":"oversold at support"
 const TRUNCATED = '{"verdict":"BUY","confidence":7,"reasoning":"oversold near the lower band and the higher timefr';
 
 async function main() {
+  // The suite is meant to run without network. Free-model discovery calls
+  // `fetch`, and reaching the real catalog made this file's assertions depend on
+  // whatever OpenRouter happens to list today; cases that care stub it themselves.
+  (globalThis as any).fetch = async () => { throw new Error('network disabled in tests'); };
+
   const bot = await import('../src/index');
   const { AiBrain, Memory, setConfig, loadConfig, isTruncated, reportPreflight } = bot;
   setConfig(loadConfig());

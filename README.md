@@ -379,8 +379,19 @@ Repeated wrong logins from one address lock it out — `DASHBOARD_MAX_LOGIN_ATTE
 8) failures within the lockout window return `429` with a `Retry-After` header for
 `DASHBOARD_LOCKOUT_MINUTES` (default 15), even to the correct password, so a live-money
 dashboard isn't only as strong as the password against something guessing it in a loop. A
-correct login resets the count. Tracking is in-memory per process (a redeploy clears it) and
-keyed on `X-Forwarded-For` behind Railway's proxy.
+correct login resets the count. A request with no credentials at all never counts — every
+browser and every internet scanner opens with one, and counting those locked the operator out
+of their own kill switch. Tracking is in-memory per process (a redeploy clears it) and keyed on
+the client address taken `DASHBOARD_TRUSTED_PROXY_HOPS` entries from the right of
+`X-Forwarded-For` (default 1, i.e. the value Railway's proxy writes; `0` ignores the header and
+uses the socket). Reading the leftmost entry instead would let anything rotate a forged header
+and guess forever.
+
+State-changing posts (`/message`, `/kill-switch`, `/resume`) are rejected with `403` when the
+`Origin` or `Referer` belongs to another host: browsers attach Basic Auth credentials to
+cross-site form posts automatically, so without that check any page the operator visited could
+have flattened the book. The dashboard's own forms are unaffected, and responses are sent
+`no-store` with `X-Frame-Options: DENY`.
 
 ### Kill switch
 

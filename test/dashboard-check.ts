@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import * as http from 'node:http';
-import { startDashboard, DashboardSnapshot } from '../src/dashboard';
+import { startDashboard, DashboardSnapshot, clientAddress } from '../src/dashboard';
 
 function emptySnapshot(): DashboardSnapshot {
   return {
@@ -20,7 +20,8 @@ function emptySnapshot(): DashboardSnapshot {
 }
 
 function request(
-  port: number, path: string, options: { auth?: string; method?: string; body?: string } = {},
+  port: number, path: string,
+  options: { auth?: string; method?: string; body?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -28,6 +29,7 @@ function request(
         headers: {
           ...(options.auth ? { Authorization: `Basic ${Buffer.from(options.auth).toString('base64')}` } : {}),
           ...(options.body ? { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(options.body) } : {}),
+          ...(options.headers || {}),
         },
       },
       res => {
@@ -202,6 +204,45 @@ async function main() {
     // An unknown route is a 404, not a silent 200.
     const missing = await request(port, '/nope', { auth: 'operator:correct-horse' });
     assert.equal(missing.status, 404);
+
+    // ── A page on another site cannot fire the kill switch ──────────────────
+    // Basic Auth credentials ride along automatically once the operator has a
+    // session, so any page they visit could otherwise flatten the book. Probed
+    // against this server before the check existed: 303, and the switch fired.
+    snapshot = emptySnapshot();
+    killSwitchCalls.length = 0;
+    const crossSite = await request(port, '/kill-switch', {
+      auth: 'operator:correct-horse', method: 'POST', body: 'confirm=FLATTEN&reason=csrf',
+      headers: { Origin: 'https://evil.example', Referer: 'https://evil.example/' },
+    });
+    assert.equal(crossSite.status, 403, 'a cross-site POST is refused');
+    assert.deepEqual(killSwitchCalls, [], 'and never reaches the callback');
+
+    // The dashboard's own forms are unaffected.
+    const sameSite = await request(port, '/resume', {
+      auth: 'operator:correct-horse', method: 'POST',
+      headers: { Origin: `http://127.0.0.1:${port}`, Referer: `http://127.0.0.1:${port}/` },
+    });
+    assert.equal(sameSite.status, 303, 'a same-origin post still works');
+
+    // Reads are not state changes, and the response is unreadable cross-origin.
+    const read = await request(port, '/', {
+      auth: 'operator:correct-horse', headers: { Referer: 'https://evil.example/' },
+    });
+    assert.equal(read.status, 200);
+    assert.equal(read.headers['x-frame-options'], 'DENY', 'the page is not embeddable');
+    assert.equal(read.headers['referrer-policy'], 'no-referrer');
+    assert.match(String(read.headers['cache-control']), /no-store/, 'a live-money view is not cached');
+
+    // ── The message limit is enforced on the server, not just the textarea ──
+    // Operator text goes into the model prompt and the state file; maxlength in
+    // the HTML is advisory and a direct POST ignored it.
+    messages.length = 0;
+    await request(port, '/message', {
+      auth: 'operator:correct-horse', method: 'POST', body: 'text=' + 'a'.repeat(5000),
+    });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].length, 2000, 'an oversized message is truncated rather than stored whole');
   } finally {
     server.close();
   }
@@ -225,6 +266,20 @@ async function main() {
       assert.equal(locked.status, 429, 'the correct password no longer works once the address is locked out');
       assert.ok(locked.headers['retry-after'], 'a locked response names when to retry');
 
+      // Rotating the forged front of X-Forwarded-For does not buy a fresh
+      // bucket: the address is read where the trusted proxy writes it, at the
+      // right. Reading the leftmost entry instead gave unlimited guesses.
+      for (let i = 0; i < 3; i++) {
+        const res = await request(tPort, '/', {
+          auth: 'operator:nope', headers: { 'X-Forwarded-For': `10.0.0.${i}, 198.51.100.7` },
+        });
+        assert.equal(res.status, 401, `proxied attempt ${i + 1} is a plain auth failure`);
+      }
+      const forged = await request(tPort, '/', {
+        auth: 'operator:correct-horse', headers: { 'X-Forwarded-For': '10.0.0.99, 198.51.100.7' },
+      });
+      assert.equal(forged.status, 429, 'all the guesses landed in the real client\'s bucket');
+
       // /health stays reachable throughout — it never touches auth or the throttle.
       const health = await request(tPort, '/health');
       assert.equal(health.status, 200);
@@ -244,6 +299,13 @@ async function main() {
     await new Promise<void>(resolve => resettable.once('listening', resolve));
     const rPort = (resettable.address() as any).port;
     try {
+      // Anonymous requests must not consume attempts: every browser and every
+      // internet scanner opens with one, and counting them locked the operator
+      // out of the kill switch while holding the right password.
+      for (let i = 0; i < 6; i++) await request(rPort, '/');
+      const afterScans = await request(rPort, '/', { auth: 'operator:correct-horse' });
+      assert.equal(afterScans.status, 200, 'credential-less requests do not count toward the lockout');
+
       await request(rPort, '/', { auth: 'operator:nope' });
       await request(rPort, '/', { auth: 'operator:nope' });
       const ok = await request(rPort, '/', { auth: 'operator:correct-horse' });
@@ -256,6 +318,23 @@ async function main() {
     } finally {
       resettable.close();
     }
+  }
+
+  // ── Client address selection, unit level ──────────────────────────────────
+  {
+    const req = (forwarded?: string, remote = '10.0.0.1') => ({
+      headers: forwarded === undefined ? {} : { 'x-forwarded-for': forwarded },
+      socket: { remoteAddress: remote },
+    }) as any;
+
+    assert.equal(clientAddress(req('203.0.113.9, 172.16.0.1')), '172.16.0.1',
+      'one trusted hop reads the entry the proxy itself wrote');
+    assert.equal(clientAddress(req('203.0.113.9, 172.16.0.1'), 2), '203.0.113.9');
+    assert.equal(clientAddress(req('203.0.113.9'), 0), '10.0.0.1',
+      'zero hops ignores the header entirely');
+    assert.equal(clientAddress(req(undefined)), '10.0.0.1', 'no header falls back to the socket');
+    assert.equal(clientAddress(req('   ')), '10.0.0.1', 'a junk header falls back to the socket');
+    assert.equal(clientAddress(req('a, b, c'), 9), 'a', 'asking for more hops than exist is clamped');
   }
 
   console.log('dashboard checks passed');
