@@ -37,6 +37,32 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-08-27 — Devin — Dashboard: stop the refresh eating input, and say when a flatten is pending
+
+**Changed:** Same branch as the CSRF/lockout work (`devin/1787868274-dashboard-csrf-and-cycle-exit`,
+PR #1), which also hardened state-changing posts, the `X-Forwarded-For` lockout key, the
+server-side message cap and the `--once` exit. On top of that, five operator-facing fixes:
+the unconditional `<meta http-equiv="refresh" content="60">` moved into `<noscript>` and a
+small inline timer reschedules the reload while any field holds text; chat text and table
+cells wrap mid-word instead of widening the page; `fmtUsd` is always two decimals with a
+new `fmtPrice` carrying sub-cent digits for per-unit prices only; the snapshot gained
+`flattenPending` (from the existing `state.flattenRequested`) and the page reports that the
+sells run on the next cycle with the count still open; a confirmation that is not exactly
+`FLATTEN` now redirects to `/?notice=flatten-unconfirmed` and says nothing was sold.
+
+**Why:** Browser testing on the harness showed the 60s refresh wiping a half-typed
+`FLATTEN` and unsent messages, a 2,000-character message pushing the page sideways, prices
+and balances formatted inconsistently, and "Flatten & pause" pausing instantly while the
+sells waited ~54s with no indication — the worst of the set, since it reads as done during
+an emergency.
+
+**Verified:** `npm run build`, `npm test` (dashboard suite extended for each of the above),
+and a dashboard-enabled paper cycle. No live orders, no Kraken credentials; the live path
+stays unverified.
+
+**Watch out:** The page is no longer script-free — the README claim was updated. Anything
+adding a CSP will need to allow that inline script or move the timer to a file.
+
 ### 2026-08-23 — Claude — Discover free models from the provider instead of guessing
 
 **Changed:** New exported `freeModelsFromCatalog(payload)` (pure: keeps only models where BOTH

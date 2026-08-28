@@ -371,9 +371,19 @@ list shown on the page — is downloadable as CSV from a link under "Recent clos
 There is no unauthenticated mode: `DASHBOARD_PASSWORD` gates every route except `/health`
 (so Railway's health check still works) behind HTTP Basic Auth, compared with a timing-safe
 check. `DASHBOARD_USERNAME` defaults to `operator`. It listens on `$PORT` (Railway sets this
-automatically); the page itself ships zero client-side JavaScript — the message box is a
-plain HTML form. It can only read state and queue a text message for the model to see; it
+automatically); every control is a plain HTML form, and the only script on the page is the
+refresh timer. It can only read state and queue a text message for the model to see; it
 cannot place an order, change a stop, or touch config.
+
+The page refreshes itself every 60 seconds, but skips the refresh while any field holds text
+— an unsent message or a half-typed `FLATTEN` used to be wiped mid-sentence by a
+`<meta http-equiv="refresh">`, which now only applies with scripting disabled.
+
+Firing the kill switch pauses new entries immediately, but the sells happen at the start of
+the next cycle. Until they do, the page says so and names how many positions are still open,
+because "trading paused" over a full book otherwise reads as though the flatten had finished.
+A confirmation box that doesn't read exactly `FLATTEN` reports that nothing was sold rather
+than silently reloading.
 
 Repeated wrong logins from one address lock it out — `DASHBOARD_MAX_LOGIN_ATTEMPTS` (default
 8) failures within the lockout window return `429` with a `Retry-After` header for

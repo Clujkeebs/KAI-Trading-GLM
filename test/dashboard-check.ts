@@ -14,7 +14,7 @@ function emptySnapshot(): DashboardSnapshot {
     stance: null, fundingRequest: null, chat: [],
     model: 'test-model', usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
     equityHistory: [], maxDrawdownPct: 0,
-    tradingPaused: false, pauseReason: '',
+    tradingPaused: false, pauseReason: '', flattenPending: false,
     aiHealth: { consecutiveFailures: 0, lastError: '', creditExhausted: false, lastSuccessAt: '' },
   };
 }
@@ -139,8 +139,16 @@ async function main() {
     const badConfirm = await request(port, '/kill-switch', {
       auth: 'operator:correct-horse', method: 'POST', body: 'confirm=' + encodeURIComponent('flatten'),
     });
-    assert.equal(badConfirm.status, 303, 'a bad confirmation still redirects, quietly doing nothing');
+    assert.equal(badConfirm.status, 303, 'a bad confirmation still redirects');
     assert.deepEqual(killSwitchCalls, [], 'a lowercase or missing confirmation does not fire the kill switch');
+    assert.equal(
+      badConfirm.headers.location, '/?notice=flatten-unconfirmed',
+      'a rejected confirmation says so instead of looking like it worked',
+    );
+    const unconfirmedNotice = await request(port, '/?notice=flatten-unconfirmed', { auth: 'operator:correct-horse' });
+    assert.ok(unconfirmedNotice.body.includes('Nothing was sold'), 'the notice renders on the page');
+    const noNotice = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(!noNotice.body.includes('Nothing was sold'), 'the notice does not stick around after a reload');
 
     const goodConfirm = await request(port, '/kill-switch', {
       auth: 'operator:correct-horse', method: 'POST',
@@ -163,6 +171,53 @@ async function main() {
     assert.ok(pausedPage.body.includes('Trading paused'));
     assert.ok(pausedPage.body.includes('Resume trading'));
     assert.ok(!pausedPage.body.includes('Flatten &amp; pause'), 'the flatten form is hidden while already paused');
+    assert.ok(!pausedPage.body.includes('not done yet'), 'a plain pause is not reported as a flatten in progress');
+
+    // A fired kill switch pauses instantly but only sells on the next cycle. The
+    // page has to say that, or an operator reads "paused" with a full book as done.
+    snapshot = {
+      ...emptySnapshot(),
+      tradingPaused: true,
+      pauseReason: 'operator triggered via dashboard',
+      flattenPending: true,
+      positions: [{
+        pair: 'BTC/USD', entryPrice: 100, currentPrice: 110, qty: 1, costBasisUsd: 100,
+        stopLoss: 90, takeProfit: 130, alertPrice: null, origin: 'bot', sector: 'l1', openedAt: new Date().toISOString(),
+      }],
+    };
+    const flattening = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(flattening.body.includes('Flattening — not done yet'), 'a pending flatten is called out');
+    assert.ok(flattening.body.includes('1 position(s) are still open'), 'it names how much is still exposed');
+
+    // Money is money at two decimals; only per-unit prices carry sub-cent digits.
+    snapshot = {
+      ...emptySnapshot(),
+      account: { totalUsd: 0.5, cashUsd: 0.5, tradableUsd: 0, stakedUsd: 0, asOf: new Date().toISOString() },
+      positions: [{
+        pair: 'PEPE/USD', entryPrice: 0.00002145, currentPrice: 0.0000233, qty: 1000, costBasisUsd: 21.45,
+        stopLoss: 0.0000195, takeProfit: 0.0000301, alertPrice: null, origin: 'bot', sector: 'meme', openedAt: new Date().toISOString(),
+      }],
+    };
+    const formatting = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(formatting.body.includes('$0.50'), 'a sub-dollar balance is still shown in cents');
+    assert.ok(!formatting.body.includes('$0.500000'), 'balances never grow six decimals');
+    assert.ok(formatting.body.includes('$0.000021'), 'a sub-cent price keeps the digits that distinguish it');
+
+    // Long unbroken text must wrap rather than widening the whole page.
+    snapshot = {
+      ...emptySnapshot(),
+      chat: [{ id: '1', from: 'operator', text: 'x'.repeat(2000), at: new Date().toISOString() }],
+    };
+    const longChat = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(longChat.body.includes('overflow-wrap: anywhere'), 'chat text and table cells wrap mid-word');
+
+    // The old unconditional meta refresh threw away whatever was typed, including
+    // a half-typed FLATTEN. Scripted clients reschedule instead; no-script ones keep it.
+    assert.ok(
+      !longChat.body.includes('<meta http-equiv="refresh"') ||
+      /<noscript><meta http-equiv="refresh"/.test(longChat.body),
+      'any meta refresh left is inside <noscript>',
+    );
 
     // The trade ledger is downloadable as CSV, gated by the same auth as everything else.
     const noAuthExport = await request(port, '/export/trades.csv');

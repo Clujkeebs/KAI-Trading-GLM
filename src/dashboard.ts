@@ -95,6 +95,10 @@ export interface DashboardSnapshot {
   tradingPaused: boolean;
   /** Why trading is paused, shown next to the resume control. */
   pauseReason: string;
+  /** True between firing the kill switch and the next cycle actually selling.
+   * The pause is instant, the sells are not, and a page that showed positions
+   * still open under a "paused" banner read as though nothing had happened. */
+  flattenPending: boolean;
   /** Whether the model is actually answering — a bot whose every decision is a
    * fallback HOLD is broken, not cautious, and must not look healthy here. */
   aiHealth: {
@@ -145,10 +149,20 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
+/** Money: always cents, so account values and P/L line up down the page. */
 function fmtUsd(n: number): string {
   if (!Number.isFinite(n)) return '$n/a';
-  const abs = Math.abs(n);
-  return abs >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(6)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+/**
+ * A per-unit price, which is the one place sub-cent digits matter — a $0.000021
+ * token would otherwise print as $0.00 next to a stop at the same $0.00.
+ */
+function fmtPrice(n: number): string {
+  if (!Number.isFinite(n)) return '$n/a';
+  if (Math.abs(n) >= 1) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
 }
 
 function fmtPct(n: number): string {
@@ -282,12 +296,12 @@ function renderPositions(positions: DashboardPosition[]): string {
     return `<tr>
       <td>${escapeHtml(p.pair)} ${badge}</td>
       <td>${escapeHtml(p.sector)}</td>
-      <td>${fmtUsd(p.entryPrice)}</td>
-      <td>${fmtUsd(p.currentPrice)}</td>
+      <td>${fmtPrice(p.entryPrice)}</td>
+      <td>${fmtPrice(p.currentPrice)}</td>
       <td class="${pnl >= 0 ? 'pos' : 'neg'}">${fmtUsd(pnl)} (${fmtPct(pnlPct)})</td>
-      <td>${fmtUsd(p.stopLoss)}</td>
-      <td>${fmtUsd(p.takeProfit)}</td>
-      <td>${p.alertPrice === null ? '—' : fmtUsd(p.alertPrice)}</td>
+      <td>${fmtPrice(p.stopLoss)}</td>
+      <td>${fmtPrice(p.takeProfit)}</td>
+      <td>${p.alertPrice === null ? '—' : fmtPrice(p.alertPrice)}</td>
     </tr>`;
   }).join('');
   return `<table>
@@ -342,7 +356,10 @@ function renderEquitySparkline(points: DashboardEquityPoint[]): string {
     `<div class="muted" style="margin-top:4px;">${escapeHtml(points[0].at.slice(0, 16).replace('T', ' '))} → ${escapeHtml(points[points.length - 1].at.slice(0, 16).replace('T', ' '))} · ${fmtUsd(min)}–${fmtUsd(max)}</div>`;
 }
 
-function renderPage(snapshot: DashboardSnapshot): string {
+/** Notices raised by a redirect back to the page, so a rejected action says so. */
+type DashboardNotice = 'flatten-unconfirmed';
+
+function renderPage(snapshot: DashboardSnapshot, notice: DashboardNotice | null = null): string {
   const a = snapshot.account;
   const stance = snapshot.stance;
   return `<!doctype html>
@@ -350,7 +367,7 @@ function renderPage(snapshot: DashboardSnapshot): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60">
+<noscript><meta http-equiv="refresh" content="60"></noscript>
 <title>KAI Trading — Dashboard</title>
 <style>
   :root { color-scheme: dark; }
@@ -378,6 +395,8 @@ function renderPage(snapshot: DashboardSnapshot): string {
   .chat-operator { background: #1e293b; margin-left: auto; }
   .chat-ai { background: #131826; border: 1px solid #232b3d; }
   .chat-meta { font-size: 11px; color: #8891a3; margin-bottom: 4px; }
+  .chat-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  td { overflow-wrap: anywhere; }
   form { display: flex; gap: 8px; margin-top: 12px; }
   textarea { flex: 1; background: #0b0e14; border: 1px solid #232b3d; border-radius: 8px; color: #e6e9ef; padding: 10px; font-family: inherit; font-size: 13px; resize: vertical; min-height: 44px; }
   button { background: #4f46e5; color: white; border: none; border-radius: 8px; padding: 0 18px; font-size: 13px; cursor: pointer; }
@@ -402,6 +421,14 @@ ${snapshot.aiHealth?.creditExhausted
     : ''}
 
 ${snapshot.tradingPaused ? `<div class="banner-danger"><strong>Trading paused:</strong> ${escapeHtml(snapshot.pauseReason)} — no new positions will open until resumed.</div>` : ''}
+
+${snapshot.flattenPending
+  ? `<div class="banner-danger"><strong>Flattening — not done yet.</strong> ${snapshot.positions.length} position(s) are still open and will be sold at market on the next cycle. If you cannot wait, sell on Kraken directly.</div>`
+  : ''}
+
+${notice === 'flatten-unconfirmed'
+  ? `<div class="banner"><strong>Nothing was sold.</strong> The kill switch needs the word <strong>FLATTEN</strong> typed in the confirmation box.</div>`
+  : ''}
 
 ${snapshot.fundingRequest ? `<div class="banner"><strong>Funding request:</strong> ${fmtUsd(snapshot.fundingRequest.usd)} — ${escapeHtml(snapshot.fundingRequest.reasoning)} <span class="muted">(${escapeHtml(snapshot.fundingRequest.requestedAt)})</span></div>` : ''}
 
@@ -434,7 +461,9 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
   <h2>Controls</h2>
   <div class="danger-box">
   ${snapshot.tradingPaused
-    ? `<p>Trading is paused: ${escapeHtml(snapshot.pauseReason)}</p>
+    ? `<p>Trading is paused: ${escapeHtml(snapshot.pauseReason)}${
+        snapshot.flattenPending ? ' — the flatten order runs on the next cycle' : ''
+      }</p>
        <form method="POST" action="/resume"><button type="submit" class="btn-safe">Resume trading</button></form>`
     : `<p>Sells every open position at market right now and pauses new entries until you resume. Type <strong>FLATTEN</strong> to confirm.</p>
        <form method="POST" action="/kill-switch">
@@ -453,6 +482,29 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
     <button type="submit">Send</button>
   </form>
 </section>
+
+<div class="muted">Auto-refreshes every 60s, but not while you are typing.</div>
+<script>
+(function () {
+  var DELAY = 60000;
+  var timer = null;
+  function dirty() {
+    var fields = document.querySelectorAll('input, textarea');
+    for (var i = 0; i < fields.length; i++) if (fields[i].value.trim()) return true;
+    return false;
+  }
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      // A half-typed FLATTEN or an unsent message must survive the refresh.
+      if (dirty() || document.activeElement instanceof HTMLTextAreaElement) return schedule();
+      location.reload();
+    }, DELAY);
+  }
+  document.addEventListener('input', schedule);
+  schedule();
+})();
+</script>
 
 </body>
 </html>`;
@@ -525,7 +577,10 @@ export function startDashboard(options: DashboardOptions): http.Server {
       }
 
       if (url.pathname === '/' && req.method === 'GET') {
-        const html = renderPage(options.getSnapshot());
+        const notice = url.searchParams.get('notice') === 'flatten-unconfirmed'
+          ? 'flatten-unconfirmed'
+          : null;
+        const html = renderPage(options.getSnapshot(), notice);
         res.writeHead(200, {
           'Content-Type': 'text/html; charset=utf-8',
           'Cache-Control': 'no-store',
@@ -567,11 +622,14 @@ export function startDashboard(options: DashboardOptions): http.Server {
         const params = new URLSearchParams(body);
         // A typed confirmation, not just a click, so this can't fire from a stray
         // request or a form auto-resubmitted by the browser.
-        if (params.get('confirm') === 'FLATTEN') {
+        const confirmed = params.get('confirm') === 'FLATTEN';
+        if (confirmed) {
           const reason = (params.get('reason') || '').trim() || 'operator triggered via dashboard';
           options.onKillSwitch(reason);
+        } else {
+          console.warn('  [DASHBOARD] Kill switch not fired: confirmation text did not read FLATTEN');
         }
-        res.writeHead(303, { Location: '/' });
+        res.writeHead(303, { Location: confirmed ? '/' : '/?notice=flatten-unconfirmed' });
         res.end();
         return;
       }

@@ -4464,6 +4464,7 @@ async function main() {
           maxDrawdownPct: memory.maxDrawdownPct(),
           tradingPaused: memory.state.tradingPaused,
           pauseReason: memory.state.pauseReason,
+          flattenPending: memory.state.flattenRequested,
           aiHealth: {
             consecutiveFailures: ai.health.consecutiveFailures,
             lastError: ai.health.lastError,
