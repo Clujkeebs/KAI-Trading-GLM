@@ -1047,6 +1047,22 @@ console.log('correlation checks passed');
   assert.deepEqual(freeModelsFromCatalog({ data: [{ id: 'no/pricing' }] }), []);
   assert.deepEqual(freeModelsFromCatalog({ data: [{ id: 'bad', pricing: { prompt: 'free', completion: 'free' } }] }), [],
     'a non-numeric price is not treated as zero');
+
+  // The live free tier also lists image, music and video models. Queueing one as
+  // the trading brain burns a fallback attempt on something that cannot reply.
+  const mixed = {
+    data: [
+      { id: 'text/one', pricing: { prompt: '0', completion: '0' }, context_length: 100,
+        architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+      { id: 'image/one', pricing: { prompt: '0', completion: '0' }, context_length: 900000,
+        architecture: { input_modalities: ['text'], output_modalities: ['image'] } },
+      { id: 'audio/one', pricing: { prompt: '0', completion: '0' }, context_length: 800000,
+        architecture: { modality: 'text->audio' } },
+      { id: 'legacy/one', pricing: { prompt: '0', completion: '0' }, context_length: 50 },
+    ],
+  };
+  assert.deepEqual(freeModelsFromCatalog(mixed), ['text/one', 'legacy/one'],
+    'non-text outputs are dropped; an entry that declares nothing is still allowed');
 }
 console.log('free-model discovery checks passed');
 

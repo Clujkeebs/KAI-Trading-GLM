@@ -3151,6 +3151,10 @@ export function normalizeTrimFraction(value: unknown): number {
 
 function normalizeAiDecision(json: any, salvage = false): AiDecision {
   const verdict = String(json?.verdict || '').toUpperCase();
+  // A HOLD the model never said is indistinguishable in the log from one it did,
+  // so a reply whose schema drifted has to announce itself.
+  if (verdict !== 'BUY' && verdict !== 'SELL' && verdict !== 'HOLD')
+    console.warn(`  [AI] Reply carried no usable verdict (${verdict ? `"${verdict}"` : 'field missing'}); treating it as HOLD`);
   const confidenceValue = Number(json?.confidence);
   const confidence = Number.isFinite(confidenceValue)
     ? Math.min(10, Math.max(1, Math.round(confidenceValue)))
@@ -3304,6 +3308,10 @@ export function affordableTokensFromError(error: unknown): number | null {
  *
  * "Best" is approximated by context length, which correlates with capability
  * well enough to order candidates and is the only quality signal in the payload.
+ *
+ * Price is not the only filter that matters: the live catalog's free tier also
+ * contains music, image and video models, and queueing one as the trading brain
+ * burns an attempt on something that can never answer with JSON.
  */
 export function freeModelsFromCatalog(payload: unknown, limit = 8): string[] {
   const data = (payload as any)?.data;
@@ -3316,6 +3324,7 @@ export function freeModelsFromCatalog(payload: unknown, limit = 8): string[] {
     .filter(entry => {
       const id = typeof entry?.id === 'string' ? entry.id : '';
       if (!id) return false;
+      if (!emitsText(entry?.architecture)) return false;
       const pricing = entry?.pricing;
       // Both sides must be free: a model with free prompts but paid completions
       // still fails on a spent balance, which is the whole case being handled.
@@ -3324,6 +3333,25 @@ export function freeModelsFromCatalog(payload: unknown, limit = 8): string[] {
     .sort((a, b) => (Number(b?.context_length) || 0) - (Number(a?.context_length) || 0))
     .map(entry => String(entry.id))
     .slice(0, Math.max(0, limit));
+}
+
+/**
+ * True when a catalog entry both takes and returns text.
+ *
+ * The shape varies across providers, so an entry that says nothing about its
+ * modalities is assumed usable rather than dropped — only an explicit
+ * non-text output disqualifies it.
+ */
+function emitsText(architecture: unknown): boolean {
+  const arch = architecture as any;
+  if (!arch || typeof arch !== 'object') return true;
+  const outputs = Array.isArray(arch.output_modalities)
+    ? arch.output_modalities.map((m: unknown) => String(m).toLowerCase())
+    : null;
+  if (outputs && outputs.length > 0) return outputs.includes('text');
+  const modality = typeof arch.modality === 'string' ? arch.modality.toLowerCase() : '';
+  if (modality.includes('->')) return modality.split('->')[1].split('+').includes('text');
+  return true;
 }
 
 /** True when the provider stopped generating because the token budget ran out. */
@@ -4237,7 +4265,10 @@ export async function runPreflight(
       const minimum = await exchange.getMinimumTradeUsd(pair, price);
       if (minimum === null) continue;
       if (!cheapest || minimum < cheapest.minimum) cheapest = { pair, minimum };
-      const free = exchange.getAvailableCash(pair);
+      // Paper mode sizes orders from simulated cash, so measuring the real (often
+      // empty) exchange balance here reported "no new entry can be funded" while
+      // the same cycle went on to spend hundreds of simulated dollars.
+      const free = exchange.paper ? mem.paperCash() : exchange.getAvailableCash(pair);
       if (free === null) continue;
       quoteCash = Math.max(quoteCash, free);
       const spendable = free * (1 - CONFIG.feeReservePct);
@@ -4382,15 +4413,17 @@ async function main() {
   const ai = new AiBrain(memory);
 
   const dashboardPassword = process.env.DASHBOARD_PASSWORD;
+  let dashboardServer: ReturnType<typeof startDashboard> | null = null;
   if (dashboardPassword) {
     const dashboardPort = envInteger('PORT', 8080, 1);
     const dashboardUsername = process.env.DASHBOARD_USERNAME || 'operator';
-    startDashboard({
+    dashboardServer = startDashboard({
       port: dashboardPort,
       username: dashboardUsername,
       password: dashboardPassword,
       maxLoginAttempts: envInteger('DASHBOARD_MAX_LOGIN_ATTEMPTS', 8, 1),
       lockoutMinutes: envInteger('DASHBOARD_LOCKOUT_MINUTES', 15, 1),
+      trustedProxyHops: envInteger('DASHBOARD_TRUSTED_PROXY_HOPS', 1, 0),
       getTradesCsv: () => memory.readTradesCsv(),
       getSnapshot: (): DashboardSnapshot => {
         const snap = memory.state.lastAccountSnapshot;
@@ -4431,6 +4464,7 @@ async function main() {
           maxDrawdownPct: memory.maxDrawdownPct(),
           tradingPaused: memory.state.tradingPaused,
           pauseReason: memory.state.pauseReason,
+          flattenPending: memory.state.flattenRequested,
           aiHealth: {
             consecutiveFailures: ai.health.consecutiveFailures,
             lastError: ai.health.lastError,
@@ -4530,6 +4564,9 @@ async function main() {
   }
   memory.savePositions();
   memory.saveState();
+  // The listening socket otherwise holds the event loop open, so a single-cycle
+  // run printed this line and then hung forever instead of exiting.
+  dashboardServer?.close();
   console.log('[SHUTDOWN] State saved; exiting.');
 }
 

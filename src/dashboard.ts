@@ -95,6 +95,10 @@ export interface DashboardSnapshot {
   tradingPaused: boolean;
   /** Why trading is paused, shown next to the resume control. */
   pauseReason: string;
+  /** True between firing the kill switch and the next cycle actually selling.
+   * The pause is instant, the sells are not, and a page that showed positions
+   * still open under a "paused" banner read as though nothing had happened. */
+  flattenPending: boolean;
   /** Whether the model is actually answering — a bot whose every decision is a
    * fallback HOLD is broken, not cautious, and must not look healthy here. */
   aiHealth: {
@@ -121,9 +125,18 @@ export interface DashboardOptions {
   maxLoginAttempts?: number;
   /** How long a lockout lasts, in minutes (default 15). */
   lockoutMinutes?: number;
+  /**
+   * Proxy hops in front of this process (default 1, as on Railway). The client
+   * address is read that many entries from the right of `X-Forwarded-For`, so a
+   * forged header cannot choose which bucket a request is throttled under.
+   * `0` ignores the header entirely and uses the socket address.
+   */
+  trustedProxyHops?: number;
 }
 
 const MAX_BODY_BYTES = 10_000;
+/** Server-side cap on an operator message; the textarea's maxlength is only advisory. */
+const MAX_MESSAGE_CHARS = 2_000;
 /** Bound on tracked addresses, so a flood of forged source IPs can't grow this forever. */
 const MAX_TRACKED_ADDRESSES = 500;
 
@@ -136,10 +149,22 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
+/** Money: always cents, so account values and P/L line up down the page. */
 function fmtUsd(n: number): string {
   if (!Number.isFinite(n)) return '$n/a';
+  return `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
+}
+
+/**
+ * A per-unit price, which is the one place sub-cent digits matter — a $0.000021
+ * token would otherwise print as $0.00 next to a stop at the same $0.00.
+ */
+function fmtPrice(n: number): string {
+  if (!Number.isFinite(n)) return '$n/a';
+  const sign = n < 0 ? '-' : '';
   const abs = Math.abs(n);
-  return abs >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(6)}`;
+  if (abs >= 1) return `${sign}$${abs.toFixed(2)}`;
+  return `${sign}$${abs.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
 }
 
 function fmtPct(n: number): string {
@@ -175,6 +200,12 @@ function checkAuth(req: http.IncomingMessage, username: string, password: string
   return credentialsMatch(user, username) && credentialsMatch(pass, password);
 }
 
+/** True when the request carried credentials at all, as opposed to being anonymous. */
+function hasCredentials(req: http.IncomingMessage): boolean {
+  const header = req.headers.authorization;
+  return typeof header === 'string' && header.startsWith('Basic ');
+}
+
 function requireAuth(res: http.ServerResponse) {
   res.writeHead(401, {
     'WWW-Authenticate': 'Basic realm="dashboard"',
@@ -183,13 +214,46 @@ function requireAuth(res: http.ServerResponse) {
   res.end('Authentication required.');
 }
 
-/** Railway terminates TLS in front of this process, so the real client sits behind
- * X-Forwarded-For; fall back to the socket address for a direct connection (e.g. tests). */
-function clientAddress(req: http.IncomingMessage): string {
+/**
+ * The address a request is throttled under.
+ *
+ * Railway terminates TLS in front of this process, so the real client sits behind
+ * `X-Forwarded-For` — but the header is entirely client-supplied except for the
+ * entries the trusted proxies appended. Reading the leftmost value let a caller
+ * pick its own bucket: rotating a forged header gave unlimited password guesses,
+ * and naming the operator's IP locked the operator out of the kill switch. Only
+ * the entry a trusted hop wrote is used, and the socket address is the fallback.
+ */
+export function clientAddress(req: http.IncomingMessage, trustedProxyHops = 1): string {
+  const socketAddress = req.socket.remoteAddress || 'unknown';
+  if (trustedProxyHops <= 0) return socketAddress;
   const forwarded = req.headers['x-forwarded-for'];
-  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  const ip = first?.split(',')[0]?.trim();
-  return ip || req.socket.remoteAddress || 'unknown';
+  const chain = (Array.isArray(forwarded) ? forwarded.join(',') : forwarded ?? '')
+    .split(',').map(part => part.trim()).filter(Boolean);
+  if (chain.length === 0) return socketAddress;
+  const index = chain.length - trustedProxyHops;
+  return chain[Math.max(0, index)] || socketAddress;
+}
+
+/**
+ * True when a state-changing request came from another site.
+ *
+ * Basic Auth credentials are attached by the browser, not by a token this page
+ * issued, so nothing about a POST proves the operator meant to send it. A
+ * cross-site form can otherwise fire `/kill-switch` and liquidate the account.
+ */
+export function isCrossSiteRequest(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  const referer = req.headers.referer;
+  const source = typeof origin === 'string' && origin && origin !== 'null' ? origin : referer;
+  if (typeof source !== 'string' || !source) return false;
+  const host = req.headers.host;
+  if (!host) return true;
+  try {
+    return new URL(source).host !== host;
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -234,12 +298,12 @@ function renderPositions(positions: DashboardPosition[]): string {
     return `<tr>
       <td>${escapeHtml(p.pair)} ${badge}</td>
       <td>${escapeHtml(p.sector)}</td>
-      <td>${fmtUsd(p.entryPrice)}</td>
-      <td>${fmtUsd(p.currentPrice)}</td>
+      <td>${fmtPrice(p.entryPrice)}</td>
+      <td>${fmtPrice(p.currentPrice)}</td>
       <td class="${pnl >= 0 ? 'pos' : 'neg'}">${fmtUsd(pnl)} (${fmtPct(pnlPct)})</td>
-      <td>${fmtUsd(p.stopLoss)}</td>
-      <td>${fmtUsd(p.takeProfit)}</td>
-      <td>${p.alertPrice === null ? '—' : fmtUsd(p.alertPrice)}</td>
+      <td>${fmtPrice(p.stopLoss)}</td>
+      <td>${fmtPrice(p.takeProfit)}</td>
+      <td>${p.alertPrice === null ? '—' : fmtPrice(p.alertPrice)}</td>
     </tr>`;
   }).join('');
   return `<table>
@@ -294,7 +358,10 @@ function renderEquitySparkline(points: DashboardEquityPoint[]): string {
     `<div class="muted" style="margin-top:4px;">${escapeHtml(points[0].at.slice(0, 16).replace('T', ' '))} → ${escapeHtml(points[points.length - 1].at.slice(0, 16).replace('T', ' '))} · ${fmtUsd(min)}–${fmtUsd(max)}</div>`;
 }
 
-function renderPage(snapshot: DashboardSnapshot): string {
+/** Notices raised by a redirect back to the page, so a rejected action says so. */
+type DashboardNotice = 'flatten-unconfirmed';
+
+function renderPage(snapshot: DashboardSnapshot, notice: DashboardNotice | null = null): string {
   const a = snapshot.account;
   const stance = snapshot.stance;
   return `<!doctype html>
@@ -302,7 +369,7 @@ function renderPage(snapshot: DashboardSnapshot): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60">
+<noscript><meta http-equiv="refresh" content="60"></noscript>
 <title>KAI Trading — Dashboard</title>
 <style>
   :root { color-scheme: dark; }
@@ -330,6 +397,8 @@ function renderPage(snapshot: DashboardSnapshot): string {
   .chat-operator { background: #1e293b; margin-left: auto; }
   .chat-ai { background: #131826; border: 1px solid #232b3d; }
   .chat-meta { font-size: 11px; color: #8891a3; margin-bottom: 4px; }
+  .chat-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  td { overflow-wrap: anywhere; }
   form { display: flex; gap: 8px; margin-top: 12px; }
   textarea { flex: 1; background: #0b0e14; border: 1px solid #232b3d; border-radius: 8px; color: #e6e9ef; padding: 10px; font-family: inherit; font-size: 13px; resize: vertical; min-height: 44px; }
   button { background: #4f46e5; color: white; border: none; border-radius: 8px; padding: 0 18px; font-size: 13px; cursor: pointer; }
@@ -354,6 +423,14 @@ ${snapshot.aiHealth?.creditExhausted
     : ''}
 
 ${snapshot.tradingPaused ? `<div class="banner-danger"><strong>Trading paused:</strong> ${escapeHtml(snapshot.pauseReason)} — no new positions will open until resumed.</div>` : ''}
+
+${snapshot.flattenPending
+  ? `<div class="banner-danger"><strong>Flattening — not done yet.</strong> ${snapshot.positions.length} position(s) are still open and will be sold at market on the next cycle. If you cannot wait, sell on Kraken directly.</div>`
+  : ''}
+
+${notice === 'flatten-unconfirmed'
+  ? `<div class="banner"><strong>Nothing was sold.</strong> The kill switch needs the word <strong>FLATTEN</strong> typed in the confirmation box.</div>`
+  : ''}
 
 ${snapshot.fundingRequest ? `<div class="banner"><strong>Funding request:</strong> ${fmtUsd(snapshot.fundingRequest.usd)} — ${escapeHtml(snapshot.fundingRequest.reasoning)} <span class="muted">(${escapeHtml(snapshot.fundingRequest.requestedAt)})</span></div>` : ''}
 
@@ -386,7 +463,9 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
   <h2>Controls</h2>
   <div class="danger-box">
   ${snapshot.tradingPaused
-    ? `<p>Trading is paused: ${escapeHtml(snapshot.pauseReason)}</p>
+    ? `<p>Trading is paused: ${escapeHtml(snapshot.pauseReason)}${
+        snapshot.flattenPending ? ' — the flatten order runs on the next cycle' : ''
+      }</p>
        <form method="POST" action="/resume"><button type="submit" class="btn-safe">Resume trading</button></form>`
     : `<p>Sells every open position at market right now and pauses new entries until you resume. Type <strong>FLATTEN</strong> to confirm.</p>
        <form method="POST" action="/kill-switch">
@@ -405,6 +484,29 @@ ${stance ? `<section><h2>Latest stance</h2><div class="stance-box">
     <button type="submit">Send</button>
   </form>
 </section>
+
+<div class="muted">Auto-refreshes every 60s, but not while you are typing.</div>
+<script>
+(function () {
+  var DELAY = 60000;
+  var timer = null;
+  function dirty() {
+    var fields = document.querySelectorAll('input, textarea');
+    for (var i = 0; i < fields.length; i++) if (fields[i].value.trim()) return true;
+    return false;
+  }
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      // A half-typed FLATTEN or an unsent message must survive the refresh.
+      if (dirty() || document.activeElement instanceof HTMLTextAreaElement) return schedule();
+      location.reload();
+    }, DELAY);
+  }
+  document.addEventListener('input', schedule);
+  schedule();
+})();
+</script>
 
 </body>
 </html>`;
@@ -439,6 +541,7 @@ export function startDashboard(options: DashboardOptions): http.Server {
     Math.max(1, options.maxLoginAttempts ?? 8),
     Math.max(1, options.lockoutMinutes ?? 15) * 60_000,
   );
+  const trustedProxyHops = Math.max(0, options.trustedProxyHops ?? 1);
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -450,7 +553,7 @@ export function startDashboard(options: DashboardOptions): http.Server {
         return;
       }
 
-      const address = clientAddress(req);
+      const address = clientAddress(req, trustedProxyHops);
       const lockedFor = throttle.lockedForSeconds(address);
       if (lockedFor > 0) {
         res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': String(lockedFor) });
@@ -459,22 +562,40 @@ export function startDashboard(options: DashboardOptions): http.Server {
       }
 
       if (!checkAuth(req, options.username, options.password)) {
-        throttle.recordFailure(address);
+        // Only a wrong guess counts. Every browser and scanner opens with an
+        // anonymous request, and counting those locked the operator out of the
+        // kill switch with the right password in hand.
+        if (hasCredentials(req)) throttle.recordFailure(address);
         requireAuth(res);
         return;
       }
       throttle.recordSuccess(address);
 
+      if (req.method === 'POST' && isCrossSiteRequest(req)) {
+        console.warn(`  [DASHBOARD] Rejected cross-site POST to ${url.pathname} from ${String(req.headers.origin ?? req.headers.referer).slice(0, 120)}`);
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Cross-site requests are not accepted.');
+        return;
+      }
+
       if (url.pathname === '/' && req.method === 'GET') {
-        const html = renderPage(options.getSnapshot());
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        const notice = url.searchParams.get('notice') === 'flatten-unconfirmed'
+          ? 'flatten-unconfirmed'
+          : null;
+        const html = renderPage(options.getSnapshot(), notice);
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Frame-Options': 'DENY',
+          'Referrer-Policy': 'no-referrer',
+        });
         res.end(html);
         return;
       }
 
       if (url.pathname === '/api/state' && req.method === 'GET') {
         const body = JSON.stringify(options.getSnapshot());
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(body);
         return;
       }
@@ -491,7 +612,7 @@ export function startDashboard(options: DashboardOptions): http.Server {
       if (url.pathname === '/message' && req.method === 'POST') {
         const body = await readBody(req);
         const params = new URLSearchParams(body);
-        const text = (params.get('text') || '').trim();
+        const text = (params.get('text') || '').trim().slice(0, MAX_MESSAGE_CHARS);
         if (text) options.onOperatorMessage(text);
         res.writeHead(303, { Location: '/' });
         res.end();
@@ -503,11 +624,14 @@ export function startDashboard(options: DashboardOptions): http.Server {
         const params = new URLSearchParams(body);
         // A typed confirmation, not just a click, so this can't fire from a stray
         // request or a form auto-resubmitted by the browser.
-        if (params.get('confirm') === 'FLATTEN') {
+        const confirmed = params.get('confirm') === 'FLATTEN';
+        if (confirmed) {
           const reason = (params.get('reason') || '').trim() || 'operator triggered via dashboard';
           options.onKillSwitch(reason);
+        } else {
+          console.warn('  [DASHBOARD] Kill switch not fired: confirmation text did not read FLATTEN');
         }
-        res.writeHead(303, { Location: '/' });
+        res.writeHead(303, { Location: confirmed ? '/' : '/?notice=flatten-unconfirmed' });
         res.end();
         return;
       }

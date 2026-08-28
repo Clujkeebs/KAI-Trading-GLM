@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import * as http from 'node:http';
-import { startDashboard, DashboardSnapshot } from '../src/dashboard';
+import { startDashboard, DashboardSnapshot, clientAddress } from '../src/dashboard';
 
 function emptySnapshot(): DashboardSnapshot {
   return {
@@ -14,13 +14,14 @@ function emptySnapshot(): DashboardSnapshot {
     stance: null, fundingRequest: null, chat: [],
     model: 'test-model', usage: { calls: 0, promptTokens: 0, completionTokens: 0 },
     equityHistory: [], maxDrawdownPct: 0,
-    tradingPaused: false, pauseReason: '',
+    tradingPaused: false, pauseReason: '', flattenPending: false,
     aiHealth: { consecutiveFailures: 0, lastError: '', creditExhausted: false, lastSuccessAt: '' },
   };
 }
 
 function request(
-  port: number, path: string, options: { auth?: string; method?: string; body?: string } = {},
+  port: number, path: string,
+  options: { auth?: string; method?: string; body?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -28,6 +29,7 @@ function request(
         headers: {
           ...(options.auth ? { Authorization: `Basic ${Buffer.from(options.auth).toString('base64')}` } : {}),
           ...(options.body ? { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(options.body) } : {}),
+          ...(options.headers || {}),
         },
       },
       res => {
@@ -137,8 +139,16 @@ async function main() {
     const badConfirm = await request(port, '/kill-switch', {
       auth: 'operator:correct-horse', method: 'POST', body: 'confirm=' + encodeURIComponent('flatten'),
     });
-    assert.equal(badConfirm.status, 303, 'a bad confirmation still redirects, quietly doing nothing');
+    assert.equal(badConfirm.status, 303, 'a bad confirmation still redirects');
     assert.deepEqual(killSwitchCalls, [], 'a lowercase or missing confirmation does not fire the kill switch');
+    assert.equal(
+      badConfirm.headers.location, '/?notice=flatten-unconfirmed',
+      'a rejected confirmation says so instead of looking like it worked',
+    );
+    const unconfirmedNotice = await request(port, '/?notice=flatten-unconfirmed', { auth: 'operator:correct-horse' });
+    assert.ok(unconfirmedNotice.body.includes('Nothing was sold'), 'the notice renders on the page');
+    const noNotice = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(!noNotice.body.includes('Nothing was sold'), 'the notice does not stick around after a reload');
 
     const goodConfirm = await request(port, '/kill-switch', {
       auth: 'operator:correct-horse', method: 'POST',
@@ -161,6 +171,66 @@ async function main() {
     assert.ok(pausedPage.body.includes('Trading paused'));
     assert.ok(pausedPage.body.includes('Resume trading'));
     assert.ok(!pausedPage.body.includes('Flatten &amp; pause'), 'the flatten form is hidden while already paused');
+    assert.ok(!pausedPage.body.includes('not done yet'), 'a plain pause is not reported as a flatten in progress');
+
+    // A fired kill switch pauses instantly but only sells on the next cycle. The
+    // page has to say that, or an operator reads "paused" with a full book as done.
+    snapshot = {
+      ...emptySnapshot(),
+      tradingPaused: true,
+      pauseReason: 'operator triggered via dashboard',
+      flattenPending: true,
+      positions: [{
+        pair: 'BTC/USD', entryPrice: 100, currentPrice: 110, qty: 1, costBasisUsd: 100,
+        stopLoss: 90, takeProfit: 130, alertPrice: null, origin: 'bot', sector: 'l1', openedAt: new Date().toISOString(),
+      }],
+    };
+    const flattening = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(flattening.body.includes('Flattening — not done yet'), 'a pending flatten is called out');
+    assert.ok(flattening.body.includes('1 position(s) are still open'), 'it names how much is still exposed');
+
+    // Money is money at two decimals; only per-unit prices carry sub-cent digits.
+    snapshot = {
+      ...emptySnapshot(),
+      account: { totalUsd: 0.5, cashUsd: 0.5, tradableUsd: 0, stakedUsd: 0, asOf: new Date().toISOString() },
+      positions: [{
+        pair: 'PEPE/USD', entryPrice: 0.00002145, currentPrice: 0.0000233, qty: 1000, costBasisUsd: 21.45,
+        stopLoss: 0.0000195, takeProfit: 0.0000301, alertPrice: null, origin: 'bot', sector: 'meme', openedAt: new Date().toISOString(),
+      }],
+    };
+    const formatting = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(formatting.body.includes('$0.50'), 'a sub-dollar balance is still shown in cents');
+    assert.ok(!formatting.body.includes('$0.500000'), 'balances never grow six decimals');
+    assert.ok(formatting.body.includes('$0.000021'), 'a sub-cent price keeps the digits that distinguish it');
+
+    // A loss reads as -$1.50, not $-1.50.
+    snapshot = {
+      ...emptySnapshot(),
+      totalPnl: -1.5,
+      closedTrades: [{
+        pair: 'BTC/USD', pnlUsd: -1.5, pnlPct: -3, closedAt: new Date().toISOString(),
+        closeReason: 'stop', holdDays: 1,
+      }],
+    };
+    const negative = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(negative.body.includes('-$1.50'), 'the minus sign leads the amount');
+    assert.ok(!negative.body.includes('$-1.50'), 'the sign never sits between the dollar and the digits');
+
+    // Long unbroken text must wrap rather than widening the whole page.
+    snapshot = {
+      ...emptySnapshot(),
+      chat: [{ id: '1', from: 'operator', text: 'x'.repeat(2000), at: new Date().toISOString() }],
+    };
+    const longChat = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(longChat.body.includes('overflow-wrap: anywhere'), 'chat text and table cells wrap mid-word');
+
+    // The old unconditional meta refresh threw away whatever was typed, including
+    // a half-typed FLATTEN. Scripted clients reschedule instead; no-script ones keep it.
+    assert.ok(
+      !longChat.body.includes('<meta http-equiv="refresh"') ||
+      /<noscript><meta http-equiv="refresh"/.test(longChat.body),
+      'any meta refresh left is inside <noscript>',
+    );
 
     // The trade ledger is downloadable as CSV, gated by the same auth as everything else.
     const noAuthExport = await request(port, '/export/trades.csv');
@@ -202,6 +272,45 @@ async function main() {
     // An unknown route is a 404, not a silent 200.
     const missing = await request(port, '/nope', { auth: 'operator:correct-horse' });
     assert.equal(missing.status, 404);
+
+    // ── A page on another site cannot fire the kill switch ──────────────────
+    // Basic Auth credentials ride along automatically once the operator has a
+    // session, so any page they visit could otherwise flatten the book. Probed
+    // against this server before the check existed: 303, and the switch fired.
+    snapshot = emptySnapshot();
+    killSwitchCalls.length = 0;
+    const crossSite = await request(port, '/kill-switch', {
+      auth: 'operator:correct-horse', method: 'POST', body: 'confirm=FLATTEN&reason=csrf',
+      headers: { Origin: 'https://evil.example', Referer: 'https://evil.example/' },
+    });
+    assert.equal(crossSite.status, 403, 'a cross-site POST is refused');
+    assert.deepEqual(killSwitchCalls, [], 'and never reaches the callback');
+
+    // The dashboard's own forms are unaffected.
+    const sameSite = await request(port, '/resume', {
+      auth: 'operator:correct-horse', method: 'POST',
+      headers: { Origin: `http://127.0.0.1:${port}`, Referer: `http://127.0.0.1:${port}/` },
+    });
+    assert.equal(sameSite.status, 303, 'a same-origin post still works');
+
+    // Reads are not state changes, and the response is unreadable cross-origin.
+    const read = await request(port, '/', {
+      auth: 'operator:correct-horse', headers: { Referer: 'https://evil.example/' },
+    });
+    assert.equal(read.status, 200);
+    assert.equal(read.headers['x-frame-options'], 'DENY', 'the page is not embeddable');
+    assert.equal(read.headers['referrer-policy'], 'no-referrer');
+    assert.match(String(read.headers['cache-control']), /no-store/, 'a live-money view is not cached');
+
+    // ── The message limit is enforced on the server, not just the textarea ──
+    // Operator text goes into the model prompt and the state file; maxlength in
+    // the HTML is advisory and a direct POST ignored it.
+    messages.length = 0;
+    await request(port, '/message', {
+      auth: 'operator:correct-horse', method: 'POST', body: 'text=' + 'a'.repeat(5000),
+    });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].length, 2000, 'an oversized message is truncated rather than stored whole');
   } finally {
     server.close();
   }
@@ -225,6 +334,20 @@ async function main() {
       assert.equal(locked.status, 429, 'the correct password no longer works once the address is locked out');
       assert.ok(locked.headers['retry-after'], 'a locked response names when to retry');
 
+      // Rotating the forged front of X-Forwarded-For does not buy a fresh
+      // bucket: the address is read where the trusted proxy writes it, at the
+      // right. Reading the leftmost entry instead gave unlimited guesses.
+      for (let i = 0; i < 3; i++) {
+        const res = await request(tPort, '/', {
+          auth: 'operator:nope', headers: { 'X-Forwarded-For': `10.0.0.${i}, 198.51.100.7` },
+        });
+        assert.equal(res.status, 401, `proxied attempt ${i + 1} is a plain auth failure`);
+      }
+      const forged = await request(tPort, '/', {
+        auth: 'operator:correct-horse', headers: { 'X-Forwarded-For': '10.0.0.99, 198.51.100.7' },
+      });
+      assert.equal(forged.status, 429, 'all the guesses landed in the real client\'s bucket');
+
       // /health stays reachable throughout — it never touches auth or the throttle.
       const health = await request(tPort, '/health');
       assert.equal(health.status, 200);
@@ -244,6 +367,13 @@ async function main() {
     await new Promise<void>(resolve => resettable.once('listening', resolve));
     const rPort = (resettable.address() as any).port;
     try {
+      // Anonymous requests must not consume attempts: every browser and every
+      // internet scanner opens with one, and counting them locked the operator
+      // out of the kill switch while holding the right password.
+      for (let i = 0; i < 6; i++) await request(rPort, '/');
+      const afterScans = await request(rPort, '/', { auth: 'operator:correct-horse' });
+      assert.equal(afterScans.status, 200, 'credential-less requests do not count toward the lockout');
+
       await request(rPort, '/', { auth: 'operator:nope' });
       await request(rPort, '/', { auth: 'operator:nope' });
       const ok = await request(rPort, '/', { auth: 'operator:correct-horse' });
@@ -256,6 +386,23 @@ async function main() {
     } finally {
       resettable.close();
     }
+  }
+
+  // ── Client address selection, unit level ──────────────────────────────────
+  {
+    const req = (forwarded?: string, remote = '10.0.0.1') => ({
+      headers: forwarded === undefined ? {} : { 'x-forwarded-for': forwarded },
+      socket: { remoteAddress: remote },
+    }) as any;
+
+    assert.equal(clientAddress(req('203.0.113.9, 172.16.0.1')), '172.16.0.1',
+      'one trusted hop reads the entry the proxy itself wrote');
+    assert.equal(clientAddress(req('203.0.113.9, 172.16.0.1'), 2), '203.0.113.9');
+    assert.equal(clientAddress(req('203.0.113.9'), 0), '10.0.0.1',
+      'zero hops ignores the header entirely');
+    assert.equal(clientAddress(req(undefined)), '10.0.0.1', 'no header falls back to the socket');
+    assert.equal(clientAddress(req('   ')), '10.0.0.1', 'a junk header falls back to the socket');
+    assert.equal(clientAddress(req('a, b, c'), 9), 'a', 'asking for more hops than exist is clamped');
   }
 
   console.log('dashboard checks passed');
