@@ -203,6 +203,19 @@ async function main() {
     assert.ok(!formatting.body.includes('$0.500000'), 'balances never grow six decimals');
     assert.ok(formatting.body.includes('$0.000021'), 'a sub-cent price keeps the digits that distinguish it');
 
+    // A loss reads as -$1.50, not $-1.50.
+    snapshot = {
+      ...emptySnapshot(),
+      totalPnl: -1.5,
+      closedTrades: [{
+        pair: 'BTC/USD', pnlUsd: -1.5, pnlPct: -3, closedAt: new Date().toISOString(),
+        closeReason: 'stop', holdDays: 1,
+      }],
+    };
+    const negative = await request(port, '/', { auth: 'operator:correct-horse' });
+    assert.ok(negative.body.includes('-$1.50'), 'the minus sign leads the amount');
+    assert.ok(!negative.body.includes('$-1.50'), 'the sign never sits between the dollar and the digits');
+
     // Long unbroken text must wrap rather than widening the whole page.
     snapshot = {
       ...emptySnapshot(),

@@ -152,7 +152,7 @@ function escapeHtml(value: unknown): string {
 /** Money: always cents, so account values and P/L line up down the page. */
 function fmtUsd(n: number): string {
   if (!Number.isFinite(n)) return '$n/a';
-  return `$${n.toFixed(2)}`;
+  return `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
 }
 
 /**
@@ -161,8 +161,10 @@ function fmtUsd(n: number): string {
  */
 function fmtPrice(n: number): string {
   if (!Number.isFinite(n)) return '$n/a';
-  if (Math.abs(n) >= 1) return `$${n.toFixed(2)}`;
-  return `$${n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(n);
+  if (abs >= 1) return `${sign}$${abs.toFixed(2)}`;
+  return `${sign}$${abs.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
 }
 
 function fmtPct(n: number): string {
