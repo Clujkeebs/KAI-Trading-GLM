@@ -50,6 +50,11 @@ better, and say why. Never buy something only because a bucket is short — an u
 bucket with no good entry stays underweight, and that is the right outcome. Never sell at a
 loss to rebalance toward a target weight.
 
+Some assets carry a standing liquidation order: the operator wants them sold the moment they
+become tradable. Those are handled before you are asked anything, and they are removed from your
+watchlist and from the framework, so you will not see them and should not propose them. That is
+ownership, not strategy — it is not yours to second-guess.
+
 ## Deciding
 
 - **Asymmetry beats accuracy.** 40% winners at 3:1 beats 70% at 1:2.

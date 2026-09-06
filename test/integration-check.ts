@@ -121,6 +121,7 @@ async function main() {
     Exchange, Memory, AiBrain, setConfig, loadConfig, runPreflight, reportPreflight,
     approveReservedSale, remainingSellAllowance, parseSellAllowances,
     runCycle, STRATEGY_PAIRS, isStrategyPair, allocationDrift,
+    liquidateOnUnstake, activeStrategyPairs,
   } = bot as any;
   setConfig(loadConfig());
 
@@ -403,6 +404,84 @@ async function main() {
     assert.ok(after.tradableUsd > 900, `unstaked SOL becomes spendable, got ${after.tradableUsd}`);
     assert.ok((after.lockedUsd.SOL ?? 0) === 0, 'and is no longer locked');
     console.log('  nothing reserved: unstaked SOL becomes ordinary tradable capital');
+    process.env.EXCLUDED_ASSETS = priorExcluded ?? '';
+    setConfig(loadConfig());
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 3c. The standing liquidation order: "sell my AVAX the second it is unstaked".
+  // ════════════════════════════════════════════════════════════════════════
+  {
+    const priorExcluded = process.env.EXCLUDED_ASSETS;
+    process.env.EXCLUDED_ASSETS = '';
+    process.env.LIQUIDATE_ON_UNSTAKE = 'AVAX';
+    process.env.PAPER_MODE = 'false';
+    setConfig(loadConfig());
+
+    // ── While it is STAKED, nothing happens. No order, no noise. ─────────────
+    {
+      const fake = fresh();
+      fake.balance = {
+        USD: { free: 0.01, used: 0, total: 0.01 },
+        'AVAX.B': { free: 9.38, used: 0, total: 9.38 },
+      };
+      const exchange = new Exchange('k', 's', false);
+      const mem = new Memory();
+      await exchange.getPortfolioValue(mem);
+      await liquidateOnUnstake(exchange, mem);
+      assert.equal(fake.orders.length, 0, 'a staked balance triggers no order');
+      console.log('  liquidation order: staked AVAX left alone, no order placed');
+    }
+
+    // ── The moment it is UNSTAKED, it goes — in full, in one cycle. ──────────
+    {
+      const fake = fresh();
+      fake.balance = {
+        USD: { free: 0.01, used: 0, total: 0.01 },
+        AVAX: { free: 9.38, used: 0, total: 9.38 },   // unstaked overnight
+      };
+      const exchange = new Exchange('k', 's', false);
+      const mem = new Memory();
+      await exchange.getPortfolioValue(mem);
+      const sold = await liquidateOnUnstake(exchange, mem);
+      assert.ok(sold, 'an unstaked balance is liquidated');
+      assert.equal(fake.orders.length, 1, 'exactly one order');
+      assert.equal(fake.orders[0].side, 'sell');
+      assert.equal(fake.orders[0].pair, 'AVAX/USD');
+      assert.ok(Math.abs(fake.orders[0].amount - 9.38) < 1e-6,
+        `the WHOLE balance goes, got ${fake.orders[0].amount}`);
+      assert.ok((fake.balance.AVAX?.total ?? 0) < 1e-6, 'nothing is left behind');
+      console.log('  liquidation order: unstaked AVAX sold in full on the first cycle');
+    }
+
+    // ── Dust below the exchange minimum cannot be sold, and says so. ─────────
+    {
+      const fake = fresh();
+      fake.balance = { USD: { free: 0.01, used: 0, total: 0.01 }, AVAX: { free: 0.01, used: 0, total: 0.01 } };
+      const exchange = new Exchange('k', 's', false);
+      await exchange.getPortfolioValue(new Memory());
+      const sold = await liquidateOnUnstake(exchange, new Memory());
+      assert.equal(sold, false);
+      assert.equal(fake.orders.length, 0, 'no doomed order is sent for $1 of dust');
+      console.log('  liquidation order: sub-minimum dust reported, not thrown at the exchange');
+    }
+
+    // ── It must never be BOUGHT: not by the scan, not by the framework. ──────
+    {
+      const fake = fresh();
+      fake.balance = { USD: { free: 500, used: 0, total: 500 } };
+      const exchange = new Exchange('k', 's', false);
+      const universe = await exchange.getScanUniverse('auto', []);
+      assert.ok(!universe.includes('AVAX/USD'),
+        'an asset under a standing sell order is never a buy candidate');
+      assert.ok(universe.includes('SOL/USD'), 'but its bucket-mates still are');
+      assert.equal(isStrategyPair('AVAX/USD'), false, 'and it leaves the framework');
+      assert.equal(isStrategyPair('SOL/USD'), true);
+      assert.ok(!activeStrategyPairs().includes('AVAX/USD'));
+      console.log('  liquidation order: AVAX removed from the scan and the framework');
+    }
+
+    process.env.LIQUIDATE_ON_UNSTAKE = '';
     process.env.EXCLUDED_ASSETS = priorExcluded ?? '';
     setConfig(loadConfig());
   }

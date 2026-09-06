@@ -63,6 +63,7 @@ All settings live in `.env` (see `.env.example`):
 - `DAILY_MOVERS_COUNT` — liquid daily gainers and losers forced into Stage 2 (default `3` each)
 - `SLEEPER_COUNT` — quietest liquid markets forced into full TA every cycle (default `3`, `0` disables)
 - `AI_WEB_SEARCH` — enable the optional OpenRouter `:online` loser news check before a mover decision (default `true`; blank or false disables it)
+- `LIQUIDATE_ON_UNSTAKE` — assets sold in full as soon as they become tradable, e.g. `AVAX`; also barred from the scan and the framework
 - `STRATEGY_ALLOCATION` — bias the scan and AI budget toward the operator's target allocation (default `true`)
 - `RESERVED_SELL_ALLOWANCE_USD` — bounded lifetime sell allowances against reserved holdings, as `ASSET:USD` pairs (e.g. `SOL:500`); blank keeps the reserved boundary absolute
 - `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
@@ -221,6 +222,21 @@ and what is not locked on the exchange. That last one is usually the binding con
 Kraken will not sell a staked balance through a spot order, so an allowance against a fully
 staked holding raises nothing until the operator unstakes it. Both numbers are stated in the
 prompt, and every trim to a request is logged with its reason.
+
+### Standing liquidation orders
+
+`LIQUIDATE_ON_UNSTAKE` names assets to sell in full the instant they become freely tradable. It is
+a **hard rule**, deliberately unlike everything else here: the AI is not consulted and cannot argue
+to keep the position. It runs at the top of the cycle, before reconciliation is reviewed, before
+the stance is set — a liquidation that waits for a decision budget is not "the second it unstakes".
+
+A tracked position exits through the normal path so its P/L is booked into the trade history;
+any remaining free balance is then swept. Listed assets are also stripped from the scan universe
+and from the allocation framework's eligible names, so the bot can never buy something it is under
+orders to sell, and a holding on its way out never counts toward its bucket's target. Staked
+balances are invisible to it, so nothing happens until the operator actually unstakes. Free
+balance below the exchange minimum cannot be sold and is reported plainly rather than retried
+into an order Kraken would reject.
 
 ### Allocation framework
 

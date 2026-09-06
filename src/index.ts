@@ -347,6 +347,11 @@ type TradingConfig = {
   reservedSellAllowanceUsd: Map<string, number>;
   /** Whether the allocation framework is shown to the model at all. */
   strategyAllocation: boolean;
+  /**
+   * Assets to sell in full the moment any of them becomes freely tradable.
+   * A standing operator order, not a trading opinion — the AI is not consulted.
+   */
+  liquidateOnUnstake: Set<string>;
   /** Drawdown, in R, at which a position wakes the model for a decision. */
   alertAtR: number;
   /** Whether the model may add to an open position when it reviews one. */
@@ -592,6 +597,10 @@ function loadConfig(): TradingConfig {
     ),
     reservedSellAllowanceUsd: parseSellAllowances(process.env.RESERVED_SELL_ALLOWANCE_USD),
     strategyAllocation: envBoolean('STRATEGY_ALLOCATION', true),
+    liquidateOnUnstake: new Set(
+      (process.env.LIQUIDATE_ON_UNSTAKE || '')
+        .split(',').map(entry => entry.trim()).filter(Boolean).map(normalizeAsset),
+    ),
     alertAtR: envNumber('ALERT_AT_R', 0.5, 0, 5),
     allowAddOns: envBoolean('ALLOW_AI_ADD_ONS', true),
     topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
@@ -748,14 +757,50 @@ export const STRATEGY_ASSETS = new Set(
 /** The USD pairs the framework wants watched. Unlisted ones are dropped later. */
 export const STRATEGY_PAIRS = [...STRATEGY_ASSETS].map(asset => `${asset}/USD`);
 
+/**
+ * The framework with certain assets struck out of every bucket.
+ *
+ * An asset on the standing liquidation list must not also be a name the
+ * framework tells the model to buy: the bot would buy it, sell it on sight next
+ * cycle, and pay both spreads for the privilege. Striking it out also stops it
+ * counting toward its bucket's target — a holding on its way out is not
+ * allocation, and treating it as such would suppress buying the names that are
+ * actually meant to fill that sleeve.
+ *
+ * A bucket emptied entirely keeps its target weight; the weight is the
+ * operator's, not a property of whichever names currently qualify.
+ */
+export function excludeAssetsFromBuckets(
+  buckets: StrategyBucket[], exclude: Iterable<string>,
+): StrategyBucket[] {
+  const excluded = new Set([...exclude].map(normalizeAsset));
+  if (excluded.size === 0) return buckets;
+  return buckets.map(bucket => ({
+    ...bucket,
+    assets: bucket.assets.filter(asset => !excluded.has(normalizeAsset(asset))),
+  }));
+}
+
+/** The framework as it actually applies right now, given the live config. */
+export function activeStrategyBuckets(): StrategyBucket[] {
+  return excludeAssetsFromBuckets(STRATEGY_BUCKETS, CONFIG?.liquidateOnUnstake ?? []);
+}
+
+/** The USD pairs the framework currently wants watched. */
+export function activeStrategyPairs(): string[] {
+  return activeStrategyBuckets()
+    .flatMap(bucket => bucket.assets)
+    .map(asset => `${asset}/USD`);
+}
+
 export function strategyBucketFor(asset: string): StrategyBucket | null {
   const base = normalizeAsset(asset);
-  return STRATEGY_BUCKETS.find(bucket => bucket.assets.includes(base)) ?? null;
+  return activeStrategyBuckets().find(bucket => bucket.assets.includes(base)) ?? null;
 }
 
 export function isStrategyPair(pair: string): boolean {
   const base = pair.split('/')[0];
-  return Boolean(base) && STRATEGY_ASSETS.has(normalizeAsset(base));
+  return Boolean(base) && strategyBucketFor(base) !== null;
 }
 
 export interface AllocationLine {
@@ -830,7 +875,7 @@ export function candidateAllocationNote(
 ): string {
   if (lines.length === 0) return '';
   const base = normalizeAsset(pair.split('/')[0] || '');
-  const bucket = strategyBucketFor(base);
+  const bucket = strategyBucketFor(base);   // already the active, filtered bucket
   if (!bucket)
     return [
       'ALLOCATION FRAMEWORK:',
@@ -2253,10 +2298,12 @@ class Exchange {
     if (mode === 'watchlist')
       return tradablePairs().filter(pair => !new Set([...heldPairs].map(p => p.toUpperCase())).has(pair));
     await this.ensureMarkets();
+    // An asset under a standing liquidation order is never a buy candidate: the
+    // bot would purchase it and sell it on sight next cycle, paying both spreads.
     return filterDiscoveredMarkets(
       Object.values(this.ex.markets || {}) as ScanMarket[],
       heldPairs,
-      CONFIG.excludedAssets,
+      new Set([...CONFIG.excludedAssets, ...CONFIG.liquidateOnUnstake]),
     );
   }
 
@@ -4732,12 +4779,13 @@ export async function runPreflight(
   //     but is no reason to stop trading the names that are listed.
   if (CONFIG.strategyAllocation) {
     try {
-      const missingStrategy = await exchange.listMissingMarkets(STRATEGY_PAIRS);
-      const listed = STRATEGY_PAIRS.length - missingStrategy.length;
+      const activePairs = activeStrategyPairs();
+      const missingStrategy = await exchange.listMissingMarkets(activePairs);
+      const listed = activePairs.length - missingStrategy.length;
       add('Allocation framework', missingStrategy.length === 0,
         missingStrategy.length === 0
-          ? `all ${STRATEGY_PAIRS.length} framework pairs are listed on Kraken`
-          : `${listed}/${STRATEGY_PAIRS.length} framework pairs listed; unreachable here: ${missingStrategy.join(', ')}`);
+          ? `all ${activePairs.length} framework pairs are listed on Kraken`
+          : `${listed}/${activePairs.length} framework pairs listed; unreachable here: ${missingStrategy.join(', ')}`);
     } catch (e: any) {
       add('Allocation framework', false, `could not check framework markets: ${e.message}`);
     }
@@ -4956,6 +5004,7 @@ async function main() {
   console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
   console.log(`[CONFIG] Reserved assets: ${CONFIG.excludedAssets.size ? [...CONFIG.excludedAssets].sort().join(', ') : 'none'} (never bought, sold or managed)`);
   console.log(`[CONFIG] Reserved sell allowance: ${CONFIG.reservedSellAllowanceUsd.size ? [...CONFIG.reservedSellAllowanceUsd].map(([asset, usd]) => `${asset} up to ${fmt(usd)}`).join(', ') : 'none'} (lifetime cap, unlocked balances only)`);
+  console.log(`[CONFIG] Liquidate on unstake: ${CONFIG.liquidateOnUnstake.size ? [...CONFIG.liquidateOnUnstake].sort().join(', ') + ' (sold in full the moment it is tradable; never bought, never scanned)' : 'none'}`);
   console.log(`[CONFIG] Allocation framework: ${CONFIG.strategyAllocation ? STRATEGY_BUCKETS.map(bucket => `${bucket.label} ${(bucket.targetPct * 100).toFixed(0)}%`).join(' | ') : 'off'}`);
   console.log(`[CONFIG] Daily loss breaker: ${limit(CONFIG.maxDailyLossPct)} | Max positions: ${limit(CONFIG.maxOpenPositions)} | Max sector exposure: ${limit(CONFIG.maxSectorExposurePct)}`);
 
@@ -5192,6 +5241,80 @@ async function executeExit(
  * The spend is bounded by one exchange minimum order, and is skipped when cash is
  * short or the pair cannot be priced.
  */
+/**
+ * Sells, in full, any asset the operator has put on the standing liquidation
+ * list, the moment it becomes freely tradable.
+ *
+ * This is a hard rule and one of the very few in this bot. Everything else here
+ * is guidance the model may argue with, because everything else is a judgement
+ * about markets. This is not: it is the operator telling us what to do with
+ * their own property. "I want my AVAX liquidated the second it is unstaked"
+ * has no counter-case for the model to weigh, so it never reaches the model —
+ * it runs before Phase 1, before the position is reviewed, before the stance is
+ * set. A liquidation that waits for a decision budget is not "the second".
+ *
+ * Runs after reconcile so a freshly unstaked balance that has already been
+ * adopted exits through `executeExit` and books its P/L into the trade history
+ * like any other close; any balance left over (dust, or an untracked holding) is
+ * then swept directly. A staked balance is invisible to both, which is the point
+ * — nothing happens until the operator actually unstakes.
+ */
+async function liquidateOnUnstake(exchange: Exchange, mem: Memory): Promise<boolean> {
+  if (CONFIG.liquidateOnUnstake.size === 0) return false;
+  let soldAnything = false;
+  for (const asset of [...CONFIG.liquidateOnUnstake].sort()) {
+    if (shutdownRequested) break;
+    const pair = `${asset}/USD`;
+    let price: number | null = null;
+    try {
+      price = await exchange.getPrice(pair, false);
+    } catch (e) {
+      console.warn(`  [LIQUIDATE] ${pair}: no price available (${e instanceof Error ? e.message : String(e)}); nothing sold this cycle`);
+      continue;
+    }
+    if (!(price && price > 0)) continue;
+
+    // A tracked position exits properly, so the close is booked with real P/L.
+    const position = mem.positions[pair];
+    if (position && position.status === 'open') {
+      console.log(`  [LIQUIDATE] ${pair} is on the operator's standing liquidation list and is now tradable — closing the tracked position in full.`);
+      const closed = await executeExit(
+        exchange, mem, pair,
+        'Operator standing order: liquidate as soon as it is unstaked',
+        'LIQUIDATE', 10,
+      );
+      soldAnything = soldAnything || closed;
+      await exchange.refreshBalanceSnapshot();
+    }
+
+    // Then sweep whatever free balance is left — an untracked holding, or dust
+    // the tracked quantity did not cover.
+    const free = exchange.paper ? 0 : exchange.getAvailableBase(pair) ?? 0;
+    if (free <= 0) continue;
+    const value = free * price;
+    const minimum = await exchange.getMinimumTradeUsd(pair, price);
+    if (minimum !== null && value < minimum) {
+      // Worth saying once, plainly: this is money the standing order cannot
+      // reach, and no amount of waiting will change that.
+      console.warn(`  [LIQUIDATE] ${pair}: ${fmt(value)} of free balance is below Kraken's ${fmt(minimum)} minimum, so it cannot be sold. It will stay until it is topped up or sold by hand.`);
+      continue;
+    }
+    console.log(`  [LIQUIDATE] ${pair}: sweeping ${free} (${fmt(value)}) of untracked free balance under the operator's standing order.`);
+    const fill = await exchange.sellReserved(pair, value);
+    if (!fill) {
+      console.error(`  [LIQUIDATE] ${pair}: sweep did not fill; it will be retried next cycle.`);
+      continue;
+    }
+    soldAnything = true;
+    const raised = fill.qty * fill.price;
+    console.log(`  [LIQUIDATE] ${pair}: raised ${fmt(raised)}; proceeds are now cash the strategy can deploy.`);
+    await notifyWebhook('liquidated_on_unstake',
+      `KAI sold ${fmt(raised)} of ${asset} the moment it became tradable, per your standing instruction. The cash is now available to the strategy.`);
+    await exchange.refreshBalanceSnapshot();
+  }
+  return soldAnything;
+}
+
 async function topUpStrandedPositions(
   exchange: Exchange, mem: Memory, prices: Record<string, number>, portfolioValue: number,
 ) {
@@ -5273,6 +5396,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   exchange.beginCycle();
   // ── RECONCILE LIVE BALANCE ──
   if (!exchange.paper) await exchange.reconcilePositions(mem);
+
+  // ── STANDING LIQUIDATION ORDER ──
+  // Before anything is reviewed, sized or decided. The operator asked for these
+  // gone "the second" they are tradable, and a cycle that reviews them first is
+  // a cycle that might decide to keep them.
+  if (await liquidateOnUnstake(exchange, mem)) await exchange.refreshBalanceSnapshot();
 
   // ── FETCH REAL BALANCE ──
   let account = await exchange.getPortfolioValue(mem);
@@ -5687,7 +5816,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         if (sleepers.length > 0)
           console.log(`  [SCAN] Sleepers forced into TA (quiet, under the radar): ${sleepers.map(t => `${t.pair} ${t.changePct >= 0 ? '+' : ''}${t.changePct.toFixed(1)}%`).join(', ')}`);
         if (CONFIG.strategyAllocation) {
-          const missing = STRATEGY_PAIRS.filter(pair => !listedStrategy.includes(pair));
+          const missing = activeStrategyPairs().filter(pair => !listedStrategy.includes(pair));
           console.log(`  [SCAN] Allocation framework forced into TA: ${listedStrategy.join(', ') || 'none'}`);
           if (missing.length > 0)
             console.log(`  [SCAN] Framework names Kraken does not list above the volume floor, so they cannot be bought here: ${missing.join(', ')}`);
@@ -5742,7 +5871,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   // which is stated separately so the model never plans against money it cannot
   // reach.
   const allocationLines = CONFIG.strategyAllocation
-    ? allocationDrift(account.holdingsUsd, account.totalUsd)
+    ? allocationDrift(account.holdingsUsd, account.totalUsd, activeStrategyBuckets())
     : [];
   const deployableUsd = Math.max(0, account.cashUsd) * (1 - CONFIG.feeReservePct);
   const allocationText = allocationLines.length
@@ -6067,7 +6196,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     console.log(`  [FUNDING] Outstanding request: ${fmt(funding.usd)} since ${funding.requestedAt} — "${funding.reasoning}"`);
 }
 
-export { TA, applyPositionAdjustments, updateTradeExtremes, loadConfig, csvField, Memory, fmt, Exchange, runCycle, AiBrain, reportPreflight, normalizeAsset, isStakedBalance };
+export { TA, applyPositionAdjustments, updateTradeExtremes, loadConfig, csvField, Memory, fmt, Exchange, runCycle, AiBrain, reportPreflight, normalizeAsset, isStakedBalance, liquidateOnUnstake };
 export type { TradingConfig };
 
 if (require.main === module)

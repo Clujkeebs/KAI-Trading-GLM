@@ -3,6 +3,7 @@ import {
   STRATEGY_BUCKETS, STRATEGY_ASSETS, STRATEGY_PAIRS, strategyBucketFor, isStrategyPair,
   allocationDrift, underweightBuckets, allocationNote, candidateAllocationNote,
   parseSellAllowances, remainingSellAllowance, approveReservedSale, reservedAllowanceNote,
+  excludeAssetsFromBuckets,
   prioritizeMoverCandidates, isModelUnavailable, setConfig, loadConfig,
 } from '../src/index.js';
 
@@ -203,6 +204,32 @@ setConfig(loadConfig());
   // The previously handled cases still classify.
   assert.equal(isModelUnavailable(Object.assign(new Error('This model is unavailable for free.'), { status: 404 })), true);
   console.log('model availability checks passed');
+})();
+
+// ── Standing liquidation order ──
+(() => {
+  const stripped = excludeAssetsFromBuckets(STRATEGY_BUCKETS, ['AVAX']);
+  const rotational = stripped.find(b => b.name === 'rotational')!;
+  assert.ok(!rotational.assets.includes('AVAX'), 'a liquidated asset leaves the eligible list');
+  assert.ok(rotational.assets.includes('SOL'), 'its bucket-mates stay');
+  assert.equal(rotational.targetPct, 0.17, 'the bucket keeps the operator\'s weight');
+  assert.equal(stripped.reduce((s, b) => s + b.targetPct, 0), 1, 'weights still sum to 1');
+  // Kraken's staked alias must strike the same asset out.
+  assert.ok(!excludeAssetsFromBuckets(STRATEGY_BUCKETS, ['AVAX.B'])
+    .find(b => b.name === 'rotational')!.assets.includes('AVAX'));
+  assert.deepEqual(excludeAssetsFromBuckets(STRATEGY_BUCKETS, []), STRATEGY_BUCKETS,
+    'an empty list is a no-op');
+
+  // A holding on its way out must not count toward the target it is leaving,
+  // or the bucket reads as full and the names meant to fill it never get bought.
+  const withAvax = allocationDrift({ AVAX: 938 }, 1000, STRATEGY_BUCKETS)
+    .find(b => b.bucket === 'rotational')!;
+  const without = allocationDrift({ AVAX: 938 }, 1000, excludeAssetsFromBuckets(STRATEGY_BUCKETS, ['AVAX']))
+    .find(b => b.bucket === 'rotational')!;
+  assert.equal(withAvax.actualUsd, 938);
+  assert.equal(without.actualUsd, 0, 'a liquidated holding is not allocation');
+  assert.ok(without.driftUsd > 0, 'so the sleeve correctly reads as underweight');
+  console.log('liquidation-list checks passed');
 })();
 
 console.log('strategy checks passed');

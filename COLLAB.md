@@ -37,6 +37,44 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-09-06 — Claude — Standing liquidation orders (LIQUIDATE_ON_UNSTAKE)
+
+**Changed:** New `LIQUIDATE_ON_UNSTAKE` (production: `AVAX`). Sells a listed asset in full the
+moment it has free balance. New `liquidateOnUnstake(exchange, mem)` runs at the **top of
+`runCycle`**, after reconcile but before the balance snapshot the rest of the cycle sizes against —
+so before Phase 1 reviews anything, before the stance, before any decision budget. A tracked
+position exits via `executeExit` so P/L is booked; leftover free balance is then swept via
+`sellReserved`. Also `excludeAssetsFromBuckets`, `activeStrategyBuckets()`, `activeStrategyPairs()`;
+`strategyBucketFor`/`isStrategyPair` now resolve against the active (filtered) buckets, and
+`getScanUniverse` unions the liquidation list into its exclusion set.
+
+**Why:** Operator: *"my Avax position, I want to be liquidated the second it is unstaked."* That is
+an ownership instruction with no market judgement in it, so it is one of the few genuine hard rules
+in this bot — the model is never asked and cannot argue to keep it. The filtering half is the part
+that is easy to miss: **AVAX was in the rotational bucket**, so without it the framework would have
+told the model to buy AVAX and the liquidation would have sold it next cycle, paying both spreads
+forever. Striking it out of the buckets also stops it counting toward the rotational target — a
+holding on its way out is not allocation, and counting it would read the sleeve as full and starve
+the names actually meant to fill it.
+
+**Verified:** `npm run build` + `npm test` clean, **33 suites**. Unit: a struck asset leaves the
+eligible list while its bucket-mates and the bucket's target weight stay, weights still sum to 1,
+the `AVAX.B` staked alias strikes the same asset, an empty list is a no-op, and drift counts 938 →
+0 for a struck holding so the sleeve correctly reads underweight. Integration, against the real
+`Exchange` and a fake Kraken: **staked AVAX places no order**; unstaked AVAX is sold **in full in
+one cycle** (whole 9.38 balance, nothing left behind); sub-minimum dust is reported and **not**
+thrown at the exchange; and AVAX is absent from both `getScanUniverse` and `isStrategyPair` while
+SOL remains in both.
+
+**Watch out:**
+- `EXCLUDED_ASSETS` is now blank *and* AVAX is on the liquidation list. These are opposites and
+  both are intended: nothing is protected, and AVAX is actively unwanted. Do not "tidy" AVAX back
+  into `EXCLUDED_ASSETS` — that would silently cancel the standing order.
+- The order is a no-op today: `AVAX.B` is staked, so there is no free balance to sell. It fires on
+  the first cycle after the operator unstakes. Untested against a real Kraken fill.
+- `liquidateOnUnstake` is a hard rule by design. If a future change routes it through the model or
+  a confidence threshold, that breaks the operator's instruction — it is not a trade to be judged.
+
 ### 2026-09-06 — Claude — Reserved list emptied: staking is now the only thing holding the line
 
 **Changed:** `EXCLUDED_ASSETS` is now **blank** in production (was `SOL,AVAX`, then `AVAX`). The
