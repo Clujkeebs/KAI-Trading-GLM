@@ -846,10 +846,32 @@ export function candidateAllocationNote(
   const standing = line.driftUsd > 0
     ? `That bucket is ${fmt(line.driftUsd)} UNDER its ${(line.targetPct * 100).toFixed(0)}% target — buying here moves the book toward the plan.`
     : `That bucket is already ${fmt(-line.driftUsd)} over its ${(line.targetPct * 100).toFixed(0)}% target — buying here moves the book away from the plan, so it needs to be worth it on its own merits.`;
+  // Naming the bucket without naming the size gets the coins right and the
+  // weights wrong. A paper run of the operator's own framework put ETH at 12%
+  // of the book against a 50% target, purely because ETH is one name and the
+  // large-cap sleeve is six: every position was sized the same, so the sleeve
+  // with more names won on count. A 50% ETH target that fills to 12% is not the
+  // strategy. So each candidate is told what a full position *in its own bucket*
+  // is worth — which is a very different number for a one-name bucket than for
+  // a six-name one.
+  const perName = line.targetUsd / Math.max(1, bucket.assets.length);
+  const sizing = [
+    `BUCKET SIZE: this bucket targets ${fmt(line.targetUsd)} spread over ${bucket.assets.length} eligible name${bucket.assets.length === 1 ? '' : 's'}, so a full position in it is around ${fmt(perName)} — not the same as a full position in a wider bucket.`,
+    line.held.length
+      ? `You already hold ${line.held.length} of them (${line.held.map(entry => `${entry.asset} ${fmt(entry.usd)}`).join(', ')}).`
+      : 'You hold none of them yet.',
+    line.driftUsd > 0
+      ? `Room left before this bucket is on target: ${fmt(line.driftUsd)}.`
+      : 'This bucket has no room left before it is over target.',
+  ].join('\n');
   return [
     'ALLOCATION FRAMEWORK:',
     `${base} sits in "${line.label}". ${bucket.note}`,
     standing,
+    sizing,
+    'Size is where the plan is actually kept or lost: getting the names right and',
+    'the weights wrong is not following it. Still, this is a target to grow into,',
+    'not a number to hit today — size to what the setup and your cash justify.',
     'Being underweight is a tiebreaker, not a reason. A bad entry in the right',
     'bucket still loses money.',
     '',
@@ -2925,21 +2947,25 @@ class Exchange {
         // "the bot can sell $0 of that SOL" are both true and both need saying.
         const holdingsUsd: Record<string, number> = {};
         const lockedUsd: Record<string, number> = {};
-        const accrue = async (
-          holdings: Record<string, { asset: string; qty: number }>, locked: boolean,
-        ) => {
-          for (const [pair, holding] of Object.entries(holdings)) {
-            const price = await this.getCyclePrice(pair);
-            if (price === null) continue;
-            const base = normalizeAsset(holding.asset);
-            const usd = holding.qty * price;
-            holdingsUsd[base] = (holdingsUsd[base] ?? 0) + usd;
-            if (locked || isStakedBalance(holding.asset))
-              lockedUsd[base] = (lockedUsd[base] ?? 0) + usd;
-          }
-        };
-        await accrue(allHoldings, false);
-        await accrue(reservedHoldings, true);
+        // Walked over the raw balance entries rather than the mapped holdings on
+        // purpose. `mapHoldings` and `reservedHoldings` both collapse SOL and
+        // SOL03.S onto the single SOL/USD market, which is right for valuation
+        // and fatal here: it loses exactly the distinction this is measuring.
+        // "Locked" means the exchange will not sell it, which is a property of
+        // the balance name, not of whether the operator reserved the asset — a
+        // reserved holding that is NOT staked is still reachable by a sale the
+        // operator has authorised.
+        for (const { asset, qty } of this.getBalanceEntries(balance)) {
+          if (this.isCashEquivalent(asset) || this.isIgnoredAsset(asset)) continue;
+          const market = this.usdMarketForAsset(asset);
+          if (!market) continue;
+          const price = await this.getCyclePrice(market.symbol);
+          if (price === null) continue;
+          const base = normalizeAsset(asset);
+          const usd = qty * price;
+          holdingsUsd[base] = (holdingsUsd[base] ?? 0) + usd;
+          if (isStakedBalance(asset)) lockedUsd[base] = (lockedUsd[base] ?? 0) + usd;
+        }
         const snapshot: PortfolioSnapshot = {
           totalUsd: cashUsd + allCrypto + reservedUsd,
           cashUsd,

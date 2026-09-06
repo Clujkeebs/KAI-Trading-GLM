@@ -37,6 +37,54 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-09-06 — Claude — Simulate the framework instead of trusting it: two real bugs
+
+**Changed:** New `test/integration-check.ts` (wired into `npm test`, 32 suites total) driving the
+*real* `Exchange`, `AiBrain` and `runCycle` against a fake Kraken and a scripted model — no live
+order, no spend. It found two defects that unit tests could not:
+
+1. **`lockedUsd` marked every reserved holding as locked.** `getPortfolioValue` accrued
+   `reservedHoldings` with `locked: true`, but `reservedHoldings` (like `mapHoldings`) collapses
+   `SOL` and `SOL03.S` onto one `SOL/USD` entry, so the free/staked split was already gone. A
+   reserved-but-unstaked balance therefore reported as unsellable, and `reservedAllowanceNote`
+   would have told the model "$0 reachable" while $1,000 of free SOL sat there. Now computed by
+   walking `getBalanceEntries` directly, with locked ≡ `isStakedBalance(asset)` — a property of
+   the balance name, not of whether the operator reserved the asset.
+2. **The framework got the coins right and the weights wrong.** A 5-cycle paper run of the
+   operator's own $1,000 allocation put ETH at **12%** of the book against its 50% target, purely
+   because ETH is one name and the large-cap sleeve is six, and every position was sized alike.
+   `candidateAllocationNote` now carries a BUCKET SIZE line — `targetUsd / eligible names`, plus
+   what is already held in the bucket and the room left. Same run now lands ETH at **50.0%**, and
+   the model is handed ETH $500 / large caps $55 / rotational $21.25, which is exactly the
+   framework's $500-$330-$170 split.
+
+**Why:** I had told the operator the reserved-sell path and the 403 fix were "unverified against a
+live order", which was true and not good enough — `AGENTS.md` forbids a test order, but it does not
+forbid simulating everything short of one. Both bugs were live in `main` and neither is visible
+from a unit test: the first needs a real balance payload with a staked alias, the second only shows
+up over several cycles of real sizing.
+
+**Verified:** `npm run build` + `npm test` clean, 32 suites. The integration suite asserts:
+a fully staked holding sells nothing *and places no order*; an unlocked one sells exactly the
+dollar amount asked and never reaches past the free balance into the staked one; an oversized
+request caps at unlocked value; a sub-minimum request is refused before it reaches the exchange;
+`Exchange.sell` still refuses reserved pairs; a **partial fill** consumes only realised proceeds
+($200 of a $400 request, leaving $300 of a $500 allowance); the cap persists across a restart and
+cannot be re-opened via the `SOL03.S` alias. Plus the exact production 403 sequence end to end
+(402 → catalog → gated id tried **once** → working id → real BUY), a regression guard proving the
+same error still fails loudly without the walk-past, and a preflight run asserting the AI is the
+*only* critical failure while the framework check stays non-critical.
+
+**Watch out:**
+- Live preflight against real Kraken reports `14/15 framework pairs listed; unreachable here:
+  CANTON/USD`. CANTON is not on Kraken; it stays in `STRATEGY_BUCKETS` deliberately so the gap is
+  reported rather than silently forgotten if Kraken ever lists it.
+- The paper sim's model sizes by parsing the BUCKET SIZE line out of the prompt. That is the point
+  — it tests the guidance — but it is a *cooperative* reader. A real model may weight it
+  differently; the framework is guidance and is meant to be arguable.
+- Still unverified by a live order, and will stay that way: `sellReserved` against real Kraken.
+  Everything up to `createMarketSellOrder` is now exercised; the exchange's own response is not.
+
 ### 2026-09-06 — Claude — Allocation framework, and the three faults that had production halted
 
 **Changed:** Four things, in the order they mattered.

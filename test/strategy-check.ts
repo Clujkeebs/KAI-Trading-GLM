@@ -91,6 +91,18 @@ setConfig(loadConfig());
   const inPlan = candidateAllocationNote('ETH/USD', lines, note);
   assert.ok(inPlan.includes('Core (ETH)'));
   assert.ok(/UNDER its 50% target/.test(inPlan));
+  // A one-name bucket and a six-name bucket must not be told the same full size:
+  // equal sizing is what put ETH at 12% of the book against a 50% target.
+  const ethSize = /a full position in it is around \$([\d,.]+)/.exec(inPlan)?.[1];
+  const linkSize = /a full position in it is around \$([\d,.]+)/
+    .exec(candidateAllocationNote('LINK/USD', lines, note))?.[1];
+  assert.ok(ethSize && linkSize, 'both candidates are told a bucket size');
+  assert.notEqual(ethSize, linkSize, 'the size differs by bucket');
+  assert.ok(Number(ethSize!.replace(/,/g, '')) > Number(linkSize!.replace(/,/g, '')) * 5,
+    'a 50% one-name bucket is worth far more per position than a 33% six-name one');
+  assert.ok(/Room left before this bucket is on target/.test(inPlan));
+  assert.ok(/not a number to hit today|target to grow into/.test(inPlan),
+    'sizing stays guidance, not a quota');
   const outOfPlan = candidateAllocationNote('DOGE/USD', lines, note);
   assert.ok(/not one of the names/.test(outOfPlan));
   assert.ok(/not a refusal/.test(outOfPlan), 'off-framework names stay takeable');
