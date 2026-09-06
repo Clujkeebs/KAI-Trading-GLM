@@ -125,7 +125,7 @@ async function main() {
   setConfig(loadConfig());
 
   const fresh = () => {
-    const fake = new FakeKraken(['SOL/USD', 'ETH/USD', 'LINK/USD', 'ONDO/USD', 'ICP/USD']);
+    const fake = new FakeKraken(['SOL/USD', 'AVAX/USD', 'ETH/USD', 'LINK/USD', 'ONDO/USD', 'ICP/USD']);
     (ccxt as any).kraken = function () { return fake; };
     return fake;
   };
@@ -352,6 +352,59 @@ async function main() {
     assert.ok(framework, 'the framework is checked at startup');
     assert.equal(framework.critical, false, 'but a missing framework pair is never critical');
     console.log(`  preflight: AI-only critical failure isolated; framework check non-critical (${framework.detail})`);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 3b. With NOTHING reserved, a staked balance must still be untouchable.
+  //     The operator has removed the reserved list entirely, so `isStakedBalance`
+  //     is now the only thing standing between the bot and ~$1,050 of staked SOL
+  //     and AVAX. That is a mechanical property of the exchange rather than a
+  //     guard, which is exactly why it needs proving rather than assuming.
+  // ════════════════════════════════════════════════════════════════════════
+  {
+    const priorExcluded = process.env.EXCLUDED_ASSETS;
+    process.env.EXCLUDED_ASSETS = '';
+    process.env.RESERVED_SELL_ALLOWANCE_USD = '';
+    setConfig(loadConfig());
+    const fake = fresh();
+    // The live account, exactly: a little cash, everything else bonded.
+    fake.balance = {
+      USD: { free: 0.01, used: 0, total: 0.01 },
+      'SOL03.S': { free: 9.47, used: 0, total: 9.47 },
+      'AVAX.B': { free: 9.38, used: 0, total: 9.38 },
+    };
+    const exchange = new Exchange('k', 's', false);
+    const mem = new Memory();
+    const snap = await exchange.getPortfolioValue(mem);
+
+    // Staked value is counted as the operator's wealth but NOT as capital to spend.
+    assert.ok(snap.totalUsd > 1800, 'staked value still counts toward the account total');
+    assert.ok(snap.tradableUsd < 1, `staked value is never spendable, got ${snap.tradableUsd}`);
+    assert.ok(snap.stakedUsd > 1800, 'and is reported as staked');
+    assert.ok(Math.abs((snap.lockedUsd.SOL ?? 0) - 947) < 1, 'SOL is locked');
+    assert.ok(Math.abs((snap.lockedUsd.AVAX ?? 0) - 938) < 1, 'AVAX is locked');
+
+    // Nothing may be adopted as a tradable position off a staked balance.
+    await exchange.reconcile?.(mem);
+    const adopted = mem.getOpenPositions().map((p: any) => p.pair);
+    assert.deepEqual(adopted, [], `a staked balance must never become a position, got ${adopted}`);
+
+    // And a sell against it places no order, on either path.
+    assert.equal(await exchange.sell('SOL/USD', 5), null, 'ordinary sell finds no free balance');
+    assert.equal(await exchange.sellReserved('SOL/USD', 400), null, 'nor does the allowance path');
+    assert.equal(fake.orders.length, 0, 'no order reaches the exchange');
+    console.log('  nothing reserved: staked SOL/AVAX still unsellable, unadopted, unspendable');
+
+    // But the moment the operator unstakes, it becomes ordinary tradable capital.
+    fake.balance.SOL = { free: 9.47, used: 0, total: 9.47 };
+    delete fake.balance['SOL03.S'];
+    const exchange2 = new Exchange('k', 's', false);
+    const after = await exchange2.getPortfolioValue(new Memory());
+    assert.ok(after.tradableUsd > 900, `unstaked SOL becomes spendable, got ${after.tradableUsd}`);
+    assert.ok((after.lockedUsd.SOL ?? 0) === 0, 'and is no longer locked');
+    console.log('  nothing reserved: unstaked SOL becomes ordinary tradable capital');
+    process.env.EXCLUDED_ASSETS = priorExcluded ?? '';
+    setConfig(loadConfig());
   }
 
   // ════════════════════════════════════════════════════════════════════════

@@ -37,6 +37,37 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-09-06 — Claude — Reserved list emptied: staking is now the only thing holding the line
+
+**Changed:** `EXCLUDED_ASSETS` is now **blank** in production (was `SOL,AVAX`, then `AVAX`). The
+operator's instruction, in their words: *"The AI can sell and buy as long as it is making me more
+money."* No code change — `isExcludedAsset` simply matches nothing now. Added an integration case
+covering the configuration that results.
+
+**Why:** The operator has loosened this three times across one session (hard rule → $500 SOL
+allowance → unstaked SOL fully managed → nothing reserved) and reaffirmed each time. Treating that
+as settled rather than re-litigating it.
+
+**Verified:** `npm run build` + `npm test` clean, 32 suites. The new case pins the live account's
+exact shape ($0.01 cash, `SOL03.S` 9.47, `AVAX.B` 9.38) with **nothing reserved** and asserts that
+staked value still counts toward `totalUsd`, is absent from `tradableUsd`, appears in `lockedUsd`,
+is **never adopted as a position**, and that both `sell` and `sellReserved` place **zero orders**
+against it. It then unstakes SOL in the fixture and asserts it becomes ordinary tradable capital
+with `lockedUsd.SOL === 0`.
+
+**Watch out — read this before touching balance handling:**
+- `isStakedBalance` is now the *only* thing between the bot and ~$1,885 of the operator's SOL and
+  AVAX. It was previously a backstop behind `EXCLUDED_ASSETS`; it is now load-bearing on its own.
+  `AGENTS.md` already warns that being staked is not the same as being protected — that warning is
+  now the whole story. Any change to `STAKED_BALANCE_SUFFIXES`, `normalizeAsset`, `mapHoldings` or
+  `getAssetField` can hand that balance to the bot. Do not touch them without re-running
+  `test/integration-check.ts`.
+- The protection is *mechanical*, not a policy: it holds because Kraken will not sell a bonded
+  balance through a spot order. If the operator unstakes, the bot may deploy all of it. They said
+  they want to keep *some* SOL; there is no floor enforcing that, and adding one would need their
+  say-so since they explicitly removed the caps.
+- Nothing about this makes the bot trade today. Free cash is $0.01.
+
 ### 2026-09-06 — Claude — Simulate the framework instead of trusting it: two real bugs
 
 **Changed:** New `test/integration-check.ts` (wired into `npm test`, 32 suites total) driving the
