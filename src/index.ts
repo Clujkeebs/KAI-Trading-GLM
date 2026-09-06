@@ -152,6 +152,8 @@ interface BuyContext {
   windowHigh?: WindowHighContext | null;
   /** Bid/ask spread as a fraction of price; wide spreads eat a market order on entry and exit alike. */
   spreadPct?: number | null;
+  /** Where this pair sits in the operator's allocation framework, if anywhere. */
+  allocation?: string;
 }
 export interface Position {
   pair: string; status: 'open' | 'closed'; sector: string;
@@ -207,6 +209,13 @@ export interface PortfolioStance {
   cashTargetPct: number;
   /** Extra capital the model is asking the operator to add, in USD. */
   requestedFundsUsd: number;
+  /**
+   * A reserved holding the model wants partially liquidated to fund the book, and
+   * how much. Honoured only up to the operator's standing allowance and only out
+   * of a freely sellable balance; zero means no such request.
+   */
+  raiseFromReservedAsset: string;
+  raiseFromReservedUsd: number;
   /** Cycle and time at which this stance was persisted. */
   recordedAt?: string;
   cycle?: number;
@@ -246,6 +255,15 @@ interface PortfolioSnapshot {
   tradableUsd: number;
   /** Staked or otherwise locked value, held but unusable. */
   stakedUsd: number;
+  /**
+   * Every crypto holding valued in USD, keyed by normalized base — tradable,
+   * staked and reserved alike. The allocation framework has to measure the whole
+   * book: reporting the rotational sleeve as empty while the operator's staked
+   * SOL *is* the account would make every drift number a lie.
+   */
+  holdingsUsd: Record<string, number>;
+  /** Value held in balances the exchange will not let a spot order sell. */
+  lockedUsd: Record<string, number>;
 }
 interface BotState {
   startedAt: string; totalTrades: number; wins: number; losses: number;
@@ -272,6 +290,12 @@ interface BotState {
    * its own charter — never applied automatically, only surfaced.
    */
   chatLog: ChatMessage[];
+  /**
+   * Cumulative USD raised by selling each reserved asset, against the ceiling in
+   * RESERVED_SELL_ALLOWANCE_USD. Persisted because the allowance is a lifetime
+   * grant: forgetting it across a restart would silently reset the operator's cap.
+   */
+  reservedSoldUsd: Record<string, number>;
   /** The account breakdown from the most recent cycle, cached for the dashboard
    * so viewing it never triggers its own exchange call. */
   lastAccountSnapshot: (PortfolioSnapshot & { asOf: string }) | null;
@@ -316,6 +340,13 @@ type TradingConfig = {
   targetPositionCount: number | null;
   /** Assets the bot must never buy, sell, or manage. The operator's property. */
   excludedAssets: Set<string>;
+  /**
+   * Per-asset USD ceilings on selling a reserved holding, cumulative for the life
+   * of the account. Blank means the reserved boundary is absolute, as before.
+   */
+  reservedSellAllowanceUsd: Map<string, number>;
+  /** Whether the allocation framework is shown to the model at all. */
+  strategyAllocation: boolean;
   /** Drawdown, in R, at which a position wakes the model for a decision. */
   alertAtR: number;
   /** Whether the model may add to an open position when it reviews one. */
@@ -397,6 +428,126 @@ function envEnum<T extends string>(name: string, allowed: readonly T[], fallback
   return value;
 }
 
+/**
+ * Per-asset ceilings on how much of a reserved holding may ever be sold.
+ *
+ * `EXCLUDED_ASSETS` is an absolute boundary and stays one: a reserved asset is
+ * never bought, never adopted as a position, never scanned. This is the operator
+ * granting a bounded, one-way exception to that — "you may raise up to $500 from
+ * my SOL" — without handing the whole holding over. The ceiling is cumulative
+ * across the life of the account, not per trade and not per cycle, so a bot that
+ * sells $200 today has $300 left forever, not $500 again tomorrow.
+ *
+ * Format: `SOL:500,AVAX:0`. Malformed entries are dropped loudly rather than
+ * guessed at — a typo here would otherwise silently authorise the wrong number.
+ */
+export function parseSellAllowances(raw: string | undefined | null): Map<string, number> {
+  const allowances = new Map<string, number>();
+  for (const entry of String(raw ?? '').split(',')) {
+    const text = entry.trim();
+    if (!text) continue;
+    const [assetPart, usdPart] = text.split(':');
+    const asset = normalizeAsset((assetPart ?? '').trim());
+    const usd = Number((usdPart ?? '').trim());
+    if (!asset || !Number.isFinite(usd) || usd < 0) {
+      console.warn(`[CONFIG] Ignoring malformed RESERVED_SELL_ALLOWANCE_USD entry "${text}" (expected ASSET:USD)`);
+      continue;
+    }
+    allowances.set(asset, (allowances.get(asset) ?? 0) + usd);
+  }
+  return allowances;
+}
+
+/** How much of a reserved asset may still be sold, after what has already gone. */
+export function remainingSellAllowance(
+  asset: string, allowances: Map<string, number>, alreadySoldUsd: Record<string, number>,
+): number {
+  const base = normalizeAsset(asset);
+  const granted = allowances.get(base);
+  if (granted === undefined) return 0;
+  const spent = Number(alreadySoldUsd[base] ?? 0);
+  return Math.max(0, granted - (Number.isFinite(spent) ? spent : 0));
+}
+
+/**
+ * How much of a requested reserved sale may actually go ahead.
+ *
+ * Three separate ceilings apply and the smallest wins: what the model asked for,
+ * what the operator's lifetime allowance still permits, and what is not locked up
+ * on the exchange. Returning the reason alongside the number matters as much as
+ * the number — "we sold $0" and "we sold $0 because it is all staked" send the
+ * operator to very different places.
+ */
+export function approveReservedSale(
+  asset: string,
+  requestedUsd: number,
+  allowances: Map<string, number>,
+  soldUsd: Record<string, number>,
+  freeUsd: number,
+): { approvedUsd: number; reason: string } {
+  const base = normalizeAsset(asset);
+  if (!base) return { approvedUsd: 0, reason: 'no asset named' };
+  if (!(requestedUsd > 0)) return { approvedUsd: 0, reason: 'no amount requested' };
+  if (!allowances.has(base))
+    return { approvedUsd: 0, reason: `${base} has no standing sell allowance; it stays reserved` };
+  const remaining = remainingSellAllowance(base, allowances, soldUsd);
+  if (remaining <= 0)
+    return { approvedUsd: 0, reason: `the ${fmt(allowances.get(base) ?? 0)} allowance on ${base} is already used up` };
+  const free = Number.isFinite(freeUsd) ? Math.max(0, freeUsd) : 0;
+  if (free <= 0)
+    return { approvedUsd: 0, reason: `no freely sellable ${base}; the balance is staked or locked and has to be unstaked first` };
+  const approved = Math.min(requestedUsd, remaining, free);
+  const capped: string[] = [];
+  if (approved < requestedUsd) {
+    if (remaining < requestedUsd) capped.push(`allowance leaves ${fmt(remaining)}`);
+    if (free < requestedUsd) capped.push(`only ${fmt(free)} is unlocked`);
+  }
+  return {
+    approvedUsd: approved,
+    reason: capped.length
+      ? `capped from ${fmt(requestedUsd)} to ${fmt(approved)} (${capped.join('; ')})`
+      : `approved in full`,
+  };
+}
+
+/**
+ * The standing reserved-sell allowance, stated for the model.
+ *
+ * Two numbers matter and they are routinely different: how much the operator has
+ * authorised, and how much of that the exchange will actually let go today. A
+ * staked balance is not sellable by a spot order, so an allowance of $500 against
+ * an entirely staked holding is worth $0 until the operator unstakes it. Saying
+ * only the first number would have the model plan around cash it cannot raise.
+ */
+export function reservedAllowanceNote(
+  allowances: Map<string, number>,
+  soldUsd: Record<string, number>,
+  holdingsUsd: Record<string, number>,
+  lockedUsd: Record<string, number>,
+): string {
+  if (allowances.size === 0) return '';
+  const lines: string[] = [];
+  for (const [asset] of [...allowances].sort(([a], [b]) => a.localeCompare(b))) {
+    const granted = allowances.get(asset) ?? 0;
+    const remaining = remainingSellAllowance(asset, allowances, soldUsd);
+    const held = Number(holdingsUsd[asset] ?? 0);
+    const locked = Number(lockedUsd[asset] ?? 0);
+    const free = Math.max(0, held - locked);
+    const sellable = Math.min(remaining, free);
+    const used = Math.max(0, granted - remaining);
+    lines.push(
+      `- ${asset}: ${fmt(remaining)} of a ${fmt(granted)} lifetime allowance still available${used > 0 ? ` (${fmt(used)} already used)` : ''}.`,
+      `  Holding ${fmt(held)} of ${asset}, of which ${fmt(locked)} is staked or otherwise locked and cannot be sold by a spot order.`,
+      sellable > 0
+        ? `  You can raise up to ${fmt(sellable)} from it right now.`
+        : locked > 0
+          ? `  Nothing is sellable right now: the balance is locked. The operator has to unstake it before any of this allowance can be used. Say so in message_to_operator if you actually want the cash.`
+          : '  Nothing is sellable right now: no free balance of this asset.',
+    );
+  }
+  return ['RESERVED SELL ALLOWANCE:', ...lines].join('\n');
+}
+
 function envBoolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -439,6 +590,8 @@ function loadConfig(): TradingConfig {
         .filter(Boolean)
         .map(normalizeAsset),
     ),
+    reservedSellAllowanceUsd: parseSellAllowances(process.env.RESERVED_SELL_ALLOWANCE_USD),
+    strategyAllocation: envBoolean('STRATEGY_ALLOCATION', true),
     alertAtR: envNumber('ALERT_AT_R', 0.5, 0, 5),
     allowAddOns: envBoolean('ALLOW_AI_ADD_ONS', true),
     topUpStrandedPositions: envBoolean('TOPUP_STRANDED_POSITIONS', true),
@@ -535,6 +688,222 @@ const SECTOR_WEIGHTS: Record<string, number> = {
   ai: 0.25, rwa: 0.20, defi: 0.25, l1: 0.10,
   perp_dex: 0.10, momentum: 0.05, depin: 0.03, privacy: 0.02,
 };
+
+// ============================================================
+// STRATEGY ALLOCATION — the operator's chosen portfolio framework
+// ============================================================
+
+/**
+ * A slice of the book with a target weight and the names allowed to fill it.
+ *
+ * The operator picked a specific allocation framework for this account: half in
+ * ETH, a third across a fixed large-cap list, the rest rotating through a
+ * shortlist of interchangeable names. This encodes it so the model can see, every
+ * cycle, where the book sits against that plan.
+ *
+ * It is deliberately *not* enforced. The framework decides what gets looked at
+ * first and what "underweight" means; the model still decides whether any given
+ * entry is worth taking today. A plan that buys ETH into a collapsing tape
+ * because the spreadsheet said 50% is worse than no plan at all.
+ */
+export interface StrategyBucket {
+  name: string;
+  label: string;
+  /** Share of the strategy book this bucket should hold, 0-1. */
+  targetPct: number;
+  /** Asset bases eligible to fill it, in the operator's stated order. */
+  assets: string[];
+  note: string;
+}
+
+export const STRATEGY_BUCKETS: StrategyBucket[] = [
+  {
+    name: 'core',
+    label: 'Core (ETH)',
+    targetPct: 0.50,
+    assets: ['ETH'],
+    note: 'The anchor. Held through chop; not traded around for a few percent.',
+  },
+  {
+    name: 'large_cap',
+    label: 'Large caps',
+    targetPct: 0.33,
+    assets: ['HYPE', 'LINK', 'XLM', 'NEAR', 'AAVE', 'ONDO'],
+    note: 'Established names with a working business. Spread across them; hold on a timeframe of months, not days.',
+  },
+  {
+    name: 'rotational',
+    label: 'Rotational / interchangeable',
+    targetPct: 0.17,
+    assets: ['XRP', 'SOL', 'HBAR', 'AVAX', 'UNI', 'ICP', 'INJ', 'CANTON'],
+    note: 'Interchangeable within the sleeve. Rotate between them on relative strength; this is where a conviction call earns its keep.',
+  },
+];
+
+/** Every base the framework names, whichever bucket it belongs to. */
+export const STRATEGY_ASSETS = new Set(
+  STRATEGY_BUCKETS.flatMap(bucket => bucket.assets.map(asset => asset.toUpperCase())),
+);
+
+/** The USD pairs the framework wants watched. Unlisted ones are dropped later. */
+export const STRATEGY_PAIRS = [...STRATEGY_ASSETS].map(asset => `${asset}/USD`);
+
+export function strategyBucketFor(asset: string): StrategyBucket | null {
+  const base = normalizeAsset(asset);
+  return STRATEGY_BUCKETS.find(bucket => bucket.assets.includes(base)) ?? null;
+}
+
+export function isStrategyPair(pair: string): boolean {
+  const base = pair.split('/')[0];
+  return Boolean(base) && STRATEGY_ASSETS.has(normalizeAsset(base));
+}
+
+export interface AllocationLine {
+  bucket: string;
+  label: string;
+  targetPct: number;
+  targetUsd: number;
+  actualUsd: number;
+  actualPct: number;
+  /** Positive means underweight — this much would have to be bought to hit target. */
+  driftUsd: number;
+  assets: string[];
+  /** What is actually held in this bucket, largest first. */
+  held: Array<{ asset: string; usd: number }>;
+}
+
+/**
+ * Where the book sits against the framework.
+ *
+ * `holdingsUsd` is keyed by normalized base and must include reserved and staked
+ * value: the operator's staked SOL is unquestionably part of their portfolio and
+ * pretending otherwise would report the rotational sleeve as empty while it is in
+ * fact the entire account. What the bot can *do* about a drift is a separate
+ * question, answered by free cash, not by this function.
+ *
+ * `bookUsd` is the denominator — normally the whole account.
+ */
+export function allocationDrift(
+  holdingsUsd: Record<string, number>,
+  bookUsd: number,
+  buckets: StrategyBucket[] = STRATEGY_BUCKETS,
+): AllocationLine[] {
+  const normalized = new Map<string, number>();
+  for (const [asset, usd] of Object.entries(holdingsUsd)) {
+    if (!Number.isFinite(usd) || usd <= 0) continue;
+    const base = normalizeAsset(asset);
+    normalized.set(base, (normalized.get(base) ?? 0) + usd);
+  }
+  const total = Number.isFinite(bookUsd) && bookUsd > 0 ? bookUsd : 0;
+  return buckets.map(bucket => {
+    const held = bucket.assets
+      .map(asset => ({ asset, usd: normalized.get(normalizeAsset(asset)) ?? 0 }))
+      .filter(entry => entry.usd > 0)
+      .sort((a, b) => b.usd - a.usd);
+    const actualUsd = held.reduce((sum, entry) => sum + entry.usd, 0);
+    const targetUsd = total * bucket.targetPct;
+    return {
+      bucket: bucket.name,
+      label: bucket.label,
+      targetPct: bucket.targetPct,
+      targetUsd,
+      actualUsd,
+      actualPct: total > 0 ? actualUsd / total : 0,
+      driftUsd: targetUsd - actualUsd,
+      assets: bucket.assets,
+      held,
+    };
+  });
+}
+
+/** The buckets furthest below target, worst first. Empty when nothing is short. */
+/**
+ * The framework as it bears on one specific pair, for a buy decision.
+ *
+ * The whole allocation table is useful to the portfolio call but mostly noise in
+ * a single-pair decision, where the only questions are: is this name in the plan,
+ * and is its bucket short? A pair outside the framework is told so plainly rather
+ * than left to infer it from an absence — silence there reads as approval.
+ */
+export function candidateAllocationNote(
+  pair: string, lines: AllocationLine[], fullNote: string,
+): string {
+  if (lines.length === 0) return '';
+  const base = normalizeAsset(pair.split('/')[0] || '');
+  const bucket = strategyBucketFor(base);
+  if (!bucket)
+    return [
+      'ALLOCATION FRAMEWORK:',
+      `${base} is not one of the names in the operator's framework.`,
+      'That is not a refusal — you may take it when the setup is genuinely better',
+      'than anything the framework offers. It does mean the bar is higher: say in',
+      'your reasoning what this gives you that an eligible name does not.',
+      '',
+      fullNote,
+    ].join('\n');
+  const line = lines.find(entry => entry.bucket === bucket.name);
+  if (!line) return fullNote;
+  const standing = line.driftUsd > 0
+    ? `That bucket is ${fmt(line.driftUsd)} UNDER its ${(line.targetPct * 100).toFixed(0)}% target — buying here moves the book toward the plan.`
+    : `That bucket is already ${fmt(-line.driftUsd)} over its ${(line.targetPct * 100).toFixed(0)}% target — buying here moves the book away from the plan, so it needs to be worth it on its own merits.`;
+  return [
+    'ALLOCATION FRAMEWORK:',
+    `${base} sits in "${line.label}". ${bucket.note}`,
+    standing,
+    'Being underweight is a tiebreaker, not a reason. A bad entry in the right',
+    'bucket still loses money.',
+    '',
+    fullNote,
+  ].join('\n');
+}
+
+export function underweightBuckets(lines: AllocationLine[]): AllocationLine[] {
+  return lines.filter(line => line.driftUsd > 0).sort((a, b) => b.driftUsd - a.driftUsd);
+}
+
+/**
+ * The framework, rendered for the model.
+ *
+ * Written as a standing plan with the current gap measured against it, and
+ * explicitly as guidance the model may depart from with a reason. The operator's
+ * words for this were that the framework is "the main strategy" but the model
+ * "is in charge" — so the text has to convey a real preference without becoming a
+ * rule the model feels it cannot argue with.
+ */
+export function allocationNote(
+  lines: AllocationLine[], bookUsd: number, deployableUsd: number,
+): string {
+  if (lines.length === 0 || !(bookUsd > 0)) return '';
+  const rows = lines.map(line => {
+    const held = line.held.length
+      ? line.held.map(entry => `${entry.asset} ${fmt(entry.usd)}`).join(', ')
+      : 'nothing held';
+    const gap = line.driftUsd > 0
+      ? `${fmt(line.driftUsd)} UNDER target`
+      : line.driftUsd < 0 ? `${fmt(-line.driftUsd)} over target` : 'on target';
+    return `- ${line.label} — target ${(line.targetPct * 100).toFixed(0)}% (${fmt(line.targetUsd)}), holding ${(line.actualPct * 100).toFixed(1)}% (${fmt(line.actualUsd)}): ${gap}\n  Eligible: ${line.assets.join(', ')}\n  Held: ${held}`;
+  });
+  const short = underweightBuckets(lines);
+  return [
+    'ALLOCATION FRAMEWORK (the operator\'s standing plan for this account):',
+    `Book measured: ${fmt(bookUsd)} — everything the account holds, including staked and reserved value.`,
+    ...rows,
+    '',
+    short.length
+      ? `Most underweight right now: ${short.slice(0, 2).map(line => `${line.label} (${fmt(line.driftUsd)} short)`).join(', ')}.`
+      : 'Every bucket is at or above its target weight.',
+    `Capital you can actually deploy this cycle: ${fmt(deployableUsd)}. Closing a gap larger than that is a direction of travel, not something to finish today — buy toward it in the size you have.`,
+    '',
+    'How to use this: when two candidates are close, prefer the one that fills the',
+    'most underweight bucket, and prefer a name already on the eligible list over one',
+    'that is not. A name outside the framework is not forbidden — take it when the',
+    'setup is genuinely better and say why in your reasoning. Do not buy something',
+    'only because it is underweight: an underweight bucket with no good entry stays',
+    'underweight, and that is the correct outcome. Never sell a position at a loss to',
+    'rebalance toward a target weight.',
+  ].join('\n');
+}
+
 
 // Railway-style hosts wipe the working directory on redeploy; point DATA_DIR at a
 // mounted volume to keep positions and trade history across restarts.
@@ -857,6 +1226,10 @@ interface DecisionCandidate {
   pair: string;
   mover?: 'gainer' | 'loser';
   sleeper?: boolean;
+  /** Bucket name when this pair belongs to the operator's allocation framework. */
+  strategy?: string;
+  /** Rank of that bucket by how underweight it is; 0 is the most underweight. */
+  strategyPriority?: number;
   score: { score: number };
 }
 
@@ -868,6 +1241,7 @@ interface DecisionCandidate {
  */
 export function prioritizeMoverCandidates<T extends DecisionCandidate>(
   candidates: T[], budget: number, moverSlots = Math.ceil(budget / 2), sleeperSlots = 0,
+  strategySlots = 0,
 ): T[] {
   const reserved: T[] = [];
   const reservedPairs = new Set<string>();
@@ -879,13 +1253,25 @@ export function prioritizeMoverCandidates<T extends DecisionCandidate>(
     }
   };
 
+  // The framework's own names get first claim, most underweight bucket first.
+  // Everything downstream of this is discretionary: movers and sleepers are how
+  // the bot looks beyond the plan, and they keep their slots. But if the plan
+  // never gets a decision slot it is not a plan, it is a comment in the prompt.
+  const strategyPool = candidates
+    .filter(candidate => candidate.strategy)
+    .sort((a, b) =>
+      (a.strategyPriority ?? 0) - (b.strategyPriority ?? 0) ||
+      b.score.score - a.score.score ||
+      a.pair.localeCompare(b.pair));
+  reserve(strategyPool, Math.min(Math.floor(strategySlots), budget));
+
   const moverPool = candidates
-    .filter(candidate => candidate.mover)
+    .filter(candidate => candidate.mover && !reservedPairs.has(candidate.pair))
     .sort((a, b) =>
       (a.mover === 'loser' ? 0 : 1) - (b.mover === 'loser' ? 0 : 1) ||
       b.score.score - a.score.score ||
       a.pair.localeCompare(b.pair));
-  reserve(moverPool, Math.min(Math.floor(moverSlots), budget));
+  reserve(moverPool, Math.min(Math.floor(moverSlots), Math.max(0, budget - reserved.length)));
 
   const sleeperPool = candidates
     .filter(candidate => candidate.sleeper && !reservedPairs.has(candidate.pair))
@@ -2268,6 +2654,64 @@ class Exchange {
     } catch (e: any) { console.error(`  [SELL FAIL] ${pair}: ${e.message}`); return null; }
   }
 
+  /**
+   * Sells a bounded dollar amount of a reserved holding, under an explicit grant.
+   *
+   * Deliberately separate from `sell`, which refuses reserved assets outright and
+   * must keep doing so: that refusal is the boundary protecting the operator's
+   * holdings, and threading an exception through it would weaken every ordinary
+   * exit path. This is the one narrow door, and it only opens on an amount the
+   * caller has already checked against the operator's standing allowance.
+   *
+   * Only a freely sellable balance is ever touched. A staked balance is invisible
+   * to `getAvailableBase`, so an allowance against an entirely staked holding
+   * raises nothing and says why, rather than failing at the exchange.
+   */
+  async sellReserved(pair: string, usdTarget: number): Promise<OrderFill | null> {
+    if (!(usdTarget > 0)) return null;
+    try {
+      const price = await this.getPrice(pair, !this.paper);
+      if (!price) {
+        console.error(`  [RESERVED SELL] ${pair}: no price available; nothing sold`);
+        return null;
+      }
+      if (this.paper) {
+        const qty = usdTarget / price;
+        console.log(`  [PAPER RESERVED SELL] ${qty.toFixed(6)} ${pair} @ ${fmt(price)} = ${fmt(usdTarget)}`);
+        this.balanceDirty = true;
+        return { qty, price, feeUsd: 0 };
+      }
+      const availableBase = this.getAvailableBase(pair);
+      if (availableBase === null) {
+        console.error(`  [RESERVED SELL] ${pair}: free balance unknown; refusing to size a sale blind`);
+        return null;
+      }
+      if (availableBase <= 0) {
+        console.warn(`  [RESERVED SELL] ${pair}: the whole holding is staked or locked, so none of the allowance can be used. Unstake it on Kraken first.`);
+        return null;
+      }
+      const sellQty = Math.min(usdTarget / price, availableBase);
+      const orderQty = await this.normalizeOrderAmount(pair, sellQty, price);
+      if (orderQty === null) {
+        console.warn(`  [RESERVED SELL] ${pair}: ${fmt(sellQty * price)} is below Kraken's minimum sellable size; nothing sold`);
+        return null;
+      }
+      const placed = await this.ex.createMarketSellOrder(pair, orderQty);
+      const order = await this.resolveOrder(placed, pair);
+      if (this.isUnfilled(order)) {
+        console.warn(`  [RESERVED SELL] ${pair}: order ${order?.status ?? 'ended'} without a fill`);
+        return null;
+      }
+      const fill = this.orderFill(order, orderQty, price, pair);
+      this.balanceDirty = true;
+      console.log(`  [RESERVED SELL] ${fill.qty.toFixed(6)} ${pair} @ ${fmt(fill.price)} = ${fmt(fill.qty * fill.price)} (fee ${fmt(fill.feeUsd)}) — raised under the operator's standing allowance`);
+      return fill;
+    } catch (e: any) {
+      console.error(`  [RESERVED SELL] ${pair} failed: ${e.message}`);
+      return null;
+    }
+  }
+
   /** ATR-priced stop and target for a holding the bot did not open itself. */
   private async importedPlan(pair: string, price: number): Promise<(TradePlan & { atr: number | null }) | null> {
     try {
@@ -2467,17 +2911,42 @@ class Exchange {
           }
           return total;
         };
-        const tradableCrypto = await valueOf(this.mapHoldings(balance, false, false));
-        const allCrypto = await valueOf(this.mapHoldings(balance, false, true));
+        const tradableHoldings = this.mapHoldings(balance, false, false);
+        const allHoldings = this.mapHoldings(balance, false, true);
+        const tradableCrypto = await valueOf(tradableHoldings);
+        const allCrypto = await valueOf(allHoldings);
         // Reserved holdings are the operator's, not the bot's working capital;
         // counting them would inflate every position size it asks for.
-        const reservedUsd = await valueOf(this.reservedHoldings(balance));
+        const reservedHoldings = this.reservedHoldings(balance);
+        const reservedUsd = await valueOf(reservedHoldings);
         const stakedUsd = Math.max(0, allCrypto - tradableCrypto) + reservedUsd;
+        // Per-asset value for the allocation framework. Freely sellable value is
+        // tracked separately from locked value, because "the book is 97% SOL" and
+        // "the bot can sell $0 of that SOL" are both true and both need saying.
+        const holdingsUsd: Record<string, number> = {};
+        const lockedUsd: Record<string, number> = {};
+        const accrue = async (
+          holdings: Record<string, { asset: string; qty: number }>, locked: boolean,
+        ) => {
+          for (const [pair, holding] of Object.entries(holdings)) {
+            const price = await this.getCyclePrice(pair);
+            if (price === null) continue;
+            const base = normalizeAsset(holding.asset);
+            const usd = holding.qty * price;
+            holdingsUsd[base] = (holdingsUsd[base] ?? 0) + usd;
+            if (locked || isStakedBalance(holding.asset))
+              lockedUsd[base] = (lockedUsd[base] ?? 0) + usd;
+          }
+        };
+        await accrue(allHoldings, false);
+        await accrue(reservedHoldings, true);
         const snapshot: PortfolioSnapshot = {
           totalUsd: cashUsd + allCrypto + reservedUsd,
           cashUsd,
           tradableUsd: cashUsd + tradableCrypto,
           stakedUsd,
+          holdingsUsd,
+          lockedUsd,
         };
         console.log(`  [BALANCE] API: ${fmt(cashUsd)} cash + ${fmt(tradableCrypto)} tradable crypto${stakedUsd > 0 ? ` + ${fmt(stakedUsd)} staked or reserved (not the bot's to spend)` : ''} = ${fmt(snapshot.totalUsd)}`);
         if (snapshot.totalUsd > 0) return snapshot;
@@ -2502,7 +2971,7 @@ class Exchange {
       console.warn(`  [BALANCE] Falling back to PORTFOLIO_VALUE: ${fmt(total)} (${fmt(marketValue)} in tracked positions)`);
       // Free cash is unknown here, so claim none: an over-optimistic guess would
       // size orders the exchange is going to reject anyway.
-      return { totalUsd: total, cashUsd: 0, tradableUsd: total, stakedUsd: 0 };
+      return { totalUsd: total, cashUsd: 0, tradableUsd: total, stakedUsd: 0, holdingsUsd: {}, lockedUsd: {} };
     }
     // Paper: simulated cash plus positions marked to market. This used to return the
     // configured starting value forever, so paper results never compounded and every
@@ -2512,7 +2981,12 @@ class Exchange {
     console.log(`  [BALANCE] Paper: ${fmt(cash)} cash + ${fmt(marketValue)} positions = ${fmt(total)}`);
     const value = total > 0 ? total : CONFIG.fallbackPortfolioValue;
     if (this.paper) this.balanceDirty = false;
-    return { totalUsd: value, cashUsd: cash, tradableUsd: value, stakedUsd: 0 };
+    const paperHoldings: Record<string, number> = {};
+    for (const position of mem.getOpenPositions()) {
+      const base = normalizeAsset(position.pair.split('/')[0]);
+      paperHoldings[base] = (paperHoldings[base] ?? 0) + position.qty * position.currentPrice;
+    }
+    return { totalUsd: value, cashUsd: cash, tradableUsd: value, stakedUsd: 0, holdingsUsd: paperHoldings, lockedUsd: {} };
   }
 
   /**
@@ -2571,6 +3045,7 @@ class Memory {
       lastScan: '', lastAiDecision: '', cycleCount: 0,
       recentTrades: [], sectorStats: {}, riskDay: utcDay(), riskDayPnl: 0, paperCash: null,
       lastStance: null, fundingRequest: null, chatLog: [], lastAccountSnapshot: null,
+      reservedSoldUsd: {},
       equityHistory: [], tradingPaused: false, pauseReason: '', flattenRequested: false,
       ...saved,
     };
@@ -2586,6 +3061,11 @@ class Memory {
     this.state.lastStance = saved.lastStance && typeof saved.lastStance === 'object' ? saved.lastStance : null;
     this.state.fundingRequest = saved.fundingRequest && typeof saved.fundingRequest === 'object' ? saved.fundingRequest : null;
     this.state.chatLog = Array.isArray(saved.chatLog) ? saved.chatLog.slice(-CHAT_LOG_LIMIT) : [];
+    this.state.reservedSoldUsd = saved.reservedSoldUsd && typeof saved.reservedSoldUsd === 'object'
+      ? Object.fromEntries(Object.entries(saved.reservedSoldUsd)
+          .map(([asset, usd]) => [normalizeAsset(asset), Number(usd)])
+          .filter(([, usd]) => Number.isFinite(usd as number) && (usd as number) > 0))
+      : {};
     this.state.lastAccountSnapshot = saved.lastAccountSnapshot && typeof saved.lastAccountSnapshot === 'object'
       ? saved.lastAccountSnapshot : null;
     this.state.equityHistory = Array.isArray(saved.equityHistory)
@@ -2780,6 +3260,20 @@ class Memory {
    */
   /** Returns true when this call raised a funding request that was not already standing
    * at the same amount, so the caller can decide whether it is worth a notification. */
+  /**
+   * Books cash raised from a reserved holding against its lifetime allowance.
+   *
+   * Recorded on the fill, not on the request, and by realised proceeds rather
+   * than the amount asked for: a partial fill or a worse price than quoted must
+   * consume only what it actually raised, or the operator's cap drifts away from
+   * the money that really left.
+   */
+  recordReservedSale(asset: string, usdRaised: number) {
+    if (!(usdRaised > 0)) return;
+    const base = normalizeAsset(asset);
+    this.state.reservedSoldUsd[base] = (this.state.reservedSoldUsd[base] ?? 0) + usdRaised;
+  }
+
   recordStance(stance: PortfolioStance): boolean {
     this.state.lastStance = {
       ...stance,
@@ -3242,6 +3736,15 @@ export function isModelUnavailable(error: unknown): boolean {
   const value = error as any;
   const message = String(value?.message || error || '').toLowerCase();
   const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
+  // 403 is how a provider gates a model it advertises but will not serve to this
+  // client. OpenRouter answers "<id> is only available on agentic harnesses" for
+  // several of the free ids its own /models catalog returns. Unclassified, that
+  // reply was not "try the next candidate" — so the bot latched onto one such id
+  // and answered HOLD to every decision for 409 consecutive cycles while the
+  // health line read like an ordinary error. Never let a refusal that another
+  // model id would satisfy look like a transient failure.
+  if (status === 403)
+    return /only available|not available|unavailable|no endpoints|not permitted|restricted/.test(message);
   if (status !== 400 && status !== 404) return false;
   return /model/.test(message) && /unavailable|no longer|deprecated|retired|use this slug/.test(message);
 }
@@ -3369,6 +3872,20 @@ If the opportunity in front of you is larger than the account can fund, set
 funds them manually. Ask for 0 when the account is adequate. Do not ask every cycle;
 ask when it would change what you can actually do.
 
+RAISING CASH FROM A RESERVED HOLDING:
+Some holdings are the operator's and off limits to you. Occasionally they grant a
+bounded exception — "you may raise up to $N from my SOL". When one is in force it
+is stated under RESERVED SELL ALLOWANCE below, with the amount still available and
+how much of it is actually sellable today. To use it, name the asset in
+"raise_from_reserved_asset" and the dollars in "raise_from_reserved_usd"; the bot
+sells that much at market and the proceeds become cash you can deploy.
+
+Treat this as a real decision, not free money. You are converting something the
+operator chose to hold into something you have to redeploy well, and the sale is
+irreversible — the allowance does not refill. Use it when you can name what you
+would buy with the proceeds and why that is better than continuing to hold. Ask for
+nothing when no allowance is stated, or when you have nowhere better to put it.
+
 TALKING TO THE OPERATOR:
 Anything under "OPERATOR MESSAGE" below was written by the operator since you last
 spoke. Reply in "message_to_operator" — leave it empty if there is nothing to say,
@@ -3389,7 +3906,7 @@ stance in "counter_case", then keep the stance only if it survives that.
 
 Keep "reasoning" under 25 words, "counter_case" under 20, "message_to_operator" under 60,
 and "charter_suggestion" under 40.
-{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "counter_case": "strongest argument against this", "message_to_operator": "reply or empty string", "charter_suggestion": "suggested mandate change or empty string"}`;
+{"stance": "RISK_ON" or "NEUTRAL" or "RISK_OFF", "confidence": 1-10, "reasoning": "brief why", "cash_target_pct": 0-100, "requested_funds_usd": 0 or greater, "raise_from_reserved_asset": "asset symbol or empty string", "raise_from_reserved_usd": 0 or greater, "counter_case": "strongest argument against this", "message_to_operator": "reply or empty string", "charter_suggestion": "suggested mandate change or empty string"}`;
 const CHARTERED_STANCE_SYSTEM_PROMPT = composeSystemPrompt(STANCE_SYSTEM_PROMPT, SOUL_CHARTER.contents, PLAYBOOK.contents);
 const NEWS_SYSTEM_PROMPT = composeSystemPrompt(
   'You are a crypto market-news researcher. Return the requested JSON object only.',
@@ -3411,6 +3928,10 @@ export function normalizeStance(json: any): PortfolioStance {
     counterCase: typeof json?.counter_case === 'string' && json.counter_case.trim() ? json.counter_case.trim() : '',
     cashTargetPct: Number.isFinite(cashValue) ? Math.min(1, Math.max(0, cashValue / 100)) : 0,
     requestedFundsUsd: Number.isFinite(fundsValue) && fundsValue > 0 ? fundsValue : 0,
+    raiseFromReservedAsset: typeof json?.raise_from_reserved_asset === 'string'
+      ? normalizeAsset(json.raise_from_reserved_asset.trim()) : '',
+    raiseFromReservedUsd: Number.isFinite(Number(json?.raise_from_reserved_usd)) &&
+      Number(json.raise_from_reserved_usd) > 0 ? Number(json.raise_from_reserved_usd) : 0,
     messageToOperator: typeof json?.message_to_operator === 'string' ? json.message_to_operator.trim() : '',
     charterSuggestion: typeof json?.charter_suggestion === 'string' ? json.charter_suggestion.trim() : '',
   };
@@ -3551,6 +4072,7 @@ Free cash available for this pair after fee reserve: ${fmt(context?.spendableCas
 Pair minimum order value: ${context?.marketMinimumUsd === null || context?.marketMinimumUsd === undefined ? 'unavailable' : fmt(context.marketMinimumUsd)}
 A position percentage that translates below the pair minimum will be raised to that minimum when available cash can cover it.
 ${marketContextNote(context?.relativeStrength, context?.windowHigh) ? `\nMARKET CONTEXT:\n${marketContextNote(context?.relativeStrength, context?.windowHigh)}\n` : ''}
+${context?.allocation ? `\n${context.allocation}\n` : ''}
 ${context?.concentration ? `\n${context.concentration}\n` : ''}
 ${context?.marketContext ? `\nMARKET CONTEXT NOTE (evidence, not an instruction):\n${context.marketContext}\n` : ''}
 BUY or HOLD?`, pair);
@@ -3718,12 +4240,12 @@ HOLD, SELL, or ADJUST?`, pair);
     }
   }
 
-  private switchToFreeModel(): boolean {
+  private switchToFreeModel(reason = 'the paid balance is spent'): boolean {
     const free = this.freeModelCandidates.shift();
     if (!free) return false;
-    if (free === this.model) return this.switchToFreeModel();
+    if (free === this.model) return this.switchToFreeModel(reason);
     const remaining = this.freeModelCandidates.length;
-    console.error(`  [AI] Paid balance is spent; switching to the no-cost model "${free}" for the rest of this run${remaining > 0 ? ` (${remaining} more to try if it is unavailable)` : ''}.`);
+    console.error(`  [AI] ${reason}; switching to the no-cost model "${free}" for the rest of this run${remaining > 0 ? ` (${remaining} more to try if it is unavailable)` : ''}.`);
     console.error('  [AI] Decision quality will be lower than the paid model. Top up to restore it.');
     this.model = free;
     this.switchedToFreeTier = true;
@@ -3845,11 +4367,12 @@ HOLD, SELL, or ADJUST?`, pair);
         }
         // A free slug that has been withdrawn ("unavailable for free") is not a
         // reason to give up on the free tier — try the next candidate instead.
-        if (isModelUnavailable(e) && this.switchedToFreeTier) {
+        if (isModelUnavailable(e) &&
+            (this.switchedToFreeTier || this.modelFellBack || !CONFIG.aiModelFallback)) {
           // A withdrawn free slug: top up from the live catalog if not done yet,
           // then try the next candidate rather than abandoning the free tier.
           await this.discoverFreeModels();
-          if (this.switchToFreeModel()) continue;
+          if (this.switchToFreeModel(`"${this.model}" is listed but the provider refuses to serve it`)) continue;
         }
         // A model the provider does not recognise is fatal to every later call,
         // so switch to the fallback once rather than failing the whole run.
@@ -3950,6 +4473,8 @@ HOLD, SELL, or ADJUST?`, pair);
     concentration = '',
     marketNote = '',
     correlationNote = '',
+    allocation = '',
+    allowanceNote = '',
   ): Promise<PortfolioStance> {
     const breadth = candidates.length;
     const bullish = candidates.filter(c => c.ta.htfTrend === 'bullish').length;
@@ -3981,6 +4506,8 @@ MARKET BREADTH (${breadth} watchlist pairs with usable data):
 4h trend: ${bullish} bullish, ${bearish} bearish, ${breadth - bullish - bearish} neutral
 Average RSI: ${avgRsi} | ${overbought} overbought (>70) | ${oversold} oversold (<35)
 Best-ranked setups: ${best}
+${allocation ? `\n${allocation}\n` : ''}
+${allowanceNote ? `\n${allowanceNote}\n` : ''}
 ${concentration ? `\n${concentration}\n` : ''}
 ${marketNote ? `\n${marketNote}\n` : ''}
 ${correlationNote ? `\n${correlationNote}\n` : ''}
@@ -3989,7 +4516,7 @@ What is the stance for this cycle?`;
     const json = await this.requestJsonObject(CHARTERED_STANCE_SYSTEM_PROMPT, prompt, 'PORTFOLIO');
     if (!json) {
       console.warn('  [AI] No usable portfolio stance; defaulting to NEUTRAL for this cycle');
-      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, messageToOperator: '', charterSuggestion: '' };
+      return { stance: 'NEUTRAL', confidence: 5, reasoning: 'AI unavailable', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, raiseFromReservedAsset: '', raiseFromReservedUsd: 0, messageToOperator: '', charterSuggestion: '' };
     }
     // Persisting is the caller's job, so the record is kept no matter which
     // implementation produced the stance.
@@ -4174,6 +4701,22 @@ export async function runPreflight(
       `${reserved} will not be bought, sold or managed${stillListed.length ? ` (${stillListed.join(', ')} removed from the scan)` : ''}`);
   }
 
+  // 0b. Allocation framework reachability. Explicitly NOT critical: a framework
+  //     name Kraken does not list cannot be bought here, which narrows the plan
+  //     but is no reason to stop trading the names that are listed.
+  if (CONFIG.strategyAllocation) {
+    try {
+      const missingStrategy = await exchange.listMissingMarkets(STRATEGY_PAIRS);
+      const listed = STRATEGY_PAIRS.length - missingStrategy.length;
+      add('Allocation framework', missingStrategy.length === 0,
+        missingStrategy.length === 0
+          ? `all ${STRATEGY_PAIRS.length} framework pairs are listed on Kraken`
+          : `${listed}/${STRATEGY_PAIRS.length} framework pairs listed; unreachable here: ${missingStrategy.join(', ')}`);
+    } catch (e: any) {
+      add('Allocation framework', false, `could not check framework markets: ${e.message}`);
+    }
+  }
+
   // 1. Market coverage — a watchlist pair Kraken does not list is dead weight.
   try {
     const missing = await exchange.listMissingMarkets(preflightPairs);
@@ -4321,6 +4864,17 @@ let shutdownRequested = false;
  * worth refusing outright.
  */
 let newEntriesBlocked: string | null = null;
+/**
+ * True when the only critical preflight failure was the AI check.
+ *
+ * A preflight block used to be permanent for the life of the process. That is
+ * right for a broken exchange connection, and badly wrong for the model: a free
+ * model id that the provider had stopped serving failed preflight at boot, and
+ * the bot then refused every new entry for four straight days — long after a
+ * later cycle had walked to a working model and was answering normally. An
+ * AI-caused block has to lift the moment the AI demonstrably works again.
+ */
+let newEntriesBlockedByAiOnly = false;
 /** UTC day the daily-loss breaker was last notified for, so a webhook fires once
  * per trip instead of every cycle it stays blocked. */
 let dailyLossNotifiedDay: string | null = null;
@@ -4375,6 +4929,8 @@ async function main() {
   console.log(`[CONFIG] Risk model: stop ${CONFIG.atrStopMult}x ATR (max ${pct(CONFIG.maxStopDistancePct)} from entry) | target ${CONFIG.atrTargetMult}x ATR | trail ${CONFIG.trailingStopAtrMult > 0 ? `${CONFIG.trailingStopAtrMult}x ATR` : 'off'} | breakeven at ${CONFIG.breakevenAtR > 0 ? `${CONFIG.breakevenAtR}R` : 'off'}`);
   console.log(`[CONFIG] Preferred concurrent positions: ${limit(CONFIG.targetPositionCount)} (guidance, not a cap)`);
   console.log(`[CONFIG] Reserved assets: ${CONFIG.excludedAssets.size ? [...CONFIG.excludedAssets].sort().join(', ') : 'none'} (never bought, sold or managed)`);
+  console.log(`[CONFIG] Reserved sell allowance: ${CONFIG.reservedSellAllowanceUsd.size ? [...CONFIG.reservedSellAllowanceUsd].map(([asset, usd]) => `${asset} up to ${fmt(usd)}`).join(', ') : 'none'} (lifetime cap, unlocked balances only)`);
+  console.log(`[CONFIG] Allocation framework: ${CONFIG.strategyAllocation ? STRATEGY_BUCKETS.map(bucket => `${bucket.label} ${(bucket.targetPct * 100).toFixed(0)}%`).join(' | ') : 'off'}`);
   console.log(`[CONFIG] Daily loss breaker: ${limit(CONFIG.maxDailyLossPct)} | Max positions: ${limit(CONFIG.maxOpenPositions)} | Max sector exposure: ${limit(CONFIG.maxSectorExposurePct)}`);
 
   const exchange = new Exchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET, CONFIG.paperMode);
@@ -4469,7 +5025,12 @@ async function main() {
         process.exit(healthy ? 0 : 1);
       }
       if (!healthy) {
-        newEntriesBlocked = 'preflight reported a critical failure';
+        const criticalFailures = checks.filter(check => !check.ok && check.critical);
+        newEntriesBlockedByAiOnly = criticalFailures.length > 0 &&
+          criticalFailures.every(check => check.name === 'AI decisions');
+        newEntriesBlocked = newEntriesBlockedByAiOnly
+          ? 'preflight could not get a usable decision out of the AI'
+          : 'preflight reported a critical failure';
         console.error('[PREFLIGHT] Critical checks failed; existing positions will still be managed and exited, but no new positions will be opened.');
         await notifyWebhook('preflight_critical',
           'Preflight found a critical failure at startup. Existing positions are still managed, but no new positions will open until this is resolved.');
@@ -4993,6 +5554,14 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   const cycleCashSpent: Record<string, number> = {};
 
   const blockers: string[] = [];
+  // An AI that has since answered successfully has settled the only question the
+  // failed check was asking. Holding the block past that point stops the bot
+  // trading for a reason that is no longer true.
+  if (newEntriesBlocked && newEntriesBlockedByAiOnly && ai.health.lastSuccessAt) {
+    console.log(`  [PREFLIGHT] The AI has answered successfully since the failed startup check (last success ${ai.health.lastSuccessAt}); lifting the block on new entries.`);
+    newEntriesBlocked = null;
+    newEntriesBlockedByAiOnly = false;
+  }
   if (newEntriesBlocked) blockers.push(newEntriesBlocked);
   if (mem.state.tradingPaused) blockers.push(`trading paused: ${mem.state.pauseReason}`);
   if (CONFIG.maxExposurePct !== null && exposure >= portfolioValue * CONFIG.maxExposurePct)
@@ -5027,6 +5596,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   let scanMedianChangePct = stagedMedianChangePct;
   const moverByPair = new Map<string, 'gainer' | 'loser'>();
   const sleeperPairs = new Set<string>();
+  const strategyScanPairs = new Set<string>();
   if (canOpen) {
     try {
       if (!stage1FetchSucceeded) {
@@ -5067,7 +5637,16 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           CONFIG.sleeperCount,
         );
         for (const ticker of sleepers) sleeperPairs.add(ticker.pair);
+        // The operator's framework names the coins it wants held. A coarse rank
+        // built to reward what is loud will not surface a quiet ETH or LINK every
+        // cycle, so the framework's own names are forced into TA the same way
+        // movers and sleepers are — otherwise the plan can never be filled.
+        const listedStrategy = CONFIG.strategyAllocation
+          ? liquidTickers.filter(ticker => isStrategyPair(ticker.pair)).map(ticker => ticker.pair)
+          : [];
+        for (const pair of listedStrategy) strategyScanPairs.add(pair);
         scanPairs = [...new Set([
+          ...listedStrategy,
           ...coarseSlice,
           ...movers.gainers.map(ticker => ticker.pair),
           ...movers.losers.map(ticker => ticker.pair),
@@ -5081,6 +5660,12 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
           console.log(`  [SCAN] Movers forced into TA: ${movers.gainers.map(t => `${t.pair} +${t.changePct.toFixed(1)}%`).join(', ') || 'none'} | losers: ${movers.losers.map(t => `${t.pair} ${t.changePct.toFixed(1)}%`).join(', ') || 'none'}`);
         if (sleepers.length > 0)
           console.log(`  [SCAN] Sleepers forced into TA (quiet, under the radar): ${sleepers.map(t => `${t.pair} ${t.changePct >= 0 ? '+' : ''}${t.changePct.toFixed(1)}%`).join(', ')}`);
+        if (CONFIG.strategyAllocation) {
+          const missing = STRATEGY_PAIRS.filter(pair => !listedStrategy.includes(pair));
+          console.log(`  [SCAN] Allocation framework forced into TA: ${listedStrategy.join(', ') || 'none'}`);
+          if (missing.length > 0)
+            console.log(`  [SCAN] Framework names Kraken does not list above the volume floor, so they cannot be bought here: ${missing.join(', ')}`);
+        }
         const categories = [...new Set(scanPairs.map(pair => getSector(pair)))];
         console.log(`  [SCAN] Category spread: ${categories.join(', ') || 'none'}${categories.length === 1 && categories[0] === 'unlisted' ? ' (Kraken provides no sector metadata for discovered markets)' : ''}`);
       }
@@ -5105,6 +5690,9 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         pair, sector: getSector(pair), ta,
         vol: ticker?.volume24h ?? 0, score: scoreSetup(ta), plan: planTrade(ta),
         mover, sleeper,
+        strategy: CONFIG.strategyAllocation && isStrategyPair(pair)
+          ? strategyBucketFor(pair.split('/')[0])?.name
+          : undefined,
       };
     } catch (e) {
       console.warn(`  [PHASE 2] ${pair} skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -5116,15 +5704,37 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
   candidates.sort((a, b) => b.score.score - a.score.score || a.ta.rsi - b.ta.rsi);
   for (const c of candidates) {
     const distance = c.score.supportDistance === null ? 'none' : pct(c.score.supportDistance);
-    console.log(`  [CANDIDATE] ${c.pair}${c.mover ? ` [MOVER ${c.mover}]` : ''}${c.sleeper ? ' [SLEEPER]' : ''}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
+    console.log(`  [CANDIDATE] ${c.pair}${c.strategy ? ` [FRAMEWORK ${c.strategy}]` : ''}${c.mover ? ` [MOVER ${c.mover}]` : ''}${c.sleeper ? ' [SLEEPER]' : ''}: score=${c.score.score.toFixed(2)} | RSI=${c.ta.rsi} | 1h=${c.ta.trend} 4h=${c.ta.htfTrend} | volume=${c.ta.volumeRatio}x | ATR=${c.ta.atrPct === null ? 'n/a' : pct(c.ta.atrPct)} | support distance=${distance}`);
   }
 
   // ── PHASE 3: AI DECISIONS ──
   console.log('\n── PHASE 3: AI analysis ──');
 
+  // Where the book stands against the operator's allocation framework. Measured
+  // against the whole account — staked value included — because that is what the
+  // plan is a plan for. What can be *done* about a gap is bounded by free cash,
+  // which is stated separately so the model never plans against money it cannot
+  // reach.
+  const allocationLines = CONFIG.strategyAllocation
+    ? allocationDrift(account.holdingsUsd, account.totalUsd)
+    : [];
+  const deployableUsd = Math.max(0, account.cashUsd) * (1 - CONFIG.feeReservePct);
+  const allocationText = allocationLines.length
+    ? allocationNote(allocationLines, account.totalUsd, deployableUsd)
+    : '';
+  const bucketPriority = new Map<string, number>();
+  underweightBuckets(allocationLines).forEach((line, index) => bucketPriority.set(line.bucket, index));
+  for (const line of allocationLines)
+    console.log(`  [ALLOCATION] ${line.label}: ${fmt(line.actualUsd)} held (${(line.actualPct * 100).toFixed(1)}%) vs ${fmt(line.targetUsd)} target (${(line.targetPct * 100).toFixed(0)}%) — ${line.driftUsd > 0 ? `${fmt(line.driftUsd)} under` : line.driftUsd < 0 ? `${fmt(-line.driftUsd)} over` : 'on target'}`);
+  if (allocationLines.length)
+    console.log(`  [ALLOCATION] Deployable cash this cycle: ${fmt(deployableUsd)}`);
+  for (const candidate of candidates)
+    if (candidate.strategy)
+      (candidate as any).strategyPriority = bucketPriority.get(candidate.strategy) ?? allocationLines.length;
+
   // The model's call on the whole book comes first. It can decline to deploy
   // capital at all this cycle, reserve dry powder for a dip, or ask for more funds.
-  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, messageToOperator: '', charterSuggestion: '' };
+  let stance: PortfolioStance = { stance: 'NEUTRAL', confidence: 5, reasoning: 'not evaluated', counterCase: '', cashTargetPct: 0, requestedFundsUsd: 0, raiseFromReservedAsset: '', raiseFromReservedUsd: 0, messageToOperator: '', charterSuggestion: '' };
   if (!shutdownRequested) {
     const marketNote = !canOpen
       ? `NEW ENTRIES BLOCKED THIS CYCLE: ${blockers.join('; ')}.`
@@ -5141,7 +5751,10 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
     const correlationNote = portfolioCorrelationNote(openDailyCandles);
     if (correlationNote) console.log(`  [STANCE] ${correlationNote}`);
     stance = await ai.reviewPortfolio(account, candidates,
-      concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote, correlationNote);
+      concentrationNote(portfolioValue, mem.getOpenPositions().length), marketNote, correlationNote,
+      allocationText, reservedAllowanceNote(
+        CONFIG.reservedSellAllowanceUsd, mem.state.reservedSoldUsd,
+        account.holdingsUsd, account.lockedUsd));
     if (mem.recordStance(stance))
       await notifyWebhook('funding_request', `KAI is asking for ${fmt(stance.requestedFundsUsd)} more: ${stance.reasoning}`);
     console.log(`  [STANCE] ${stance.stance} (${stance.confidence}/10) — ${stance.reasoning}`);
@@ -5150,18 +5763,60 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
       console.log(`  [STANCE] Holding back ${pct(stance.cashTargetPct)} of the portfolio as dry powder (${fmt(portfolioValue * stance.cashTargetPct)})`);
     if (stance.requestedFundsUsd > 0)
       console.log(`\n  *** FUNDING REQUEST: the model is asking for ${fmt(stance.requestedFundsUsd)} ***\n  Reason: ${stance.reasoning}\n`);
+
+    // The model may raise cash from a reserved holding, but only inside the
+    // operator's standing grant and only out of an unlocked balance. Everything
+    // that trims the request is logged: a silent partial fill here would look
+    // like the allowance working when it is not.
+    if (stance.raiseFromReservedUsd > 0 && stance.raiseFromReservedAsset) {
+      const asset = stance.raiseFromReservedAsset;
+      const held = Number(account.holdingsUsd[asset] ?? 0);
+      const locked = Number(account.lockedUsd[asset] ?? 0);
+      const verdict = approveReservedSale(
+        asset, stance.raiseFromReservedUsd, CONFIG.reservedSellAllowanceUsd,
+        mem.state.reservedSoldUsd, Math.max(0, held - locked),
+      );
+      console.log(`  [RESERVED SELL] Model asked to raise ${fmt(stance.raiseFromReservedUsd)} from ${asset}: ${verdict.reason}`);
+      if (verdict.approvedUsd > 0) {
+        const fill = await exchange.sellReserved(`${asset}/USD`, verdict.approvedUsd);
+        if (fill) {
+          const raised = fill.qty * fill.price;
+          mem.recordReservedSale(asset, raised);
+          mem.saveState();
+          account = await exchange.getPortfolioValue(mem);
+          portfolioValue = account.tradableUsd;
+          console.log(`  [RESERVED SELL] Raised ${fmt(raised)} from ${asset}; ${fmt(remainingSellAllowance(asset, CONFIG.reservedSellAllowanceUsd, mem.state.reservedSoldUsd))} of the allowance remains`);
+          await notifyWebhook('reserved_sale',
+            `KAI sold ${fmt(raised)} of your reserved ${asset} under the standing allowance to fund the book. Reason: ${stance.reasoning}`);
+        }
+      } else if (locked > 0 && held - locked <= 0) {
+        console.warn(`  [RESERVED SELL] ${fmt(locked)} of ${asset} is staked. The allowance cannot be used until you unstake it on Kraken.`);
+      }
+    }
   }
   const cashReserveUsd = portfolioValue * stance.cashTargetPct;
   if (stance.stance === 'RISK_OFF')
     console.log('  [STANCE] RISK_OFF — no new entries this cycle; exits and stops continue as normal.');
 
+  // Half the budget goes to the framework when one is configured. It is the
+  // operator's main plan, so it gets the larger share; the rest still funds the
+  // movers and sleepers that look outside it.
+  const strategySlots = allocationLines.length
+    ? Math.max(1, Math.floor(CONFIG.aiDecisionsPerCycle / 2))
+    : 0;
   const aiCandidates = stance.stance === 'RISK_OFF'
     ? []
     : prioritizeMoverCandidates(
         candidates, CONFIG.aiDecisionsPerCycle,
         Math.ceil(CONFIG.aiDecisionsPerCycle / 2),
         Math.max(1, Math.floor(CONFIG.aiDecisionsPerCycle / 3)),
+        strategySlots,
       );
+  const strategySlotCount = Math.min(
+    strategySlots, aiCandidates.filter(candidate => candidate.strategy).length,
+  );
+  if (strategySlotCount > 0)
+    console.log(`  [AI BUDGET] Reserving ${strategySlotCount}/${CONFIG.aiDecisionsPerCycle} decision slots for allocation-framework names (most underweight bucket first)`);
   const moverSlotCount = Math.min(
     Math.ceil(CONFIG.aiDecisionsPerCycle / 2),
     aiCandidates.filter(candidate => candidate.mover).length,
@@ -5247,6 +5902,7 @@ async function runCycle(exchange: Exchange, mem: Memory, ai: AiBrain) {
         sectorTargetPct: SECTOR_WEIGHTS[c.sector],
       } : {}),
       concentration: concentrationNote(portfolioValue, mem.getOpenPositions().length),
+      allocation: candidateAllocationNote(c.pair, allocationLines, allocationText),
       marketContext: newsContext,
       relativeStrength: relative,
       windowHigh,

@@ -63,6 +63,8 @@ All settings live in `.env` (see `.env.example`):
 - `DAILY_MOVERS_COUNT` — liquid daily gainers and losers forced into Stage 2 (default `3` each)
 - `SLEEPER_COUNT` — quietest liquid markets forced into full TA every cycle (default `3`, `0` disables)
 - `AI_WEB_SEARCH` — enable the optional OpenRouter `:online` loser news check before a mover decision (default `true`; blank or false disables it)
+- `STRATEGY_ALLOCATION` — bias the scan and AI budget toward the operator's target allocation (default `true`)
+- `RESERVED_SELL_ALLOWANCE_USD` — bounded lifetime sell allowances against reserved holdings, as `ASSET:USD` pairs (e.g. `SOL:500`); blank keeps the reserved boundary absolute
 - `FEE_RESERVE_PCT` — cash reserved for buy fees (default `0.01`, or 1%)
 - `DATA_DIR` — where positions, state and trade history live (default `./data`)
 - `OHLCV_CONCURRENCY` — parallel market-data requests per cycle (default `4`)
@@ -204,6 +206,34 @@ excluded from the tradable value used for sizing. A position already tracked for
 Kraken's staking names resolve to the underlying asset, so `SOL` also covers `SOL03.S` and
 `AVAX` covers `AVAX.B`. Being staked is not protection by itself: unstaking would otherwise hand
 the balance straight to the bot.
+
+### Reserved sell allowance
+
+`RESERVED_SELL_ALLOWANCE_USD` grants bounded, one-way exceptions to the reserved boundary, as
+`ASSET:USD` pairs (`SOL:500`). It permits *selling* only — a reserved asset is still never
+bought, never adopted as a position and never scanned — and the cap is cumulative for the life
+of the account: proceeds are booked against it in state as they are realised, so a bot that
+raises $200 has $300 left forever, not $500 again next cycle.
+
+The model asks for it through the stance (`raise_from_reserved_asset` / `raise_from_reserved_usd`)
+and three ceilings apply, smallest winning: what it asked for, what the allowance still permits,
+and what is not locked on the exchange. That last one is usually the binding constraint —
+Kraken will not sell a staked balance through a spot order, so an allowance against a fully
+staked holding raises nothing until the operator unstakes it. Both numbers are stated in the
+prompt, and every trim to a request is logged with its reason.
+
+### Allocation framework
+
+`STRATEGY_ALLOCATION` (default on) gives the model the operator's target shape for the book —
+50% ETH, 33% large caps, 17% rotational — measured against the whole account each cycle,
+staked value included. Framework names are forced into full technical analysis alongside movers
+and sleepers, roughly half the AI decision budget is reserved for them with the most underweight
+bucket first, and both the portfolio stance and each individual entry are told where the gap is.
+
+Like everything else here it is **guidance, not a gate**. The model may take a name outside the
+framework when the setup is better, and is explicitly told not to buy something merely because a
+bucket is short, nor to sell at a loss to rebalance. A framework name Kraken does not list is
+reported at startup as a non-critical preflight finding rather than blocking trading.
 
 ### Concentration
 

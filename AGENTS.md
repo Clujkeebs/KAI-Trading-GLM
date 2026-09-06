@@ -40,7 +40,10 @@ Breaking any of these is a defect regardless of what the tests say:
 
 - Stops only ever tighten, and are clamped by `MAX_STOP_DISTANCE_PCT`.
 - Orders must satisfy free cash and Kraken's amount, cost and precision rules.
-- `EXCLUDED_ASSETS` holdings are never traded, adopted, scanned or counted as tradable.
+- `EXCLUDED_ASSETS` holdings are never bought, adopted, scanned or counted as tradable.
+  Selling one is permitted *only* through `Exchange.sellReserved`, only up to the operator's
+  `RESERVED_SELL_ALLOWANCE_USD` lifetime cap, and only out of an unlocked balance. The ordinary
+  `Exchange.sell` path keeps refusing them outright — do not thread an exception through it.
 - Cost basis and P/L come from actual fills, never from the requested quantity.
 - Ambiguous live order failures are not retried automatically.
 - State writes are atomic; unreadable state is backed up, not discarded.
