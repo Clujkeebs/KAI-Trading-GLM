@@ -37,6 +37,62 @@ than reverting silently, and leave the repo in a state the other can pick up col
 
 ## Log
 
+### 2026-09-06 — Claude — Allocation framework, and the three faults that had production halted
+
+**Changed:** Four things, in the order they mattered.
+
+1. `isModelUnavailable` now classifies HTTP **403** refusals ("`<id>` is only available on agentic
+   harnesses", "no endpoints", "restricted") as *try another model*, and the switch guard no longer
+   requires `switchedToFreeTier` — a gated model is walked past once the named fallback has had its
+   turn. `switchToFreeModel(reason)` logs why it moved.
+2. An **AI-only critical preflight failure no longer blocks entries for the life of the process.**
+   `newEntriesBlockedByAiOnly` is set when the AI check was the only critical failure, and the block
+   lifts on the first cycle where `ai.health.lastSuccessAt` is set.
+3. **Allocation framework** (new, `STRATEGY_ALLOCATION`, default on): `STRATEGY_BUCKETS` (ETH 50% /
+   large caps 33% / rotational 17%), `allocationDrift`, `underweightBuckets`, `allocationNote`,
+   `candidateAllocationNote`, all pure and exported. `PortfolioSnapshot` gained `holdingsUsd` and
+   `lockedUsd` so drift is measured on the whole account with locked value called out separately.
+   Framework pairs are forced into TA next to movers/sleepers, `prioritizeMoverCandidates` gained a
+   `strategySlots` reserve ranked by `strategyPriority` (most underweight first), and both the stance
+   and each entry prompt carry the gap. A framework pair Kraken does not list is a **non-critical**
+   preflight finding — deliberately, since making it critical would halt trading over one dead pair.
+4. **`RESERVED_SELL_ALLOWANCE_USD`** (`ASSET:USD`): bounded, one-way, cumulative-for-life exceptions
+   to the reserved boundary. `parseSellAllowances`, `remainingSellAllowance`, `approveReservedSale`,
+   `reservedAllowanceNote`, `Memory.recordReservedSale`, and a **separate** `Exchange.sellReserved`.
+   `Exchange.sell` still refuses reserved pairs outright and must keep doing so.
+
+**Why:** The account had not opened a position in four days and the cause was stacked. The
+free-model walk latched onto `thinkingmachines/inkling-small:free`, which OpenRouter lists but
+403s; unclassified, that read as an ordinary error, so it never moved on — 409 consecutive AI
+failures on one dead slug. Preflight had failed on that same model at boot and latched the entry
+block permanently, so even a recovered AI would not have traded. And ~$1,050 of the $1,080 account
+is staked (`SOL03.S`, `AVAX.B`), leaving ~$30 deployable. The framework is the operator's own
+strategy; the allowance exists because they authorised selling part of their reserved SOL.
+
+**Verified:** `npm run build` and `npm test` clean, 30 suites (new `test/strategy-check.ts`, wired
+into `npm test`). Covers: bucket weights summing to 1 and no asset in two buckets; drift on an empty
+book, on the live account's all-staked-SOL shape, on Kraken staking names (`SOL03.S` → `SOL`), on a
+zero denominator and on negative/NaN holdings; guidance-not-gate wording in both prompt builders;
+all three allowance ceilings binding independently plus each refusal reason; framework slots
+out-ranking a higher raw score; `strategySlots: 0` reproducing the old ordering exactly; a pair that
+is both framework and mover not consuming two slots; and the exact production 403 string
+classifying, while 401/403-auth/429 do not.
+
+**Watch out:**
+- **The SOL allowance is worth $0 today.** The whole holding is `SOL03.S`; Kraken will not sell a
+  staked balance through a spot order. Per the operator, unstaked SOL should be fully managed rather
+  than capped, so `EXCLUDED_ASSETS` is now **`AVAX` only** and `RESERVED_SELL_ALLOWANCE_USD` is
+  blank. The staked pile stays unreachable by construction (`mapHoldings` skips staked balances, so
+  it is never adopted and never counted as tradable) — but that is a mechanical property, not a
+  guard. If SOL is ever fully unstaked the bot may deploy all of it; the operator wants *some* SOL
+  held, so a floor may be worth adding.
+- `AI_FREE_MODEL` cleared on Railway so runtime discovery is authoritative rather than trying stale
+  slugs first.
+- The 403 fix, the block-lifting fix and `sellReserved` are **unverified against a live order** —
+  AGENTS.md forbids placing one to test. The 403 classification is verified against the exact
+  production error string only. This sandbox still has no egress to openrouter.ai or
+  `*.up.railway.app`, so everything live is read through Railway logs.
+
 ### 2026-08-23 — Claude — Discover free models from the provider instead of guessing
 
 **Changed:** New exported `freeModelsFromCatalog(payload)` (pure: keeps only models where BOTH
